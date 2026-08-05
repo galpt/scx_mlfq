@@ -35,6 +35,10 @@ one-line workspace edit. From a checkout of your scx fork, run
 ```sh
 git checkout -b scx_mlfq
 cp -r <this-repo>/scx scheds/experimental/scx_mlfq
+# the scheduler package carries the repo LICENSE symlink, like every
+# other scheduler; the standalone copy keeps the full text instead
+rm scheds/experimental/scx_mlfq/LICENSE
+ln -s ../../../LICENSE scheds/experimental/scx_mlfq/LICENSE
 # add "scheds/experimental/scx_mlfq" to [workspace].members in Cargo.toml
 cargo build --locked            # regenerates Cargo.lock for the new member
 cargo fmt --check

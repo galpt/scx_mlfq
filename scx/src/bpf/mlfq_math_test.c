@@ -5,8 +5,8 @@
  * Native unit tests for the scx_mlfq pure-logic layer (intf.h). Compiles
  * the same header the BPF code and the Rust bindings use, with MLFQ_CHECK
  * forced on so the invariant predicates are exercised too. Runs on the
- * host with no kernel, BTF or BPF privileges; driven by the Rust #[test]
- * in tests/mlfq_math.rs.
+ * host with no kernel, BTF or BPF privileges, driven by the Rust unit
+ * test in main.rs.
  */
 
 #define MLFQ_CHECK 1
