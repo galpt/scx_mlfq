@@ -15,7 +15,7 @@ DSQ rbtree provides earliest-virtual-deadline-first selection. Task
 classification uses an EMA interactivity gauge in the style of the
 infinity scheduler; promotion and demotion follow MLFQ rules with
 hysteresis, and a periodic aging pass bounds the wait of lower-queue
-tasks. See `scx/README.md` for the full design.
+tasks. See `scx/README.md` for an overview of the design.
 
 RT/DL tasks are scheduled by the kernel rt/dl classes — sched_ext sits
 below the fair class, so this scheduler handles non-RT tasks only.
