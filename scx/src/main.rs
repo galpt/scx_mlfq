@@ -120,11 +120,11 @@ impl<'a> Scheduler<'a> {
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
 
-        // Write the validated tunables into rodata before load; the rodata
+        // Write the validated constants into rodata before load; the rodata
         // section becomes read-only once the object is loaded.
         let config = ConfigBuilder::default().build()?;
         config.apply(&mut skel)?;
-        info!("Tunables: {}", config.describe());
+        info!("Config: {}", config.describe());
 
         // Hybrid-capacity and cache-domain placement data also goes into
         // rodata pre-load.

@@ -103,7 +103,7 @@ struct {
 } mlfq_llc_bitmaps SEC(".maps");
 
 /*
- * Tunables - rodata, materialized by cargo-veristat from the
+ * Constants - rodata, materialized by cargo-veristat from the
  * veristat/9950x.json config. Compile-time defaults match the constants
  * in intf.h; the Rust front-end may override them before load.
  */

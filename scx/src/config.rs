@@ -5,9 +5,10 @@
 // This software may be used and distributed according to the terms of the GNU
 // General Public License version 2.
 
-//! Userspace configuration, validated tunables written into BPF rodata.
+//! Userspace configuration, validated scheduling constants written into
+//! BPF rodata.
 //!
-//! `Config` is the single validated set of scheduler tunables; the BPF side
+//! `Config` is the single validated set of scheduling constants; the BPF side
 //! reads them from `const volatile` rodata globals declared in
 //! `src/bpf/main.bpf.c` (see `src/bpf/intf.h` for the compile-time
 //! defaults, which are the source of truth for every value here).
@@ -68,7 +69,7 @@ const Q1_QUOTA: u32 = crate::bpf_intf::mlfq_consts_MLFQ_Q1_QUOTA;
 const Q2_QUOTA: u32 = crate::bpf_intf::mlfq_consts_MLFQ_Q2_QUOTA;
 const DISPATCH_MAX_BATCH: u32 = crate::bpf_intf::mlfq_consts_MLFQ_DISPATCH_MAX_BATCH;
 
-/// Validated scheduler tunables.
+/// Validated scheduling constants.
 ///
 /// Every field maps to a `const volatile` rodata global in
 /// `src/bpf/main.bpf.c`; field names match the BPF globals 1:1 so
@@ -232,7 +233,7 @@ impl Config {
         Ok(())
     }
 
-    /// Write the validated tunables into the BPF object's rodata section.
+    /// Write the validated constants into the BPF object's rodata section.
     ///
     /// Must be called on the opened, not-yet-loaded skeleton, before
     /// `scx_ops_load!()` - rodata becomes read-only after load.
@@ -261,7 +262,7 @@ impl Config {
         Ok(())
     }
 
-    /// One-line summary of the applied tunables for the startup log.
+    /// One-line summary of the applied constants for the startup log.
     pub fn describe(&self) -> String {
         format!(
             "slices: Q1={}us Q2={}us Q3={}us, T_L={}us, T_H={}us, \
@@ -314,11 +315,11 @@ pub struct ConfigBuilder {
 }
 
 /*
- * The setters form the extension surface of the builder. v1 applies the
- * validated defaults (there are no tunable CLI flags yet), so the
- * production path calls only `build()`. The full surface is exercised by
- * the unit tests below; future tunable plumbing (CLI flags or a config
- * file) will call these without changing `build()`'s validation contract.
+ * The setters assemble a Config from the intf.h defaults and run it
+ * through build()'s validation. The scheduler is intentionally knob-free,
+ * so the production path always uses the defaults. The setters are
+ * exercised by the unit tests, which drive every field through the
+ * validation contract.
  */
 #[allow(dead_code)]
 impl ConfigBuilder {

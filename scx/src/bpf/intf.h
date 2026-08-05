@@ -5,9 +5,10 @@
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
  * This header is shared between BPF, the Rust front-end (via bindgen) and
- * the native unit-test harness. It holds every tunable, the task/queue
- * state layouts and the pure virtual-time and classification math; it must
- * stay self-contained (no BPF kfuncs, no vmlinux.h references).
+ * the native unit-test harness. It holds every scheduling constant, the
+ * task/queue state layouts and the pure virtual-time and classification
+ * math; it must stay self-contained (no BPF kfuncs, no vmlinux.h
+ * references).
  */
 #ifndef __SCX_MLFQ_INTF_H
 #define __SCX_MLFQ_INTF_H
