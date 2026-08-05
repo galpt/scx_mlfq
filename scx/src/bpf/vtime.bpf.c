@@ -193,8 +193,7 @@ static __always_inline u64 mlfq_place_task(u32 qid, struct task_ctx *tctx,
 		mlfq_queue_advance_zero(q);
 #if MLFQ_CHECK
 	if (!mlfq_check_queue_ctx(q) || !mlfq_check_aggregate_bounds(q))
-		scx_bpf_error("pid %d queue %u aggregate inconsistent "
-			      "(sum=%lld W=%llu n=%llu)",
+		scx_bpf_error("pid %d q%u aggregate inconsistent s=%lld W=%llu n=%llu",
 			      pid, qid, q->sum_w_vruntime, q->sum_weight,
 			      q->nr_queued);
 	if (!mlfq_check_queued_vlag(tctx->vlag))
@@ -223,8 +222,7 @@ static __always_inline void mlfq_queue_del_task(u32 qid, struct queue_ctx *q,
 	mlfq_queue_advance_zero(q);
 #if MLFQ_CHECK
 	if (!mlfq_check_queue_ctx(q) || !mlfq_check_aggregate_bounds(q))
-		scx_bpf_error("queue %u aggregate inconsistent after del "
-			      "(sum=%lld W=%llu n=%llu)",
+		scx_bpf_error("q%u aggregate inconsistent s=%lld W=%llu n=%llu",
 			      qid, q->sum_w_vruntime, q->sum_weight,
 			      q->nr_queued);
 #endif

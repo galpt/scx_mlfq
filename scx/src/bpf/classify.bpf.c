@@ -123,8 +123,8 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
 					   mlfq_ema_half_life_ns);
 #if MLFQ_CHECK
 		if (!mlfq_check_ema_bounds(tctx->ema, mlfq_budget_max_ns))
-			scx_bpf_error("pid %d ema %llu out of bounds after "
-				      "decay", p->pid, tctx->ema);
+			scx_bpf_error("pid %d ema %llu out of bounds after decay",
+				      p->pid, tctx->ema);
 #endif
 	}
 	tctx->last_sleep_at = 0;

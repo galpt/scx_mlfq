@@ -75,7 +75,12 @@ struct {
 	__type(value, struct mlfq_cpu_state);
 } cpu_state_stor SEC(".maps");
 
-/* Scheduler-wide state. */
+/*
+ * Scheduler-wide state in .bss. The stats counters are shared across
+ * CPUs and updated with atomic RMWs; volatile stops the compiler from
+ * caching a value in a register across the atomic operations.
+ * nr_cpu_ids is written once in init() before any other callback runs.
+ */
 volatile u64 nr_cpu_ids;
 volatile struct mlfq_stats mlfq_stats;
 
@@ -105,7 +110,9 @@ struct {
 /*
  * Constants - rodata, materialized by cargo-veristat from the
  * veristat/9950x.json config. Compile-time defaults match the constants
- * in intf.h; the Rust front-end may override them before load.
+ * in intf.h. They are const volatile: the Rust front-end writes them
+ * before load, the section is read-only afterwards, and the compiler
+ * must not fold them as compile-time constants.
  */
 const volatile u64 mlfq_q1_slice_ns = MLFQ_Q1_SLICE_NS;
 const volatile u64 mlfq_q2_slice_ns = MLFQ_Q2_SLICE_NS;
@@ -138,7 +145,7 @@ const volatile bool mlfq_primary_all = true;
  * primary (big) core; mlfq_cpu_llc maps a CPU to its LLC domain (0 when
  * unknown).
  */
-const volatile u32 mlfq_nr_llcs = 0;
+const volatile u32 mlfq_nr_llcs;
 const volatile u8 mlfq_llc_has_primary[MLFQ_MAX_LLCS];
 const volatile u32 mlfq_cpu_llc[MLFQ_MAX_CPUS];
 

@@ -79,8 +79,8 @@ static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 	if (!bm)
 		return -ENOENT;
 
-	bpf_for (word, 0, MLFQ_BITMAP_WORDS) {
-		bpf_for (bit, 0, 64) {
+	bpf_for(word, 0, MLFQ_BITMAP_WORDS) {
+		bpf_for(bit, 0, 64) {
 			u32 cand = word * 64 + bit;
 
 			if (cand >= MLFQ_MAX_CPUS)
