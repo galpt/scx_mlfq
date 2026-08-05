@@ -12,6 +12,8 @@ Placement is cache and capacity aware. Wakeups prefer the previous CPU when it i
 
 RT and DL tasks are scheduled by the kernel rt and dl classes. sched_ext sits below the fair class, so this scheduler handles non-RT tasks only.
 
+The scheduler is deliberately knob-free. Every scheduling constant is a compile-time value and no command-line option changes the scheduling behavior, so there is nothing to misconfigure and no mode to get wrong.
+
 ## Typical Use Case
 
 Interactive-first desktop and latency workloads running alongside CPU-intensive background tasks. Interactive tasks get short, frequently refreshed deadlines on big cores, while CPU-bound work is demoted to Q3, where larger requests amortize switching cost.
