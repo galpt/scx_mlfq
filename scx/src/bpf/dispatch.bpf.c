@@ -14,8 +14,7 @@
  *
  * The three quotas are served by three independent, tightly bounded loops.
  * Each iteration is a queue-nonempty check, one move and one stat
- * increment - no nested branch chains - which keeps the verifier state
- * small.
+ * increment, so the loop bodies stay flat and the verifier state small.
  */
 
 void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)

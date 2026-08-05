@@ -16,10 +16,10 @@
  * callback for migration-disabled tasks.
  *
  * The primary-core and LLC sets live in ARRAY map values as plain u64
- * bitmaps (see main.bpf.c), written by the Rust front-end after load.
- * An unpopulated map entry means "no data": the primary bitmap is treated
- * as all-primary and an empty LLC bitmap yields no idle candidate. No
- * kptrs are involved, so no RCU discipline is needed.
+ * bitmaps (see main.bpf.c), written by the Rust front-end after load and
+ * read directly as map values. An unpopulated map entry means "no data":
+ * the primary bitmap is treated as all-primary and an empty LLC bitmap
+ * yields no idle candidate.
  */
 
 /*

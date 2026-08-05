@@ -84,9 +84,10 @@ volatile struct mlfq_stats mlfq_stats;
  *
  * mlfq_primary_bitmap[0] holds the primary (big-core) CPU set;
  * mlfq_llc_bitmaps[llc_id] holds the CPU membership of one LLC domain.
- * Both are plain u64 bitmaps in ARRAY map values, written by the Rust
- * front-end after load and read as map values by the CPU-selection path,
- * so no kernel cpumask kptrs and no RCU discipline are required.
+ * Both are plain u64 bitmaps in ARRAY map values: the Rust front-end
+ * writes them after load, and the CPU-selection path reads them directly
+ * as map values, without any kernel cpumask kptr machinery or RCU
+ * protection.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
