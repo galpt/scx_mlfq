@@ -22,11 +22,10 @@
  *   - Run-out (slice exhaustion): put_prev_task_scx() re-enqueues the
  *     runnable task with do_enqueue_task(rq, p, 0, -1) -- flags == 0 --
  *     or with SCX_ENQ_LAST when leaving for a higher sched class.
- *   - SCX_ENQ_REENQ is set only for SCX_ENQ_IMMED re-enqueues
- *     (put_prev_task_scx(), ext.c:3102) and for
+ *   - SCX_ENQ_REENQ marks SCX_ENQ_IMMED re-enqueues
+ *     (put_prev_task_scx(), ext.c:3102) and re-enqueues via
  *     scx_bpf_reenqueue_local()/scx_bpf_dsq_reenq() (ext.c:4165, 4280);
- *     this scheduler never uses IMMED or those kfuncs, so SCX_ENQ_REENQ
- *     never reaches ops.enqueue() here and is not tested.
+ *     it does not appear on any of the paths above.
  *   - SCX-internal DSQ migrations (dispatch_to_local_dsq()) keep the task
  *     SCX_TASK_QUEUED and never call ops.enqueue(); generic rq migrations
  *     (move_queued_task()) only move CFS-queued tasks, which SCX tasks

@@ -173,13 +173,12 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
  * @p: The task.
  * @tctx: The task context.
  *
- * The genuine run-out re-enqueue (ops.enqueue() with flags == 0, delivered
- * by put_prev_task_scx()'s do_enqueue_task(rq, p, 0, -1)) is the scx
- * equivalent of the tick/demotion path. SCX_ENQ_REENQ itself is never seen:
- * it is set only for SCX_ENQ_IMMED re-enqueues and scx_bpf_reenqueue_local()
- * -- neither of which this scheduler uses -- so the flags == 0 run-out is
- * the demotion event. The consecutive-exhaustion counter gates the band
- * crossing; uclamp_min tasks keep their queue.
+ * The run-out re-enqueue arrives through ops.enqueue() with flags == 0,
+ * delivered by put_prev_task_scx()'s do_enqueue_task(rq, p, 0, -1), and is
+ * the scx equivalent of the tick/demotion path. It is the only enqueue
+ * without flag bits, which identifies it at the routing in enqueue(). The
+ * consecutive-exhaustion counter gates the band crossing, and uclamp_min
+ * tasks keep their queue.
  */
 static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 						 struct task_ctx *tctx)

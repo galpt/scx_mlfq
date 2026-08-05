@@ -134,8 +134,8 @@ impl<'a> Scheduler<'a> {
 
         // The membership bitmaps are written after load (the maps are only
         // available on the loaded object). An unpopulated primary bitmap
-        // falls back to all-primary behavior; an empty LLC bitmap simply
-        // yields no idle candidate there, so a failure only degrades the
+        // falls back to all-primary behavior; an empty LLC bitmap yields
+        // no idle candidate there, so a failure only degrades the
         // placement hint.
         if let Err(e) = topology::write_primary_bitmap(&mut skel, &topology_plan.capacity) {
             log::warn!(

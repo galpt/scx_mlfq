@@ -246,7 +246,7 @@ pub fn write_primary_bitmap(
 /// Phase 2 (post-load): write the per-LLC membership bitmaps.
 ///
 /// One bitmap per LLC domain. On failure the affected domain's bitmap is
-/// left empty, so the selector simply finds no idle candidate there and
+/// left empty, so the selector finds no idle candidate there and
 /// falls through to the global placement path.
 pub fn write_llc_bitmaps(skel: &mut crate::bpf_skel::BpfSkel<'_>, plan: &LlcPlan) -> Result<()> {
     if plan.nr_llcs == 0 {
