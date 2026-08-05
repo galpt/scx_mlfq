@@ -12,7 +12,7 @@ Placement is cache and capacity aware. Wakeups prefer the previous CPU when it i
 
 The scheduler is deliberately knob-free. Every scheduling constant is a compile-time value and no command-line option changes the scheduling behavior, so there is nothing to misconfigure and no mode to get wrong.
 
-## Typical Use Case
+## Typical Use Cases
 
 - Gaming and other latency-sensitive applications. Interactive tasks wake from short sleeps or I/O, receive a virtual-slice boost, preempt lower-queue tasks, run at the maximum performance target, and prefer idle big cores on hybrid systems, so wakeup latency stays low.
 - General desktop use. The desktop session stays responsive while background work such as software updates, file indexing, or compilation is demoted to Q3 and no longer competes with interactive tasks.
@@ -20,11 +20,8 @@ The scheduler is deliberately knob-free. Every scheduling constant is a compile-
 
 ## Limitations
 
-The EEVDF substrate is approximated where BPF cannot express the kernel's exact machinery. Eligibility is enforced at placement with DELAY_ZERO semantics instead of an augmented-tree walk, only the local CPU's running task is folded into the weighted average, and the aggregate math is s64-only. Each approximation is documented in the code.
-
-The MLFQ queues are host-wide user dispatch queues, so NUMA locality comes from wakeup placement, since the kernel's built-in per-node global dispatch queue does not apply to user dispatch queues. Per-node queue sharding is future work.
-
-There are no cgroup ops. The kernel folds cgroup shares into the task weight, which the EEVDF ordering honors by construction.
+- The EEVDF substrate is approximated where BPF cannot express the kernel's exact machinery. Eligibility is enforced at placement with DELAY_ZERO semantics instead of an augmented-tree walk, only the local CPU's running task is folded into the weighted average, and the aggregate math is s64-only. Each approximation is documented in the code.
+- The MLFQ queues are host-wide user dispatch queues, so NUMA locality comes from wakeup placement, since the kernel's built-in per-node global dispatch queue does not apply to user dispatch queues.
 
 ## Production Ready?
 
