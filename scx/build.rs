@@ -18,8 +18,8 @@ fn add_bpf_warning_suppression(flag: &str) {
 }
 
 fn main() {
-    // clang can warn about forward declarations inside generated vmlinux.h.
-    // Those are not actionable for scx_mlfq and just add noise for builders.
+    // clang can warn about forward declarations inside the generated
+    // kernel type header, which is not actionable for this scheduler.
     add_bpf_warning_suppression("-Wno-missing-declarations");
 
     scx_cargo::BpfBuilder::new()

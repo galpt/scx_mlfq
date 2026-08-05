@@ -15,23 +15,20 @@
 #include <bpf/bpf_core_read.h>
 
 /*
- * in_iowait guard. task_struct::in_iowait is a 1-bit bitfield; bitfield
- * CO-RE access was verified on this host (a standalone probe reading it
- * with BPF_CORE_READ_BITFIELD from both a raw tracepoint and a struct_ops
- * enqueue loaded cleanly on the target kernel). Define
- * MLFQ_HAVE_IN_IOWAIT to 0 when building against a vmlinux.h that does not
- * expose the field.
+ * in_iowait guard. task_struct::in_iowait is a 1-bit bitfield read with
+ * BPF_CORE_READ_BITFIELD. Define MLFQ_HAVE_IN_IOWAIT to 0 when the
+ * kernel type header does not expose the field.
  */
 #ifndef MLFQ_HAVE_IN_IOWAIT
 #define MLFQ_HAVE_IN_IOWAIT 1
 #endif
 
 /*
- * uclamp_min guard. task_struct::uclamp_req only
- * exists with CONFIG_UCLAMP_TASK; the vmlinux.h this tree builds against
- * does not expose it, so the guard is compiled out (silently dropped).
- * Define MLFQ_HAVE_TASK_UCLAMP_MIN to 1 when building against a vmlinux.h
- * that provides the field.
+ * uclamp_min guard. task_struct::uclamp_req only exists with
+ * CONFIG_UCLAMP_TASK; the kernel type header used for this build does
+ * not expose it, so the guard is compiled out. Define
+ * MLFQ_HAVE_TASK_UCLAMP_MIN to 1 when the kernel type header provides
+ * the field.
  */
 #ifndef MLFQ_HAVE_TASK_UCLAMP_MIN
 #define MLFQ_HAVE_TASK_UCLAMP_MIN 0
