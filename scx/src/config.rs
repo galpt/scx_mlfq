@@ -12,7 +12,7 @@
 //! `src/bpf/main.bpf.c` (see `src/bpf/intf.h` for the compile-time
 //! defaults, which are the source of truth for every value here).
 //!
-//! `ConfigBuilder` implements the refactoring.guru Builder pattern: every
+//! `ConfigBuilder` assembles a `Config` from optional setters. Every
 //! setter is optional and `build()` validates the assembled values, so an
 //! invalid intermediate state can never be constructed.
 
@@ -288,7 +288,7 @@ impl Config {
     }
 }
 
-/// Builder for `Config` (refactoring.guru Builder pattern).
+/// Builder for `Config`, assembled from optional setters.
 ///
 /// Every setter is optional; unset fields fall back to the `intf.h`
 /// defaults. `build()` validates the result and returns an error for any
@@ -314,11 +314,11 @@ pub struct ConfigBuilder {
 }
 
 /*
- * The setters are the pattern's extension surface: v1 applies the
- * validated defaults (no tunable CLI flags yet), so the production path
- * calls only `build()`. The full surface is exercised by the unit tests
- * below; future tunable plumbing (CLI flags or a config file) will call
- * these without changing `build()`'s validation contract.
+ * The setters form the extension surface of the builder. v1 applies the
+ * validated defaults (there are no tunable CLI flags yet), so the
+ * production path calls only `build()`. The full surface is exercised by
+ * the unit tests below; future tunable plumbing (CLI flags or a config
+ * file) will call these without changing `build()`'s validation contract.
  */
 #[allow(dead_code)]
 impl ConfigBuilder {
