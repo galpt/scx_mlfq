@@ -43,6 +43,11 @@ jobs:
       - name: Unit tests
         working-directory: /tmp/scx
         run: cargo test --profile ci --locked -p scx_mlfq
+      - name: Kernel diagnostics
+        run: |
+          uname -r
+          cat /proc/sys/kernel/sched_ext/state 2>/dev/null || true
+          zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_(PREEMPT|HZ_|NO_HZ|SCHED_CLASS_EXT|SCHED_SMT|SCHED_AUTOGROUP)" || true
       - name: Stress test
         working-directory: /tmp/scx
         run: |
