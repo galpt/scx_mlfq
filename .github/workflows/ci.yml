@@ -96,7 +96,7 @@ jobs:
       - name: Build and verify
         working-directory: /tmp/scx
         run: |
-          cargo build --profile ci --locked
+          cargo build --profile ci -p scx_mlfq
           cargo metadata --format-version 1 > /tmp/meta.json
           cargo veristat --profile ci --metadata-json /tmp/meta.json \
             --no-build scx_mlfq
