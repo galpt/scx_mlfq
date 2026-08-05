@@ -151,7 +151,7 @@ enum mlfq_task_flags {
 /*
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the per-queue clock and only meaningful relative
- * to the owning queue's zero_vruntime. ~80 bytes.
+ * to the owning queue's zero_vruntime. The struct is 80 bytes.
  */
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
