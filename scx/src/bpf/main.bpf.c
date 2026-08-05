@@ -3,10 +3,6 @@
  * Multilevel Feedback Queue scheduling with per-queue EEVDF virtual time.
  *
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
- *
- * This file schedules SCHED_NORMAL/BATCH/IDLE/EXT tasks only; RT/DL
- * tasks stay on the kernel rt/dl classes (sched_ext sits below the fair
- * class in sched_class precedence).
  */
 
 /*
