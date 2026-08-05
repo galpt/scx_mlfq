@@ -104,7 +104,7 @@ struct {
 } mlfq_llc_bitmaps SEC(".maps");
 
 /*
- * Constants - rodata, materialized by cargo-veristat from the
+ * Constants: rodata, materialized by cargo-veristat from the
  * veristat/9950x.json config. Compile-time defaults match the constants
  * in intf.h. They are const volatile: the Rust front-end writes them
  * before load, the section is read-only afterwards, and the compiler

@@ -205,7 +205,7 @@ impl Config {
          * dispatch() serves Q1 up to its quota, then Q2 up to its quota,
          * then the Q3 remainder within dispatch_max_batch.
          * If the quotas consume the whole batch, Q3 never runs on a busy
-         * system - the cross-queue starvation bound depends on this slack.
+         * system: the cross-queue starvation bound depends on this slack.
          */
         if u64::from(self.q1_quota) + u64::from(self.q2_quota) >= u64::from(self.dispatch_max_batch)
         {

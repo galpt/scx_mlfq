@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Classification - EMA gauge, queue mapping, hysteresis.
+ * Classification: EMA gauge, queue mapping, hysteresis.
  *
  * The gauge is a continuous interactivity measure mapped onto the
  * three queues: it climbs per run segment in stopping() and decays per

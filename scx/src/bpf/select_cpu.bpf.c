@@ -139,7 +139,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	primary_bm = mlfq_get_primary_bitmap();
 
 	/*
-	 * Step 1 - prev CPU fast path. The prev CPU is preferred when idle
+	 * Step 1: prev CPU fast path. The prev CPU is preferred when idle
 	 * for cache locality. An interactive task on a hybrid system only
 	 * sticks to prev when it is a primary core: settling an interactive
 	 * wakeup on an efficiency core would trade cache warmth for
@@ -154,7 +154,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
-	 * Step 2 - LLC-aware placement: keep the wakeup in the waker's
+	 * Step 2: LLC-aware placement, which keeps the wakeup in the waker's
 	 * cache domain. The waker is the current CPU. For Q1 an
 	 * all-efficiency LLC is skipped entirely so the wakeup can land on
 	 * an idle primary of a faster LLC via the global fallbacks below.
@@ -174,7 +174,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
-	 * Step 3 - global fallbacks. Q1 prefers an idle primary core, with
+	 * Step 3: global fallbacks. Q1 prefers an idle primary core, with
 	 * the SMT-aware whole-core preference on uniform-capacity systems;
 	 * Q2/Q3 take any idle CPU.
 	 */

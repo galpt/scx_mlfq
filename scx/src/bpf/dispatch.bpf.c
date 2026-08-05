@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Dispatch - queue service with quotas, included by main.bpf.c via
+ * Dispatch: queue service with quotas, included by main.bpf.c via
  * #include.
  *
  * The kernel serves SCX_DSQ_LOCAL before ops.dispatch() (ext.c dispatch
