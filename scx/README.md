@@ -10,8 +10,6 @@ Classification relies on an EMA interactivity gauge that climbs while a task run
 
 Placement is cache and capacity aware. Wakeups prefer the previous CPU when it is idle, then an idle CPU in the waker's LLC. On hybrid systems such as Intel P/E cores and ARM big.LITTLE, interactive tasks additionally prefer idle big cores and never stick to an efficiency core. Through the sched_ext cpuperf API the scheduler raises the schedutil performance target to its maximum for interactive tasks and lowers it to half for CPU-bound tasks.
 
-RT and DL tasks are scheduled by the kernel rt and dl classes. sched_ext sits below the fair class, so this scheduler handles non-RT tasks only.
-
 The scheduler is deliberately knob-free. Every scheduling constant is a compile-time value and no command-line option changes the scheduling behavior, so there is nothing to misconfigure and no mode to get wrong.
 
 ## Typical Use Case
