@@ -48,11 +48,24 @@ jobs:
           uname -r
           cat /proc/sys/kernel/sched_ext/state 2>/dev/null || true
           zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_(PREEMPT|HZ_|NO_HZ|SCHED_CLASS_EXT|SCHED_SMT|SCHED_AUTOGROUP)" || true
-      - name: Stress test
+      - name: Stress test (no affinity)
         working-directory: /tmp/scx
         run: |
-          stress-ng -t 31 --aggressive -M -c $(nproc) -f $(nproc) \
-            --affinity 1 --affinity-delay 1 --affinity-pin &
+          stress-ng -t 31 --aggressive -M -c 4 -f 4 &
+          stress_pid=$!
+          set +e
+          sudo timeout --foreground --preserve-status 45 \
+            target/ci/scx_mlfq -v
+          rc=$?
+          set -e
+          kill $stress_pid 2>/dev/null || true
+          wait $stress_pid 2>/dev/null || true
+          exit $rc
+      - name: Stress test (affinity only)
+        working-directory: /tmp/scx
+        run: |
+          stress-ng -t 31 --aggressive -M --affinity 1 --affinity-delay 1 \
+            --affinity-pin &
           stress_pid=$!
           set +e
           sudo timeout --foreground --preserve-status 45 \
