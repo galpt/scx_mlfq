@@ -14,7 +14,9 @@ The scheduler is deliberately knob-free. Every scheduling constant is a compile-
 
 ## Typical Use Case
 
-Interactive-first desktop and latency workloads running alongside CPU-intensive background tasks. Interactive tasks get short, frequently refreshed deadlines on big cores, while CPU-bound work is demoted to Q3, where larger requests amortize switching cost.
+- Gaming and other latency-sensitive applications. Interactive tasks wake from short sleeps or I/O, receive a virtual-slice boost, preempt lower-queue tasks, run at the maximum performance target, and prefer idle big cores on hybrid systems, so wakeup latency stays low.
+- General desktop use. The desktop session stays responsive while background work such as software updates, file indexing, or compilation is demoted to Q3 and no longer competes with interactive tasks.
+- Mixed workloads on laptops and desktops. CPU-bound jobs keep throughput with larger slices and a reduced performance target, while the aging pass periodically elevates tasks that wait in the lower queues, so no task is left behind.
 
 ## Limitations
 
