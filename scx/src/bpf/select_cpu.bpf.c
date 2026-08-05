@@ -4,20 +4,13 @@
  *
  * CPU selection, included by main.bpf.c via #include.
  *
- * Placement policy, in order of preference:
- *
- *   1. prev CPU when idle (cache warmth) - an interactive task on a hybrid
- *      system only sticks to prev when it is a primary core.
- *   2. An idle CPU in the waker's LLC domain (cache locality) - interactive
- *      tasks additionally require a big core there, and an all-efficiency
- *      waker LLC is skipped so the wakeup can land on a faster LLC.
- *   3. The global fallbacks: Q1 prefers an idle primary core (the bitmap is
- *      scanned in ascending CPU order and the first idle and allowed member
- *      wins - there is no capacity ordering), Q2/Q3 take any idle CPU.
- *   4. When no CPU is selected, prev_cpu is returned: the kernel validates
- *      the return as a CPU number (any negative value aborts the
- *      scheduler), and the task then goes through the normal enqueue path
- *      into the shared vtime DSQs.
+ * Placement preference, in order: the prev CPU when idle, an idle CPU in
+ * the waker's LLC, then the global fallbacks (an idle primary core for
+ * Q1, any idle CPU otherwise). The per-step detail is at the
+ * corresponding points in mlfq_select_cpu() below. When no CPU is
+ * selected, prev_cpu is returned: the kernel validates the return as a
+ * CPU number (any negative value aborts the scheduler), and the task
+ * then goes through the normal enqueue path into the shared vtime DSQs.
  *
  * With SCX_OPS_ENQ_MIGRATION_DISABLED the kernel never invokes this
  * callback for migration-disabled tasks.
@@ -25,8 +18,8 @@
  * The primary-core and LLC sets live in ARRAY map values as plain u64
  * bitmaps (see main.bpf.c), written by the Rust front-end after load.
  * An unpopulated map entry means "no data": the primary bitmap is treated
- * as all-primary (safe fallback) and an empty LLC bitmap yields no
- * idle candidate. No kptrs are involved, so no RCU discipline is needed.
+ * as all-primary and an empty LLC bitmap yields no idle candidate. No
+ * kptrs are involved, so no RCU discipline is needed.
  */
 
 /*
@@ -65,7 +58,8 @@ static __always_inline bool mlfq_is_primary(const struct mlfq_bitmap *bm,
  * MLFQ_BITMAP_WORDS words, bit-minor over 64 bits per word. For each set
  * candidate the scan tests task affinity, idleness (clearing the idle
  * mark) and, when requested, primary membership, returning the first
- * match. An unpopulated entry or an empty scan returns -ENOENT.
+ * match in ascending CPU order, with no capacity ordering. An unpopulated
+ * entry or an empty scan returns -ENOENT.
  */
 static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 						    const struct task_struct *p,

@@ -11,25 +11,15 @@
  *   wall-clock aging check for Q2/Q3 stays, then placement
  * and the queue-preemptive wakeup kicks.
  *
- * Enqueue flag taxonomy (which ops.enqueue() call sites produce which
- * flags; verified against kernel/sched/ext/ext.c, 6.13 and 7.2-rc6):
- *
- *   - Wakeup: ttwu_do_activate() -> activate_task() passes ENQUEUE_WAKEUP
- *     (== SCX_ENQ_WAKEUP), plus ENQUEUE_NOCLOCK and, when select_task_rq()
- *     ran, ENQUEUE_RQ_SELECTED (== SCX_ENQ_CPU_SELECTED).
- *   - Fork: wake_up_new_task() -> activate_task() passes
- *     ENQUEUE_NOCLOCK | ENQUEUE_INITIAL (no SCX_ENQ_WAKEUP bit).
- *   - Run-out (slice exhaustion): put_prev_task_scx() re-enqueues the
- *     runnable task with do_enqueue_task(rq, p, 0, -1) -- flags == 0 --
- *     or with SCX_ENQ_LAST when leaving for a higher sched class.
- *   - SCX_ENQ_REENQ marks SCX_ENQ_IMMED re-enqueues
- *     (put_prev_task_scx(), ext.c:3102) and re-enqueues via
- *     scx_bpf_reenqueue_local()/scx_bpf_dsq_reenq() (ext.c:4165, 4280);
- *     it does not appear on any of the paths above.
- *   - SCX-internal DSQ migrations (dispatch_to_local_dsq()) keep the task
- *     SCX_TASK_QUEUED and never call ops.enqueue(); generic rq migrations
- *     (move_queued_task()) only move CFS-queued tasks, which SCX tasks
- *     never are. Hence the only flags == 0 enqueue is the run-out above.
+ * The demotion path keys on the flags == 0 run-out re-enqueue, which only
+ * slice exhaustion produces: put_prev_task_scx() re-enqueues the runnable
+ * task with do_enqueue_task(rq, p, 0, -1), or with SCX_ENQ_LAST when
+ * leaving for a higher sched class. SCX_ENQ_REENQ appears only on
+ * SCX_ENQ_IMMED re-enqueues (put_prev_task_scx(), ext.c:3102) and
+ * scx_bpf_reenqueue_local()/scx_bpf_dsq_reenq() (ext.c:4165, 4280), and
+ * neither DSQ migrations nor generic rq migrations call ops.enqueue() for
+ * queued SCX tasks, so no other path produces an enqueue without flag
+ * bits.
  */
 
 static __always_inline bool mlfq_task_is_migration_disabled(const struct task_struct *p)

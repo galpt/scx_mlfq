@@ -4,10 +4,9 @@
  *
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * sched_ext sits below the fair class in sched_class precedence
- * (kernel/sched/core.c), so SCHED_FIFO/RR/DEADLINE are scheduled by the
- * rt/dl classes and never reach this scheduler. This file schedules
- * SCHED_NORMAL/BATCH/IDLE/EXT tasks only.
+ * This file schedules SCHED_NORMAL/BATCH/IDLE/EXT tasks only; RT/DL
+ * tasks stay on the kernel rt/dl classes (sched_ext sits below the fair
+ * class in sched_class precedence).
  */
 
 /*
