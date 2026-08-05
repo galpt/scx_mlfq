@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Copyright (c) 2026 Galih Tama <galpt@v.recipes>
+//
+// This software may be used and distributed according to the terms of the GNU
+// General Public License version 2.
+
+//! scx_mlfq — a Multilevel Feedback Queue scheduler for sched_ext.
+//!
+//! Three global, virtual-time-ordered user DSQs (Q1/Q2/Q3) over an EEVDF
+//! virtual-time substrate. Tasks are classified into queues by an EMA
+//! interactivity gauge with band hysteresis, promoted by short-sleep and
+//! aging, demoted by slice exhaustion. See README.md for the full
+//! description, the preserved/approximated EEVDF breakdown and the honest
+//! deviation list.
+//!
+//! RT/DL tasks are scheduled by the kernel rt/dl classes — sched_ext sits
+//! below the fair class, so this scheduler handles non-RT tasks only.
+
+mod bpf_skel;
+pub use bpf_skel::*;
+pub mod bpf_intf;
+pub use bpf_intf::*;
+
+mod config;
+mod stats;
+mod topology;
+
+use std::mem::MaybeUninit;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use clap::CommandFactory;
+use clap::Parser;
+use clap_complete::generate;
+use clap_complete::Shell;
+use crossbeam::channel::RecvTimeoutError;
+use log::info;
+use scx_stats::prelude::*;
+use scx_utils::build_id;
+use scx_utils::compat;
+use scx_utils::libbpf_clap_opts::LibbpfOpts;
+use scx_utils::scx_ops_attach;
+use scx_utils::scx_ops_load;
+use scx_utils::scx_ops_open;
+use scx_utils::try_set_rlimit_infinity;
+use scx_utils::uei_exited;
+use scx_utils::uei_report;
+use scx_utils::UserExitInfo;
+
+use config::ConfigBuilder;
+use stats::Metrics;
+
+const SCHEDULER_NAME: &str = "scx_mlfq";
+
+fn full_version() -> String {
+    build_id::full_version(env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Debug, Parser)]
+#[command(name = SCHEDULER_NAME, version, disable_version_flag = true)]
+struct Opts {
+    /// Serve scheduler statistics over the unix socket at the given interval.
+    #[clap(long)]
+    stats: Option<f64>,
+
+    /// Run in statistics monitoring mode; the scheduler is not launched.
+    #[clap(long)]
+    monitor: Option<f64>,
+
+    /// Enable BPF debugging via /sys/kernel/tracing/trace_pipe.
+    #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
+    debug: bool,
+
+    /// Enable verbose output, including libbpf details.
+    #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// Print scheduler version and exit.
+    #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
+    version: bool,
+
+    /// Generate shell completions and exit.
+    #[clap(long, value_name = "SHELL", hide = true)]
+    completions: Option<Shell>,
+
+    #[clap(flatten, next_help_heading = "Libbpf Options")]
+    libbpf: LibbpfOpts,
+}
+
+/// Scheduler facade: owns the loaded skeleton, the struct_ops link and the
+/// stats server; drives the run loop until shutdown or UEI exit.
+struct Scheduler<'a> {
+    skel: BpfSkel<'a>,
+    struct_ops: Option<libbpf_rs::Link>,
+    stats_server: StatsServer<(), Metrics>,
+    started_at: std::time::Instant,
+}
+
+impl<'a> Scheduler<'a> {
+    fn init(
+        opts: &'a Opts,
+        open_object: &'a mut MaybeUninit<libbpf_rs::OpenObject>,
+    ) -> Result<Self> {
+        try_set_rlimit_infinity();
+
+        let mut skel_builder = BpfSkelBuilder::default();
+        skel_builder.obj_builder.debug(opts.debug || opts.verbose);
+
+        let open_opts = opts.libbpf.clone().into_bpf_open_opts();
+        let mut skel = scx_ops_open!(skel_builder, open_object, mlfq_ops, open_opts)?;
+
+        /*
+         * Ops flags: honor exiting tasks, honor the LAST enqueue for
+         * slice-disabled tasks, never migrate migration-disabled tasks,
+         * and allow queued-wakeup selection of idle CPUs (the idle-CPU
+         * fast path depends on the latter two).
+         */
+        skel.struct_ops.mlfq_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
+            | *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
+
+        // Write the validated tunables into rodata before load; the rodata
+        // section becomes read-only once the object is loaded.
+        let config = ConfigBuilder::default().build()?;
+        config.apply(&mut skel)?;
+        info!("Tunables: {}", config.describe());
+
+        // Hybrid-capacity and cache-domain placement data also goes into
+        // rodata pre-load.
+        let topology_plan = topology::init_topology(&mut skel)?;
+
+        let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
+
+        // The membership bitmaps are written after load (the maps are only
+        // available on the loaded object). An unpopulated primary bitmap
+        // falls back to all-primary behavior; an empty LLC bitmap simply
+        // yields no idle candidate there, so a failure only degrades the
+        // placement hint.
+        if let Err(e) = topology::write_primary_bitmap(&mut skel, &topology_plan.capacity) {
+            log::warn!(
+                "failed to write the primary bitmap, falling back to all-primary placement: {e:#}"
+            );
+        }
+        if let Err(e) = topology::write_llc_bitmaps(&mut skel, &topology_plan.llcs) {
+            log::warn!("failed to write the LLC bitmaps, disabling LLC-aware placement: {e:#}");
+        }
+
+        let struct_ops = scx_ops_attach!(skel, mlfq_ops)?;
+
+        let stats_server = StatsServer::new(stats::server_data()).launch()?;
+
+        Ok(Self {
+            skel,
+            struct_ops: Some(struct_ops),
+            stats_server,
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    fn get_metrics(&self) -> Metrics {
+        let bss_data = self
+            .skel
+            .maps
+            .bss_data
+            .as_ref()
+            .expect("bss_data missing — BPF object has no .bss section");
+        let s = &bss_data.mlfq_stats;
+        Metrics {
+            on_cpu: s.on_cpu,
+            total_runtime: s.total_runtime,
+            uptime_ns: self.started_at.elapsed().as_nanos() as u64,
+            q1_placements: s.q1_placements,
+            q2_placements: s.q2_placements,
+            q3_placements: s.q3_placements,
+            promotions: s.promotions,
+            demotions: s.demotions,
+            aging_boosts: s.aging_boosts,
+            short_sleep_boosts: s.short_sleep_boosts,
+            preemption_kicks: s.preemption_kicks,
+        }
+    }
+
+    fn exited(&self) -> bool {
+        uei_exited!(&self.skel, uei)
+    }
+
+    fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
+        let (res_ch, req_ch) = self.stats_server.channels();
+
+        while !shutdown.load(Ordering::Relaxed) && !self.exited() {
+            match req_ch.recv_timeout(Duration::from_millis(250)) {
+                Ok(()) => res_ch.send(self.get_metrics())?,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(e) => Err(e)?,
+            }
+        }
+
+        let _ = self.struct_ops.take();
+        uei_report!(&self.skel, uei)
+    }
+}
+
+fn main() -> Result<()> {
+    let opts = Opts::parse();
+
+    if let Some(shell) = opts.completions {
+        generate(
+            shell,
+            &mut Opts::command(),
+            SCHEDULER_NAME,
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+
+    let monitor_only = opts.monitor.is_some();
+
+    // Print the version before any other work, so the install script's
+    // smoke test (and `scx_mlfq -V`) works without attaching anything.
+    if opts.version {
+        println!("{} {}", SCHEDULER_NAME, full_version());
+        return Ok(());
+    }
+
+    if !monitor_only {
+        simplelog::SimpleLogger::init(
+            if opts.debug {
+                simplelog::LevelFilter::Debug
+            } else {
+                simplelog::LevelFilter::Info
+            },
+            simplelog::Config::default(),
+        )?;
+
+        info!("{} {}", SCHEDULER_NAME, full_version());
+        info!("Starting {} scheduler", SCHEDULER_NAME);
+    }
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    ctrlc::set_handler(move || {
+        shutdown_clone.store(true, Ordering::Relaxed);
+    })?;
+
+    if let Some(intv) = opts.monitor.or(opts.stats) {
+        let monitor_shutdown = shutdown.clone();
+        let jh = std::thread::spawn(move || {
+            if let Err(err) = stats::monitor(Duration::from_secs_f64(intv), monitor_shutdown) {
+                log::warn!("stats monitor thread finished with error: {err}");
+            }
+        });
+
+        if monitor_only {
+            let _ = jh.join();
+            return Ok(());
+        }
+    }
+
+    let mut open_object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
+    let mut sched = Scheduler::init(&opts, &mut open_object)?;
+    sched.run(shutdown)?;
+
+    info!("Scheduler exited");
+
+    Ok(())
+}
