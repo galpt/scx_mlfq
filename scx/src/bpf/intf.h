@@ -7,8 +7,8 @@
  * This header is shared between BPF, the Rust front-end (via bindgen) and
  * the native unit-test harness. It holds every scheduling constant, the
  * task/queue state layouts and the pure virtual-time and classification
- * math; it must stay self-contained (no BPF kfuncs, no kernel type
- * references).
+ * math, and it defines its own kernel type aliases so the harness can
+ * compile it without the kernel headers.
  */
 #ifndef __SCX_MLFQ_INTF_H
 #define __SCX_MLFQ_INTF_H
