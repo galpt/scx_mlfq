@@ -12,6 +12,20 @@
  * that implement the hysteresis.
  */
 
+#include <bpf/bpf_core_read.h>
+
+/*
+ * in_iowait guard. task_struct::in_iowait is a 1-bit bitfield; bitfield
+ * CO-RE access was verified on this host (a standalone probe reading it
+ * with BPF_CORE_READ_BITFIELD from both a raw tracepoint and a struct_ops
+ * enqueue loaded cleanly on the target kernel). Define
+ * MLFQ_HAVE_IN_IOWAIT to 0 when building against a vmlinux.h that does not
+ * expose the field.
+ */
+#ifndef MLFQ_HAVE_IN_IOWAIT
+#define MLFQ_HAVE_IN_IOWAIT 1
+#endif
+
 /*
  * uclamp_min guard. task_struct::uclamp_req only
  * exists with CONFIG_UCLAMP_TASK; the vmlinux.h this tree builds against
@@ -30,6 +44,25 @@ static __always_inline bool mlfq_demotion_blocked(const struct task_struct *p)
 	return BPF_CORE_READ(p, uclamp_req[0].value) > 0;
 #else
 	(void)p;
+	return false;
+#endif
+}
+
+/*
+ * The task is waking from I/O when task_struct::in_iowait is set. The
+ * bitfield is read with the CO-RE bitfield macro (direct memory read is
+ * fine for the trusted task pointer ops.enqueue receives). The parameter
+ * is intentionally not named p, because BPF_CORE_READ_BITFIELD() declares
+ * its own local named p and would shadow it.
+ *
+ * Return: true if @task is an I/O waiter.
+ */
+static __always_inline bool mlfq_task_io_wait(const struct task_struct *task)
+{
+#if MLFQ_HAVE_IN_IOWAIT
+	return BPF_CORE_READ_BITFIELD(task, in_iowait);
+#else
+	(void)task;
 	return false;
 #endif
 }
@@ -99,14 +132,17 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
 	tctx->reenq_cnt = 0;
 
 	/*
-	 * Short-sleep boost: a wakeup within MLFQ_SHORT_SLEEP_NS is treated
-	 * as interactive and placed with a halved vslice at the front of Q1
+	 * IPC boost: a wakeup from I/O or a short sleep is treated as
+	 * interactive and placed with a halved vslice at the front of Q1
 	 * semantics, rate-limited per task (the stand-in for the kernel's
 	 * futex/IPC wakeup fast paths). mlfq_ss_boost_allowed() grants the
 	 * boost only once the previous rate-limit window has elapsed, so a
-	 * burst of short sleeps cannot chain boosts.
+	 * burst of short sleeps or I/O completions cannot chain boosts.
+	 * wake_cnt stays short-sleep based: an I/O wakeup does not count
+	 * toward the promotion hysteresis.
 	 */
-	if (sleep_ns && sleep_ns <= mlfq_short_sleep_ns &&
+	if (mlfq_boost_eligible(sleep_ns, mlfq_short_sleep_ns,
+				mlfq_task_io_wait(p)) &&
 	    mlfq_ss_boost_allowed(tctx->last_ss_boost_at, now,
 				  mlfq_short_sleep_rate_limit_ns)) {
 		tctx->flags |= MLFQ_TF_SHORT_SLEEP_BOOST;

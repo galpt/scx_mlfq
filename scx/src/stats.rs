@@ -51,6 +51,8 @@ pub struct Metrics {
     pub short_sleep_boosts: u64,
     #[stat(desc = "Wakeup preemption kicks")]
     pub preemption_kicks: u64,
+    #[stat(desc = "Q1 cpuperf target boosts set on running")]
+    pub cpuperf_boosts: u64,
 }
 
 impl Metrics {
@@ -60,7 +62,7 @@ impl Metrics {
             "[{}] run={} runtime_ns={} uptime_ns={} \
              placements: Q1={} Q2={} Q3={} \
              promotions={} demotions={} aging_boosts={} short_sleep_boosts={} \
-             preemption_kicks={}",
+             preemption_kicks={} cpuperf_boosts={}",
             crate::SCHEDULER_NAME,
             self.on_cpu,
             self.total_runtime,
@@ -73,6 +75,7 @@ impl Metrics {
             self.aging_boosts,
             self.short_sleep_boosts,
             self.preemption_kicks,
+            self.cpuperf_boosts,
         )?;
         Ok(())
     }
@@ -92,6 +95,7 @@ impl Metrics {
             aging_boosts: self.aging_boosts.wrapping_sub(rhs.aging_boosts),
             short_sleep_boosts: self.short_sleep_boosts.wrapping_sub(rhs.short_sleep_boosts),
             preemption_kicks: self.preemption_kicks.wrapping_sub(rhs.preemption_kicks),
+            cpuperf_boosts: self.cpuperf_boosts.wrapping_sub(rhs.cpuperf_boosts),
         }
     }
 }

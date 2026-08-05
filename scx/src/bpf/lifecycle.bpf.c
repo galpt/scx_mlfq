@@ -86,6 +86,25 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 	tctx->flags &= ~MLFQ_TF_FIRST_RUN;
 
 	__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
+
+	/*
+	 * cpufreq interaction: state the running task's performance class
+	 * through the sched_ext cpuperf API. The kernel stores the target
+	 * per CPU and it persists until overwritten, so setting it on every
+	 * ops.running() makes the last value always reflect the task now on
+	 * the CPU, and schedutil then picks the frequency. Q1 (interactive)
+	 * and Q2 (default) run at the maximum level, Q3 (CPU-bound) at half
+	 * for power efficiency. The counter reports Q1 placements as the
+	 * interactive boost signal.
+	 */
+	if (tctx->queue == 1) {
+		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), MLFQ_CPUPERF_Q1);
+		__sync_fetch_and_add(&mlfq_stats.cpuperf_boosts, 1);
+	} else if (tctx->queue == 2) {
+		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), MLFQ_CPUPERF_Q2);
+	} else {
+		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), MLFQ_CPUPERF_Q3);
+	}
 }
 
 void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)

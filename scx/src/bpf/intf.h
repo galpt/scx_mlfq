@@ -97,6 +97,21 @@ enum mlfq_consts {
 	MLFQ_Q2_QUOTA			= 8ULL,
 	MLFQ_DISPATCH_MAX_BATCH		= 32ULL,
 
+	/*
+	 * sched_ext cpuperf levels (scx_bpf_cpuperf_set(), the schedutil
+	 * target hint). The perf argument is a linear relative level in
+	 * [0, SCX_CPUPERF_ONE]; SCX_CPUPERF_ONE is 0x400 (1024), the
+	 * maximum level. The kernel stores the target per-CPU and it
+	 * persists until overwritten, so ops.running() states the level of
+	 * the task now on the CPU on every context switch and schedutil
+	 * follows. Q1 (interactive) and Q2 (default) run at the maximum
+	 * level, Q3 (CPU-bound) at half.
+	 */
+	MLFQ_CPUPERF_ONE			= 1024ULL,
+	MLFQ_CPUPERF_Q1			= 1024ULL,
+	MLFQ_CPUPERF_Q2			= 1024ULL,
+	MLFQ_CPUPERF_Q3			= 512ULL,
+
 	/* One global vtime-ordered DSQ per queue. */
 	MLFQ_DSQ_Q1			= 1ULL,
 	MLFQ_DSQ_Q2			= 2ULL,
@@ -199,6 +214,7 @@ struct mlfq_stats {
 	u64 aging_boosts;
 	u64 short_sleep_boosts;
 	u64 preemption_kicks;
+	u64 cpuperf_boosts;
 };
 
 /*
@@ -276,6 +292,30 @@ static __always_inline bool mlfq_ss_boost_allowed(u64 last_boost_at, u64 now,
 	if (!last_boost_at)
 		return true;
 	return mlfq_time_before(last_boost_at + rate_limit, now);
+}
+
+/**
+ * mlfq_boost_eligible - IPC boost eligibility at wakeup.
+ * @sleep_ns: Sleep duration at wakeup (scx_bpf_now() delta, 0 = none).
+ * @window_ns: Short-sleep window (MLFQ_SHORT_SLEEP_NS).
+ * @io_wait: True when the wakeup is an I/O completion
+ *	(task_struct::in_iowait).
+ *
+ * A wakeup is boost-eligible when it is an I/O wakeup regardless of the
+ * sleep length, or when the sleep fell within the short-sleep window. The
+ * I/O-wait case extends the futex/IPC approximation to the other classic
+ * interactive wakeup source. The rate limit is applied separately by the
+ * caller (mlfq_ss_boost_allowed()), so an I/O wakeup burst cannot chain
+ * boosts.
+ *
+ * Return: true if the wakeup is boost-eligible.
+ */
+static __always_inline bool mlfq_boost_eligible(u64 sleep_ns, u64 window_ns,
+						bool io_wait)
+{
+	if (io_wait)
+		return true;
+	return sleep_ns && sleep_ns <= window_ns;
 }
 
 /**

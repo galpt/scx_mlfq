@@ -182,6 +182,7 @@ impl<'a> Scheduler<'a> {
             aging_boosts: s.aging_boosts,
             short_sleep_boosts: s.short_sleep_boosts,
             preemption_kicks: s.preemption_kicks,
+            cpuperf_boosts: s.cpuperf_boosts,
         }
     }
 

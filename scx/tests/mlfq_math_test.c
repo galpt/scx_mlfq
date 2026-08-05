@@ -366,6 +366,26 @@ static void test_ss_boost_allowed(void)
 		"wrap-around clock: a future boost timestamp blocks");
 }
 
+static void test_boost_eligible(void)
+{
+	u64 win = 1000000;	/* MLFQ_SHORT_SLEEP_NS */
+
+	TEST_OK(mlfq_boost_eligible(0, win, true),
+		"I/O wakeup with no sleep is eligible");
+	TEST_OK(mlfq_boost_eligible(5000000, win, true),
+		"I/O wakeup after a long sleep is eligible");
+	TEST_OK(!mlfq_boost_eligible(0, win, false),
+		"no sleep and not I/O is not eligible");
+	TEST_OK(mlfq_boost_eligible(500000, win, false),
+		"short sleep is eligible");
+	TEST_OK(!mlfq_boost_eligible(2000000, win, false),
+		"long sleep without I/O is not eligible");
+	TEST_OK(!mlfq_boost_eligible(win + 1, win, false),
+		"sleep just past the window is not eligible");
+	TEST_OK(mlfq_boost_eligible(win, win, false),
+		"sleep exactly at the window is eligible");
+}
+
 int main(void)
 {
 	test_calc_delta_fair();
@@ -379,6 +399,7 @@ int main(void)
 	test_promote_hysteresis();
 	test_demote_hysteresis();
 	test_ss_boost_allowed();
+	test_boost_eligible();
 	test_mlfq_check_predicates();
 	test_bitmap();
 
