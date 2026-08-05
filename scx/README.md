@@ -28,4 +28,4 @@ There are no cgroup ops. The kernel folds cgroup shares into the task weight, wh
 
 ## Production Ready?
 
-Experimental. The scheduler is verifier-clean across the CI kernel range and passes the stress gate without stalls, but it has not been formally benchmarked against the fair scheduler yet.
+The scheduler has been tested under stress-ng at full CPU load and in regular gaming and desktop use, with no stalls or issues observed. Formal benchmark results against the fair scheduler are not published yet.
