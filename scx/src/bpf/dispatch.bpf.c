@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Dispatch — queue service with quotas, included by main.bpf.c via
+ * Dispatch - queue service with quotas, included by main.bpf.c via
  * #include.
  *
  * The kernel serves SCX_DSQ_LOCAL before ops.dispatch() (ext.c dispatch
@@ -14,7 +14,7 @@
  *
  * The three quotas are served by three independent, tightly bounded loops.
  * Each iteration is a queue-nonempty check, one move and one stat
- * increment — no nested branch chains — which keeps the verifier state
+ * increment - no nested branch chains - which keeps the verifier state
  * small.
  */
 

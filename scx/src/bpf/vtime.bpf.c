@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * EEVDF virtual-time substrate — included by main.bpf.c via #include.
+ * EEVDF virtual-time substrate, included by main.bpf.c via #include.
  *
  * The pure math (calc_delta_fair_bpf, avg_vruntime, entity_lag_clamp,
  * place_entity) lives in intf.h so the native unit-test harness compiles
@@ -204,7 +204,9 @@ static __always_inline u64 mlfq_place_task(u32 qid, struct task_ctx *tctx,
 	bpf_spin_unlock(lock);
 
 	return deadline;
-}/*
+}
+
+/*
  * Remove @tctx from queue @q's aggregate (ops.running()/exit_task()).
  * Caller looks up @q by tctx->queue.
  */

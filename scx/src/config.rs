@@ -5,7 +5,7 @@
 // This software may be used and distributed according to the terms of the GNU
 // General Public License version 2.
 
-//! Userspace configuration — validated tunables written into BPF rodata.
+//! Userspace configuration, validated tunables written into BPF rodata.
 //!
 //! `Config` is the single validated set of scheduler tunables; the BPF side
 //! reads them from `const volatile` rodata globals declared in
@@ -54,7 +54,7 @@ const EMA_HALF_LIFE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_EMA_HALF_LIFE_NS
 /// Aging period.
 const AGING_PERIOD_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_AGING_PERIOD_NS as u64;
 
-/// Short-sleep boost / IPC approximation.
+/// Short-sleep boost window.
 const SHORT_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_NS as u64;
 const SHORT_SLEEP_RATE_LIMIT_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS as u64;
@@ -93,7 +93,7 @@ pub struct Config {
     pub ema_half_life_ns: u64,
     /// Global aging period, nsecs.
     pub aging_period_ns: u64,
-    /// Short-sleep (IPC approximation) boost window, nsecs.
+    /// Short-sleep boost window, nsecs.
     pub short_sleep_ns: u64,
     /// Per-task short-sleep boost rate limit, nsecs.
     pub short_sleep_rate_limit_ns: u64,
@@ -204,7 +204,7 @@ impl Config {
          * dispatch() serves Q1 up to its quota, then Q2 up to its quota,
          * then the Q3 remainder within dispatch_max_batch.
          * If the quotas consume the whole batch, Q3 never runs on a busy
-         * system — the cross-queue starvation bound depends on this slack.
+         * system - the cross-queue starvation bound depends on this slack.
          */
         if u64::from(self.q1_quota) + u64::from(self.q2_quota) >= u64::from(self.dispatch_max_batch)
         {
@@ -235,13 +235,13 @@ impl Config {
     /// Write the validated tunables into the BPF object's rodata section.
     ///
     /// Must be called on the opened, not-yet-loaded skeleton, before
-    /// `scx_ops_load!()` — rodata becomes read-only after load.
+    /// `scx_ops_load!()` - rodata becomes read-only after load.
     pub fn apply(&self, skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<()> {
         let rodata = skel
             .maps
             .rodata_data
             .as_mut()
-            .context("rodata missing — BPF object has no .rodata section")?;
+            .context("rodata missing, the BPF object has no .rodata section")?;
         rodata.mlfq_q1_slice_ns = self.q1_slice_ns;
         rodata.mlfq_q2_slice_ns = self.q2_slice_ns;
         rodata.mlfq_q3_slice_ns = self.q3_slice_ns;
@@ -376,7 +376,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the short-sleep (IPC approximation) boost window in nsecs.
+    /// Set the short-sleep boost window in nsecs.
     pub fn short_sleep_ns(mut self, v: u64) -> Self {
         self.short_sleep_ns = Some(v);
         self

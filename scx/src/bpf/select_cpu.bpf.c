@@ -2,18 +2,18 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * CPU selection — included by main.bpf.c via #include.
+ * CPU selection, included by main.bpf.c via #include.
  *
  * Placement policy, in order of preference:
  *
- *   1. prev CPU when idle (cache warmth) — an interactive task on a hybrid
+ *   1. prev CPU when idle (cache warmth) - an interactive task on a hybrid
  *      system only sticks to prev when it is a primary core.
- *   2. An idle CPU in the waker's LLC domain (cache locality) — interactive
+ *   2. An idle CPU in the waker's LLC domain (cache locality) - interactive
  *      tasks additionally require a big core there, and an all-efficiency
  *      waker LLC is skipped so the wakeup can land on a faster LLC.
  *   3. The global fallbacks: Q1 prefers an idle primary core (the bitmap is
  *      scanned in ascending CPU order and the first idle and allowed member
- *      wins — there is no capacity ordering), Q2/Q3 take any idle CPU.
+ *      wins - there is no capacity ordering), Q2/Q3 take any idle CPU.
  *   4. When no CPU is selected, prev_cpu is returned: the kernel validates
  *      the return as a CPU number (any negative value aborts the
  *      scheduler), and the task then goes through the normal enqueue path
@@ -145,7 +145,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	primary_bm = mlfq_get_primary_bitmap();
 
 	/*
-	 * Step 1 — prev CPU fast path. The prev CPU is preferred when idle
+	 * Step 1 - prev CPU fast path. The prev CPU is preferred when idle
 	 * for cache locality. An interactive task on a hybrid system only
 	 * sticks to prev when it is a primary core: settling an interactive
 	 * wakeup on an efficiency core would trade cache warmth for
@@ -160,7 +160,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
-	 * Step 2 — LLC-aware placement: keep the wakeup in the waker's
+	 * Step 2 - LLC-aware placement: keep the wakeup in the waker's
 	 * cache domain. The waker is the current CPU. For Q1 an
 	 * all-efficiency LLC is skipped entirely so the wakeup can land on
 	 * an idle primary of a faster LLC via the global fallbacks below.
@@ -180,7 +180,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
-	 * Step 3 — global fallbacks. Q1 prefers an idle primary core, with
+	 * Step 3 - global fallbacks. Q1 prefers an idle primary core, with
 	 * the SMT-aware whole-core preference on uniform-capacity systems;
 	 * Q2/Q3 take any idle CPU.
 	 */

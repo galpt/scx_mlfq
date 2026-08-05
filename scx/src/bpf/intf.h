@@ -71,7 +71,7 @@ enum mlfq_consts {
 	/* EMA decay half-life. */
 	MLFQ_EMA_HALF_LIFE_NS		= (24ULL * NSEC_PER_MSEC),
 
-	/* Short-sleep boost / IPC approximation. */
+	/* Short-sleep boost window. */
 	MLFQ_SHORT_SLEEP_NS		= (1ULL * NSEC_PER_MSEC),
 	MLFQ_SHORT_SLEEP_RATE_LIMIT_NS	= (2ULL * NSEC_PER_MSEC),
 	MLFQ_HYSTERESIS_SLEEP_NS	= (4ULL * NSEC_PER_MSEC),
@@ -303,8 +303,8 @@ static __always_inline bool mlfq_ss_boost_allowed(u64 last_boost_at, u64 now,
  *
  * A wakeup is boost-eligible when it is an I/O wakeup regardless of the
  * sleep length, or when the sleep fell within the short-sleep window. The
- * I/O-wait case extends the futex/IPC approximation to the other classic
- * interactive wakeup source. The rate limit is applied separately by the
+ * I/O-wait case covers the other classic interactive wakeup source beside
+ * the short-sleep window. The rate limit is applied separately by the
  * caller (mlfq_ss_boost_allowed()), so an I/O wakeup burst cannot chain
  * boosts.
  *

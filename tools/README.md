@@ -19,10 +19,10 @@ discipline on top of EEVDF-style virtual-time scheduling: three global queues
 interactivity gauge (plus hysteresis) deciding which queue a task lives in.
 Interactive-first desktop/latency workloads are served from Q1, batch work is
 demoted toward Q3. Like all sched_ext schedulers it handles **non-RT tasks
-only** — the kernel's rt/dl classes are untouched. It is the designed
-successor to `scx_flow`. There is **no web UI and no TCP listener** (locked
-design decision): the scheduler attaches directly to the kernel and can only
-be observed through the kernel's sched_ext interface and `scx_mlfq --stats`.
+only**, so the kernel's rt/dl classes are untouched. It is the successor to
+`scx_flow`. There is **no web UI and no TCP listener**, so the scheduler
+attaches directly to the kernel and can only be observed through the
+kernel's sched_ext interface and `scx_mlfq --stats`.
 
 ## Prerequisites
 
@@ -55,17 +55,17 @@ Defaults (matching the beta-testing workflow):
 
 Options:
 
-- `--repo URL` — repository to clone (must be a full `scx` workspace).
-- `--branch NAME` — branch to clone.
-- `--source-dir DIR` — build from a local `scx` workspace instead of cloning.
+- `--repo URL` - repository to clone (must be a full `scx` workspace).
+- `--branch NAME` - branch to clone.
+- `--source-dir DIR` - build from a local `scx` workspace instead of cloning.
   `DIR` must contain `Cargo.toml` with `scheds/experimental/scx_mlfq` listed
   as a workspace member. `--repo`/`--branch` are ignored when set.
-- `--force` — skip the interactive confirmation when `/usr/bin/scx_mlfq` is
+- `--force` - skip the interactive confirmation when `/usr/bin/scx_mlfq` is
   owned by a package; also backs up and replaces a conflicting pre-existing
   drop-in instead of refusing.
-- `--dry-run` — validate inputs and print every action **without** cloning,
+- `--dry-run` - validate inputs and print every action **without** cloning,
   building, or changing the system.
-- `--help`, `-h` — print help.
+- `--help`, `-h` - print help.
 
 Examples:
 
@@ -159,7 +159,7 @@ The uninstaller is **manifest-driven and idempotent**:
     with a warning.
 - It removes **only** the installer's own drop-in
   (`scx_mlfq-beta.conf`, and only if it byte-matches what the installer
-  writes — otherwise it is left in place with a warning; the parent
+  writes, otherwise it is left in place with a warning, and the parent
   `scx.service.d/` is removed only if now empty), any recorded drop-in
   backup, the binary backup, and the manifest, then runs
   `systemctl daemon-reload`.
@@ -235,7 +235,7 @@ state is only visible through the kernel's sched_ext interface
   binary swap, the old binary stays in place and the leftover stage file is
   cleaned up by the EXIT trap; re-run the installer to finish.
 - `--dry-run` requires root, performs no clone and no build, and changes
-  nothing — it is a safe way to check the installer's decisions (including
+  nothing, it is a safe way to check the installer's decisions (including
   whether `/usr/bin/scx_mlfq` is currently package-owned).
 - The installer uses only owned temporary build directories (under
   `/tmp/scx_mlfq-build.*`, created with `mktemp`) and removes them on exit.

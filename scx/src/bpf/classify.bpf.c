@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Classification — EMA gauge, queue mapping, hysteresis.
+ * Classification - EMA gauge, queue mapping, hysteresis.
  *
  * The gauge is a continuous interactivity measure mapped onto the
  * three queues: it climbs per run segment in stopping() and decays per
@@ -107,8 +107,7 @@ static __always_inline void mlfq_ema_climb_task(struct task_ctx *tctx,
  *
  * Applies, in order: EMA decay over the sleep, the rate-limited short-sleep
  * IPC boost, the band-hysteresis promotion and the long-sleep base-mapping
- * boost. Updates the promotion
- * and boost stats.
+ * boost. Updates the promotion and boost stats.
  */
 static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
 						 __maybe_unused,

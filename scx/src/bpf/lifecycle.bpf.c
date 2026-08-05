@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Task lifecycle — included by main.bpf.c via #include.
+ * Task lifecycle, included by main.bpf.c via #include.
  *
  * init_task/enable initialize the task context; running() drops the task
  * from its queue aggregate and records the local-curr fold inputs;

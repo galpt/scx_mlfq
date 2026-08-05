@@ -13,12 +13,12 @@
 /*
  * This file defines the BPF maps, volatiles, and ops dispatch table.
  * The scheduling logic is organized into separate modules included below:
- *   vtime.bpf.c      — EEVDF virtual-time substrate (aggregates, placement)
- *   classify.bpf.c   — EMA gauge, queue mapping, hysteresis
- *   select_cpu.bpf.c — per-queue CPU selection
- *   enqueue.bpf.c    — enqueue routing, aging, preemption kicks
- *   dispatch.bpf.c   — queue service with quotas
- *   lifecycle.bpf.c  — init_task/enable/running/stopping/exit_task/exit
+ *   vtime.bpf.c      - EEVDF virtual-time substrate (aggregates, placement)
+ *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
+ *   select_cpu.bpf.c - per-queue CPU selection
+ *   enqueue.bpf.c    - enqueue routing, aging, preemption kicks
+ *   dispatch.bpf.c   - queue service with quotas
+ *   lifecycle.bpf.c  - init_task/enable/running/stopping/exit_task/exit
  */
 
 #include <scx/common.bpf.h>
@@ -85,8 +85,8 @@ volatile struct mlfq_stats mlfq_stats;
  * mlfq_primary_bitmap[0] holds the primary (big-core) CPU set;
  * mlfq_llc_bitmaps[llc_id] holds the CPU membership of one LLC domain.
  * Both are plain u64 bitmaps in ARRAY map values, written by the Rust
- * front-end after load and read as map values by the CPU-selection path —
- * no kernel cpumask kptrs, so no RCU discipline is required.
+ * front-end after load and read as map values by the CPU-selection path,
+ * so no kernel cpumask kptrs and no RCU discipline are required.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -103,7 +103,7 @@ struct {
 } mlfq_llc_bitmaps SEC(".maps");
 
 /*
- * Tunables — rodata, materialized by cargo-veristat from the
+ * Tunables - rodata, materialized by cargo-veristat from the
  * veristat/9950x.json config. Compile-time defaults match the constants
  * in intf.h; the Rust front-end may override them before load.
  */

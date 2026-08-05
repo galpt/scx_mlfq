@@ -5,17 +5,13 @@
 // This software may be used and distributed according to the terms of the GNU
 // General Public License version 2.
 
-//! scx_mlfq — a Multilevel Feedback Queue scheduler for sched_ext.
+//! scx_mlfq, a Multilevel Feedback Queue scheduler for sched_ext.
 //!
 //! Three global, virtual-time-ordered user DSQs (Q1/Q2/Q3) over an EEVDF
 //! virtual-time substrate. Tasks are classified into queues by an EMA
 //! interactivity gauge with band hysteresis, promoted by short-sleep and
-//! aging, demoted by slice exhaustion. See README.md for the full
-//! description, the preserved/approximated EEVDF breakdown and the honest
-//! deviation list.
-//!
-//! RT/DL tasks are scheduled by the kernel rt/dl classes — sched_ext sits
-//! below the fair class, so this scheduler handles non-RT tasks only.
+//! aging, demoted by slice exhaustion. See README.md for the design
+//! overview.
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -168,7 +164,7 @@ impl<'a> Scheduler<'a> {
             .maps
             .bss_data
             .as_ref()
-            .expect("bss_data missing — BPF object has no .bss section");
+            .expect("bss_data missing, the BPF object has no .bss section");
         let s = &bss_data.mlfq_stats;
         Metrics {
             on_cpu: s.on_cpu,

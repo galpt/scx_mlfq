@@ -5,7 +5,7 @@
 // This software may be used and distributed according to the terms of the GNU
 // General Public License version 2.
 
-//! Stats server — `#[derive(Stats)]` metrics and monitor loop.
+//! Stats server, `#[derive(Stats)]` metrics and monitor loop.
 //!
 //! `Metrics` corresponds to the BPF-side `struct mlfq_stats` (a `volatile` global
 //! declared in `src/bpf/intf.h`, defined in `src/bpf/main.bpf.c`) plus a
@@ -47,7 +47,7 @@ pub struct Metrics {
     pub demotions: u64,
     #[stat(desc = "Aging boosts to Q1")]
     pub aging_boosts: u64,
-    #[stat(desc = "Short-sleep IPC boosts")]
+    #[stat(desc = "Short-sleep and I/O wakeup boosts")]
     pub short_sleep_boosts: u64,
     #[stat(desc = "Wakeup preemption kicks")]
     pub preemption_kicks: u64,

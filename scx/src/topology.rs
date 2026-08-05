@@ -15,10 +15,10 @@
 //!
 //! Two phases:
 //!
-//! 1. `init_topology()` — before `scx_ops_load!()`: discovers the
+//! 1. `init_topology()` - before `scx_ops_load!()`: discovers the
 //!    topology, computes the plans, and writes the rodata globals (rodata
 //!    is frozen at load).
-//! 2. `write_primary_bitmap()` / `write_llc_bitmaps()` — after
+//! 2. `write_primary_bitmap()` / `write_llc_bitmaps()` - after
 //!    `scx_ops_load!()`: writes the CPU-membership bitmaps directly into
 //!    the ARRAY maps (`mlfq_primary_bitmap`, `mlfq_llc_bitmaps`) that the
 //!    CPU-selection path reads.
@@ -199,7 +199,7 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
         .maps
         .rodata_data
         .as_mut()
-        .context("rodata missing — BPF object has no .rodata section")?;
+        .context("rodata missing, the BPF object has no .rodata section")?;
     rodata.mlfq_primary_all = capacity.primary_all;
     rodata.mlfq_nr_llcs = llcs.nr_llcs;
     rodata.mlfq_llc_has_primary = llcs.has_primary;
@@ -207,7 +207,7 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
 
     if capacity.primary_all {
         info!(
-            "Topology: {} online CPUs, uniform capacity — all treated as primary",
+            "Topology: {} online CPUs, uniform capacity, all treated as primary",
             nr_online
         );
     } else {

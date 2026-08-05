@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Enqueue routing — included by main.bpf.c via #include.
+ * Enqueue routing, included by main.bpf.c via #include.
  *
  * The MLFQ enqueue path:
  *   WAKEUP -> EMA decay + classification, then placement
@@ -221,10 +221,9 @@ done:
 	/*
 	 * Wakeup preemption: a higher-priority arrival
 	 * preempts the lower-priority task running on prev_cpu. The kick is
-	 * restricted to genuine promotions into Q1 (from Q2/Q3) or into Q2
-	 * (from Q3) -- the "only into Q1 from Q2/Q3, or Q2 from Q3" guard --
-	 * which keeps borderline-promotion IPI storms out. Never kick the
-	 * wakee itself and never kick the local CPU.
+	 * restricted to genuine promotions, into Q1 from Q2 or Q3 and into
+	 * Q2 from Q3, which keeps borderline-promotion IPI storms out. Never
+	 * kick the wakee itself and never kick the local CPU.
 	 */
 	if (wakeup && !migration_disabled) {
 		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
