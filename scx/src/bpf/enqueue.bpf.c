@@ -36,11 +36,6 @@ static __always_inline u64 mlfq_queue_slice(u8 qid)
 	return mlfq_q3_slice_ns;
 }
 
-static __always_inline u64 mlfq_dsq_id(u8 qid)
-{
-	return MLFQ_DSQ_Q1 + (u64)(qid - 1);
-}
-
 static __always_inline void mlfq_stat_placement(u8 qid)
 {
 	if (qid == 1)
@@ -61,9 +56,20 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	bool wakeup, runout, inflate, local_fast_path, migration_disabled;
 	bool sched_idle;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
+	s32 target_cpu;
 
 	tctx = mlfq_lookup_task_ctx(p);
 	if (!tctx)
+		return;
+
+	/*
+	 * A task that is still queued keeps its existing placement: its
+	 * DSQ entry is already live and the queue aggregate already
+	 * accounts for it. Re-classifying or re-inserting it would
+	 * double-insert the rbtree entry and desync the queue aggregate,
+	 * so the enqueue is a no-op in that case.
+	 */
+	if (p->scx.flags & SCX_TASK_QUEUED)
 		return;
 
 	/* Refresh the weight cache; the kernel clamps p->scx.weight to [1, 10000]. */
@@ -164,6 +170,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 					   false);
 		if (!deadline)
 			return;
+		/*
+		 * Placed on the pinned CPU's local DSQ, not in a queue
+		 * DSQ, so dsq_id is cleared.
+		 */
+		tctx->dsq_id = 0;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
 				   mlfq_queue_slice(qid), enq_flags);
 		if (cpu)
@@ -186,6 +197,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 					   false);
 		if (!deadline)
 			return;
+		/*
+		 * The idle-CPU fast path places the task on the local DSQ,
+		 * not in a queue DSQ, so dsq_id is cleared.
+		 */
+		tctx->dsq_id = 0;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, mlfq_queue_slice(qid),
 				   enq_flags);
 		if (cpu)
@@ -195,12 +211,27 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		goto done;
 	}
 
-	/* Regular path: into the queue's global vtime DSQ. */
+	/*
+	 * The queue DSQ a task is placed in is owned by the CPU it is
+	 * enqueued to: a wakeup lands on prev_cpu, the CPU the task was
+	 * last running on, while run-out re-enqueues and fork/class-switch
+	 * placements run on the rq the task is being enqueued to, which is
+	 * the enqueueing CPU. Each CPU drains only its own three queue
+	 * DSQs (see dispatch.bpf.c), so the insert must target the owning
+	 * CPU's queue.
+	 */
+	if (wakeup)
+		target_cpu = prev_cpu;
+	else
+		target_cpu = bpf_get_smp_processor_id();
+
+	/* Regular path: into the owning CPU's queue vtime DSQ. */
 	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
 	if (!deadline)
 		return;
-	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid), mlfq_queue_slice(qid),
-				 deadline, enq_flags);
+	tctx->dsq_id = mlfq_dsq_id(qid, target_cpu);
+	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
+				 mlfq_queue_slice(qid), deadline, enq_flags);
 	mlfq_stat_placement(qid);
 
 	/* Keep the fast-path state from leaking into the next enqueue. */

@@ -176,7 +176,8 @@ static __always_inline struct mlfq_cpu_state *mlfq_lookup_cpu_state(s32 cpu)
 s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 {
 	struct queue_ctx *q;
-	u32 key;
+	u32 key, qid, nr_cpus;
+	s32 cpu;
 	s32 ret;
 
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
@@ -186,21 +187,58 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 		return -E2BIG;
 	}
 
-	/* Create the three global vtime-ordered queue DSQs. */
-	ret = scx_bpf_create_dsq(MLFQ_DSQ_Q1, -1);
-	if (ret < 0 && ret != -EEXIST) {
-		scx_bpf_error("failed to create Q1 DSQ: %d", ret);
-		return ret;
+	/*
+	 * Snapshot the CPU count once; the DSQ creation loop and the
+	 * id-space invariant below are keyed on it.
+	 */
+	nr_cpus = (u32)nr_cpu_ids;
+	if (nr_cpus == 0) {
+		scx_bpf_error("no possible CPUs");
+		return -EINVAL;
 	}
-	ret = scx_bpf_create_dsq(MLFQ_DSQ_Q2, -1);
-	if (ret < 0 && ret != -EEXIST) {
-		scx_bpf_error("failed to create Q2 DSQ: %d", ret);
-		return ret;
+
+	/*
+	 * Create the per-CPU vtime-ordered queue DSQs. bpf_for() is an
+	 * iterator-backed loop: the bound is a runtime value (the checked
+	 * CPU count) and the iterator contract lets the verifier bound the
+	 * iteration without unrolling it.
+	 */
+	bpf_for(cpu, 0, nr_cpus) {
+		for (qid = 1; qid <= MLFQ_NR_QUEUES; qid++) {
+			ret = scx_bpf_create_dsq(mlfq_dsq_id(qid, cpu), -1);
+			if (ret < 0 && ret != -EEXIST) {
+				scx_bpf_error("failed to create q%u cpu%d DSQ: %d",
+					      qid, cpu, ret);
+				return ret;
+			}
+		}
 	}
-	ret = scx_bpf_create_dsq(MLFQ_DSQ_Q3, -1);
-	if (ret < 0 && ret != -EEXIST) {
-		scx_bpf_error("failed to create Q3 DSQ: %d", ret);
-		return ret;
+
+	/*
+	 * The dispatch batch is served as q1 + q2 + q3, with the Q3 share
+	 * computed as the unsigned remainder of dispatch_max_batch (see
+	 * dispatch.bpf.c). Quotas that cover the whole batch would wrap
+	 * that remainder and unbind the Q3 service loop, so the
+	 * configuration is rejected outright.
+	 */
+	if (mlfq_q1_quota + mlfq_q2_quota >= mlfq_dispatch_max_batch) {
+		scx_bpf_error("Q1+Q2 quotas (%u+%u) must leave a Q3 share of "
+			      "max batch %u",
+			      mlfq_q1_quota, mlfq_q2_quota,
+			      mlfq_dispatch_max_batch);
+		return -EINVAL;
+	}
+
+	/*
+	 * The queue DSQ id space must stay below the top bits the kernel
+	 * reserves for the SCX_DSQ_LOCAL / SCX_DSQ_LOCAL_ON flags, so the
+	 * mlfq_dsq_id() arithmetic never collides with the local DSQ
+	 * range. With the per-CPU layout the highest id is owned by the
+	 * last queue on the last CPU.
+	 */
+	if (mlfq_dsq_id(MLFQ_NR_QUEUES, (s32)(nr_cpus - 1)) >= SCX_DSQ_LOCAL_ON) {
+		scx_bpf_error("queue DSQ id space overflows SCX_DSQ_LOCAL_ON");
+		return -EINVAL;
 	}
 
 	/* Initialize the per-queue aggregates. */

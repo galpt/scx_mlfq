@@ -113,12 +113,18 @@ enum mlfq_consts {
 	MLFQ_CPUPERF_Q2			= 1024ULL,
 	MLFQ_CPUPERF_Q3			= 512ULL,
 
-	/* One global vtime-ordered DSQ per queue. */
-	MLFQ_DSQ_Q1			= 1ULL,
-	MLFQ_DSQ_Q2			= 2ULL,
-	MLFQ_DSQ_Q3			= 3ULL,
-
 	MLFQ_NR_QUEUES			= 3ULL,
+
+	/*
+	 * Per-CPU vtime-ordered queue DSQ id space. Every CPU owns
+	 * MLFQ_NR_QUEUES DSQs, laid out as MLFQ_DSQ_BASE +
+	 * cpu * MLFQ_DSQ_STRIDE + (qid - 1) so the owning CPU and queue
+	 * decode arithmetically (see mlfq_dsq_id()). The range ends far
+	 * below SCX_DSQ_LOCAL_ON, which reserves the top bits for the
+	 * kernel DSQ flags; init() validates this at load time.
+	 */
+	MLFQ_DSQ_BASE			= 0x1000ULL,
+	MLFQ_DSQ_STRIDE			= MLFQ_NR_QUEUES,
 
 	/*
 	 * Compile-time CPU bound for the per-CPU capacity array. Matches the
@@ -151,7 +157,7 @@ enum mlfq_task_flags {
 /*
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the per-queue clock and only meaningful relative
- * to the owning queue's zero_vruntime. The struct is 80 bytes.
+ * to the owning queue's zero_vruntime. The struct is 88 bytes.
  */
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
@@ -162,6 +168,7 @@ struct task_ctx {
 	u64 last_sleep_at;		/* scx_bpf_now() at stopping(!runnable) */
 	u64 queued_at;			/* start of the current Q2/Q3 stay */
 	u64 last_ss_boost_at;		/* last short-sleep boost, rate limit */
+	u64 dsq_id;			/* user DSQ the task is queued in, 0 when not in a queue DSQ */
 	u32 weight;			/* cached p->scx.weight [1..10000] */
 	u8  queue;			/* current queue, 1..3 */
 	u8  reenq_cnt;			/* consecutive slice exhaustions */
@@ -227,6 +234,18 @@ struct mlfq_stats {
 struct mlfq_bitmap {
 	u64 words[MLFQ_BITMAP_WORDS];
 };
+
+/*
+ * One virtual-time DSQ per queue per CPU. The id is
+ * MLFQ_DSQ_BASE + cpu * MLFQ_DSQ_STRIDE + (qid - 1), so the owning
+ * CPU and queue decode arithmetically: (id - base) / stride and
+ * (id - base) % stride. The range ends far below SCX_DSQ_LOCAL_ON,
+ * which reserves the top bits for the kernel DSQ flags.
+ */
+static __always_inline u64 mlfq_dsq_id(u8 qid, s32 cpu)
+{
+	return MLFQ_DSQ_BASE + (u64)cpu * MLFQ_DSQ_STRIDE + (u64)(qid - 1);
+}
 
 /**
  * mlfq_bitmap_test_cpu - Test a CPU's bit in a bitmap.
