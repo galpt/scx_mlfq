@@ -40,6 +40,9 @@ jobs:
       - name: Format
         working-directory: /tmp/scx
         run: cargo fmt -p scx_mlfq --check
+      - name: Clippy
+        working-directory: /tmp/scx
+        run: cargo clippy --profile ci --no-deps --locked -p scx_mlfq -- -D warnings
       - name: Unit tests
         working-directory: /tmp/scx
         run: cargo test --profile ci --locked -p scx_mlfq
