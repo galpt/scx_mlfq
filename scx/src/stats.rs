@@ -57,7 +57,7 @@ pub struct Metrics {
     pub steals: u64,
     #[stat(desc = "Solo-task keep-running grants on empty dispatch")]
     pub keep_running: u64,
-    #[stat(desc = "Enqueues dropped for missing task state")]
+    #[stat(desc = "Enqueues dropped when task state cannot be allocated")]
     pub enq_no_tctx: u64,
     #[stat(desc = "Enqueues dropped for bad weight")]
     pub enq_bad_weight: u64,

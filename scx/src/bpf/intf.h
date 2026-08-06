@@ -220,7 +220,6 @@ struct mlfq_cpu_state {
 	u64 q3_dispatches;
 	u64 steal_dispatches;		/* per-CPU moves from remote queue DSQs */
 	u64 fast_path_dispatches;
-	u64 preemption_kicks;
 	u64 migration_disabled_placements;
 };
 

@@ -7,9 +7,9 @@
  * The gauge is a continuous interactivity measure mapped onto the
  * three queues: it climbs per run segment in stopping() and decays per
  * sleep at wakeup; see mlfq_ema_climb()/mlfq_ema_decay() in intf.h. Queue
- * changes require crossing a band, not a point, so the
- * demote/promote state machines here carry the consecutive-event counters
- * that implement the hysteresis.
+ * changes require crossing a band, not a point, so the demotion and
+ * promotion entry points here drive the consecutive-event counters in
+ * intf.h that implement the hysteresis.
  */
 
 #include <bpf/bpf_core_read.h>

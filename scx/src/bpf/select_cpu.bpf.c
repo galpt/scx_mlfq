@@ -10,7 +10,8 @@
  * corresponding points in mlfq_select_cpu() below. When no CPU is
  * selected, prev_cpu is returned: the kernel validates the return as a
  * CPU number (any negative value aborts the scheduler), and the task
- * then goes through the normal enqueue path into the shared vtime DSQs.
+ * then goes through the normal enqueue path into the owning CPU's queue
+ * vtime DSQ.
  *
  * With SCX_OPS_ENQ_MIGRATION_DISABLED the kernel never invokes this
  * callback for migration-disabled tasks.

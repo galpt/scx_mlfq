@@ -49,6 +49,16 @@ const MAX_CPUS: usize = mlfq_consts_MLFQ_MAX_CPUS as usize;
 /// Compile-time LLC bound; must match `MLFQ_MAX_LLCS` in `src/bpf/intf.h`.
 const MAX_LLCS: usize = mlfq_consts_MLFQ_MAX_LLCS as usize;
 
+/// Whether SMT is active on the host, read from the kernel's
+/// `/sys/devices/system/cpu/smt/active` interface. The knob is absent on
+/// systems without SMT support; a missing or unreadable knob yields
+/// `None`, so the caller can omit the SMT annotation from the startup
+/// banner rather than guessing.
+pub fn smt_enabled() -> Option<bool> {
+    let active = std::fs::read_to_string("/sys/devices/system/cpu/smt/active").ok()?;
+    active.trim().parse::<u8>().ok().map(|v| v == 1)
+}
+
 /// Capacity-planning decision, separated from sysfs discovery so the pure
 /// logic is unit-testable without touching the host topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +156,8 @@ pub fn plan_llcs(cpu_to_llc: &[(u32, u32)], primary_cpus: &[u32], max_llcs: usiz
 pub struct TopologyPlan {
     pub capacity: CapacityPlan,
     pub llcs: LlcPlan,
+    /// Number of non-empty NUMA nodes (0 when discovery failed).
+    pub nr_numa_nodes: usize,
 }
 
 /// Phase 1 (pre-load): discover the topology and write the rodata globals.
@@ -168,11 +180,17 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
                     llc_cpus: Vec::new(),
                     cpu_llc: [0; MAX_CPUS],
                 },
+                nr_numa_nodes: 0,
             });
         }
     };
 
     let nr_online = topo.all_cpus.len();
+    let nr_numa_nodes = topo
+        .nodes
+        .values()
+        .filter(|node| !node.all_cpus.is_empty())
+        .count();
     let primaries: Vec<u32> = match get_primary_cpus(Powermode::Performance) {
         Ok(cpus) => cpus.into_iter().map(|cpu| cpu as u32).collect(),
         Err(e) => {
@@ -221,7 +239,11 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
         info!("Topology: {} LLC cache domains", llcs.nr_llcs);
     }
 
-    Ok(TopologyPlan { capacity, llcs })
+    Ok(TopologyPlan {
+        capacity,
+        llcs,
+        nr_numa_nodes,
+    })
 }
 
 /// Phase 2 (post-load): write the primary (big-core) membership bitmap.

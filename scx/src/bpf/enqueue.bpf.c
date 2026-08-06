@@ -61,8 +61,25 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 
 	tctx = mlfq_lookup_task_ctx(p);
 	if (!tctx) {
-		__sync_fetch_and_add(&mlfq_stats.enq_no_tctx, 1);
-		return;
+		/*
+		 * init_task() normally pre-allocates the task storage, but a
+		 * task can reach enqueue() without it (for example a task
+		 * that was runnable when this scheduler attached). Allocate
+		 * on demand instead of dropping the task from scheduling: a
+		 * runnable task without state would otherwise stay stranded
+		 * until its next enqueue. If the allocation still fails (out
+		 * of memory), the error path exits the scheduler and the
+		 * kernel's bypass mode then guarantees every runnable task
+		 * makes progress, so a task is never silently stranded.
+		 */
+		tctx = mlfq_alloc_task_ctx(p);
+		if (!tctx) {
+			__sync_fetch_and_add(&mlfq_stats.enq_no_tctx, 1);
+			scx_bpf_error("pid %d task state allocation failed in enqueue",
+				      p->pid);
+			return;
+		}
+		mlfq_reset_task_ctx(tctx, p, scx_bpf_now());
 	}
 
 	/* Refresh the weight cache; the kernel clamps p->scx.weight to [1, 10000]. */

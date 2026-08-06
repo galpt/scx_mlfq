@@ -7,13 +7,14 @@
 
 /*
  * This file defines the BPF maps, volatiles, and ops dispatch table.
- * The scheduling logic is organized into separate modules included below:
+ * The scheduling logic is organized into separate modules included below,
+ * in dependency order:
  *   vtime.bpf.c      - EEVDF virtual-time substrate (aggregates, placement)
  *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
+ *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/cpu_release
  *   select_cpu.bpf.c - per-queue CPU selection
- *   enqueue.bpf.c    - enqueue routing, aging, preemption kicks
- *   dispatch.bpf.c   - queue service with quotas
- *   lifecycle.bpf.c  - init_task/enable/running/stopping/exit_task/exit
+ *   enqueue.bpf.c    - enqueue routing, aging, wakeup preemption
+ *   dispatch.bpf.c   - queue service with quotas, cross-CPU stealing, keep path
  */
 
 #include <scx/common.bpf.h>
@@ -168,10 +169,10 @@ static __always_inline struct mlfq_cpu_state *mlfq_lookup_cpu_state(s32 cpu)
 
 #include "vtime.bpf.c"
 #include "classify.bpf.c"
+#include "lifecycle.bpf.c"
 #include "select_cpu.bpf.c"
 #include "enqueue.bpf.c"
 #include "dispatch.bpf.c"
-#include "lifecycle.bpf.c"
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 {
@@ -278,4 +279,4 @@ SCX_OPS_DEFINE(mlfq_ops,
 	       .exit_task		= (void *)mlfq_exit_task,
 	       .dispatch_max_batch	= MLFQ_DISPATCH_MAX_BATCH,
 	       .timeout_ms		= 5000,
-	       .name			= "scx_mlfq");
+	       .name			= "mlfq");

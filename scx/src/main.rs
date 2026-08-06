@@ -7,7 +7,7 @@
 
 //! scx_mlfq, a Multilevel Feedback Queue scheduler for sched_ext.
 //!
-//! Three global, virtual-time-ordered user DSQs (Q1/Q2/Q3) over an EEVDF
+//! Per-CPU, virtual-time-ordered user DSQs (Q1/Q2/Q3 per CPU) over an EEVDF
 //! virtual-time substrate. Tasks are classified into queues by an EMA
 //! interactivity gauge with band hysteresis, promoted by short-sleep and
 //! aging, demoted by slice exhaustion. See README.md for the design
@@ -79,6 +79,10 @@ struct Opts {
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
 
+    /// Show descriptions for statistics.
+    #[clap(long)]
+    help_stats: bool,
+
     /// Generate shell completions and exit.
     #[clap(long, value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
@@ -109,26 +113,34 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, mlfq_ops, open_opts)?;
 
-        /*
-         * Ops flags: honor exiting tasks, honor the LAST enqueue for
-         * slice-disabled tasks, never migrate migration-disabled tasks,
-         * and allow queued-wakeup selection of idle CPUs (the idle-CPU
-         * fast path depends on the latter two).
-         */
-        skel.struct_ops.mlfq_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
-            | *compat::SCX_OPS_ENQ_LAST
-            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
-
         // Write the validated constants into rodata before load; the rodata
         // section becomes read-only once the object is loaded.
         let config = ConfigBuilder::default().build()?;
         config.apply(&mut skel)?;
         info!("Config: {}", config.describe());
 
-        // Hybrid-capacity and cache-domain placement data also goes into
-        // rodata pre-load.
+        // Hybrid-capacity, cache-domain and NUMA placement data also goes
+        // into rodata pre-load.
         let topology_plan = topology::init_topology(&mut skel)?;
+
+        /*
+         * Ops flags: honor exiting tasks, honor the LAST enqueue for
+         * slice-disabled tasks, never migrate migration-disabled tasks,
+         * and allow queued-wakeup selection of idle CPUs (the idle-CPU
+         * fast path depends on the latter two). On multi-node systems
+         * the built-in idle tracking is extended to consider NUMA
+         * topology, so the idle fast path and the CPU scans prefer
+         * node-local idle CPUs.
+         */
+        skel.struct_ops.mlfq_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
+            | *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP
+            | if topology_plan.nr_numa_nodes > 1 {
+                *compat::SCX_OPS_BUILTIN_IDLE_PER_NODE
+            } else {
+                0
+            };
 
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 
@@ -242,18 +254,35 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if opts.help_stats {
+        stats::server_data().describe_meta(&mut std::io::stdout(), None)?;
+        return Ok(());
+    }
+
     if !monitor_only {
-        simplelog::SimpleLogger::init(
+        simplelog::TermLogger::init(
             if opts.debug {
                 simplelog::LevelFilter::Debug
             } else {
                 simplelog::LevelFilter::Info
             },
             simplelog::Config::default(),
+            simplelog::TerminalMode::Stderr,
+            simplelog::ColorChoice::Auto,
         )?;
 
-        info!("{} {}", SCHEDULER_NAME, full_version());
-        info!("Starting {} scheduler", SCHEDULER_NAME);
+        // The SMT annotation is appended when the host exposes it; an
+        // unreadable knob omits the suffix rather than guessing.
+        let smt_suffix = match topology::smt_enabled() {
+            Some(true) => " SMT on",
+            Some(false) => " SMT off",
+            None => "",
+        };
+        info!("{} {}{}", SCHEDULER_NAME, full_version(), smt_suffix);
+        info!(
+            "scheduler options: {}",
+            std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+        );
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -278,8 +307,15 @@ fn main() -> Result<()> {
     }
 
     let mut open_object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
-    let mut sched = Scheduler::init(&opts, &mut open_object)?;
-    sched.run(shutdown)?;
+    loop {
+        let mut sched = Scheduler::init(&opts, &mut open_object)?;
+        if !sched.run(shutdown.clone())?.should_restart() {
+            break;
+        }
+        // Give the kernel time to finish the previous detachment before
+        // re-initializing the BPF object for the next incarnation.
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     info!("Scheduler exited");
 
