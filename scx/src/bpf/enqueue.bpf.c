@@ -59,22 +59,15 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 target_cpu;
 
 	tctx = mlfq_lookup_task_ctx(p);
-	if (!tctx)
+	if (!tctx) {
+		__sync_fetch_and_add(&mlfq_stats.enq_no_tctx, 1);
 		return;
-
-	/*
-	 * A task that is still queued keeps its existing placement: its
-	 * DSQ entry is already live and the queue aggregate already
-	 * accounts for it. Re-classifying or re-inserting it would
-	 * double-insert the rbtree entry and desync the queue aggregate,
-	 * so the enqueue is a no-op in that case.
-	 */
-	if (p->scx.flags & SCX_TASK_QUEUED)
-		return;
+	}
 
 	/* Refresh the weight cache; the kernel clamps p->scx.weight to [1, 10000]. */
 	weight = p->scx.weight;
 	if (weight < 1) {
+		__sync_fetch_and_add(&mlfq_stats.enq_bad_weight, 1);
 		scx_bpf_error("pid %d has invalid weight %u", p->pid, weight);
 		return;
 	}
@@ -154,33 +147,89 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			      tctx->queue, tctx->weight);
 #endif
 
-	/*
-	 * Migration-disabled and single-CPU tasks never enter the shared
-	 * DSQs: they are pinned to their allowed CPU with the
-	 * queue slice as their runtime grant. They are placed (for a
-	 * consistent vruntime/deadline) but not accounted.
-	 */
 	migration_disabled = mlfq_task_is_migration_disabled(p);
 	if (migration_disabled) {
 		if (prev_cpu < 0) {
 			scx_bpf_error("pid %d pinned task without a CPU", p->pid);
 			return;
 		}
-		deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid,
-					   false);
+
+		/*
+		 * The allowed CPU set may have changed since the last
+		 * placement; the pinned CPU is prev_cpu only when the task
+		 * may still run there. A task whose affinity no longer
+		 * includes prev_cpu is parked on the global DSQ, which the
+		 * kernel drains on every dispatch cycle without this
+		 * scheduler's involvement.
+		 */
+		if (!bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
+			__sync_fetch_and_add(&mlfq_stats.enq_pinned_global, 1);
+			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL,
+					   mlfq_queue_slice(qid), enq_flags);
+			mlfq_stat_placement(qid);
+			tctx->wake_cpu_state = 0;
+			goto done;
+		}
+
+		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			/*
+			 * The pinned CPU is idle, so the local DSQ is
+			 * empty. The task runs on the next scheduling
+			 * cycle and the local DSQ drains immediately after,
+			 * which keeps balance_one() from skipping
+			 * ops.dispatch() for the tasks queued behind it.
+			 */
+			deadline = mlfq_place_task(qid, tctx, inflate, cpu,
+						   p->pid, false);
+			if (!deadline)
+				return;
+			__sync_fetch_and_add(&mlfq_stats.enq_pinned_idle, 1);
+			tctx->dsq_id = 0;
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+					   mlfq_queue_slice(qid), enq_flags);
+			if (cpu)
+				cpu->migration_disabled_placements++;
+			mlfq_stat_placement(qid);
+			tctx->wake_cpu_state = 0;
+			goto done;
+		}
+
+		/*
+		 * The pinned CPU is busy. The task is placed into the
+		 * CPU's queue DSQ and shares the CPU by virtual time
+		 * order; the owning CPU drains the queue at every slice
+		 * boundary, so the task is served without ever parking in
+		 * the local DSQ, which would shadow every other runnable
+		 * task on the CPU until the stall watchdog fires.
+		 *
+		 * The task is added to the queue aggregate because it now
+		 * participates in the queue DSQ, and the aggregate must
+		 * mirror DSQ membership for the virtual-time average to
+		 * stay exact.
+		 */
+		deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
 		if (!deadline)
 			return;
-		/*
-		 * Placed on the pinned CPU's local DSQ, not in a queue
-		 * DSQ, so dsq_id is cleared.
-		 */
-		tctx->dsq_id = 0;
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-				   mlfq_queue_slice(qid), enq_flags);
+		__sync_fetch_and_add(&mlfq_stats.enq_pinned_busy, 1);
+		tctx->dsq_id = mlfq_dsq_id(qid, prev_cpu);
+		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
+					 mlfq_queue_slice(qid), deadline,
+					 enq_flags);
 		if (cpu)
 			cpu->migration_disabled_placements++;
 		mlfq_stat_placement(qid);
 		tctx->wake_cpu_state = 0;
+
+		/*
+		 * A placement into another CPU's queue needs that CPU to
+		 * run one more scheduling cycle; the idle kick is a cheap
+		 * flag that is consumed when the CPU next goes idle, and
+		 * it guarantees the queued task is not stranded on a
+		 * nohz-idle CPU. The enqueueing CPU needs no kick: its own
+		 * dispatch drains the queue in the same scheduling cycle.
+		 */
+		if (prev_cpu != bpf_get_smp_processor_id())
+			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 		goto done;
 	}
 
@@ -204,6 +253,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		tctx->dsq_id = 0;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, mlfq_queue_slice(qid),
 				   enq_flags);
+		__sync_fetch_and_add(&mlfq_stats.enq_fastpath, 1);
 		if (cpu)
 			cpu->fast_path_dispatches++;
 		mlfq_stat_placement(qid);
@@ -227,8 +277,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/* Regular path: into the owning CPU's queue vtime DSQ. */
 	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
-	if (!deadline)
+	if (!deadline) {
+		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 		return;
+	}
+	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
 	tctx->dsq_id = mlfq_dsq_id(qid, target_cpu);
 	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
 				 mlfq_queue_slice(qid), deadline, enq_flags);

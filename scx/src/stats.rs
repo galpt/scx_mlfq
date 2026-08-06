@@ -53,6 +53,22 @@ pub struct Metrics {
     pub preemption_kicks: u64,
     #[stat(desc = "Q1 cpuperf target boosts set on running")]
     pub cpuperf_boosts: u64,
+    #[stat(desc = "Enqueues dropped for missing task state")]
+    pub enq_no_tctx: u64,
+    #[stat(desc = "Enqueues dropped for bad weight")]
+    pub enq_bad_weight: u64,
+    #[stat(desc = "Enqueues dropped for missing placement")]
+    pub enq_no_deadline: u64,
+    #[stat(desc = "Fast-path enqueues")]
+    pub enq_fastpath: u64,
+    #[stat(desc = "Regular-path enqueues")]
+    pub enq_regular: u64,
+    #[stat(desc = "Pinned enqueues to idle CPUs")]
+    pub enq_pinned_idle: u64,
+    #[stat(desc = "Pinned enqueues to busy CPUs")]
+    pub enq_pinned_busy: u64,
+    #[stat(desc = "Pinned enqueues to the global DSQ")]
+    pub enq_pinned_global: u64,
 }
 
 impl Metrics {
@@ -96,6 +112,14 @@ impl Metrics {
             short_sleep_boosts: self.short_sleep_boosts.wrapping_sub(rhs.short_sleep_boosts),
             preemption_kicks: self.preemption_kicks.wrapping_sub(rhs.preemption_kicks),
             cpuperf_boosts: self.cpuperf_boosts.wrapping_sub(rhs.cpuperf_boosts),
+            enq_no_tctx: self.enq_no_tctx.wrapping_sub(rhs.enq_no_tctx),
+            enq_bad_weight: self.enq_bad_weight.wrapping_sub(rhs.enq_bad_weight),
+            enq_no_deadline: self.enq_no_deadline.wrapping_sub(rhs.enq_no_deadline),
+            enq_fastpath: self.enq_fastpath.wrapping_sub(rhs.enq_fastpath),
+            enq_regular: self.enq_regular.wrapping_sub(rhs.enq_regular),
+            enq_pinned_idle: self.enq_pinned_idle.wrapping_sub(rhs.enq_pinned_idle),
+            enq_pinned_busy: self.enq_pinned_busy.wrapping_sub(rhs.enq_pinned_busy),
+            enq_pinned_global: self.enq_pinned_global.wrapping_sub(rhs.enq_pinned_global),
         }
     }
 }

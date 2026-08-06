@@ -179,6 +179,14 @@ impl<'a> Scheduler<'a> {
             short_sleep_boosts: s.short_sleep_boosts,
             preemption_kicks: s.preemption_kicks,
             cpuperf_boosts: s.cpuperf_boosts,
+            enq_no_tctx: s.enq_no_tctx,
+            enq_bad_weight: s.enq_bad_weight,
+            enq_no_deadline: s.enq_no_deadline,
+            enq_fastpath: s.enq_fastpath,
+            enq_regular: s.enq_regular,
+            enq_pinned_idle: s.enq_pinned_idle,
+            enq_pinned_busy: s.enq_pinned_busy,
+            enq_pinned_global: s.enq_pinned_global,
         }
     }
 
@@ -197,6 +205,14 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        let m = self.get_metrics();
+        log::error!(
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} preempt_kicks={}",
+            m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
+            m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
+            m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
+            m.enq_no_deadline, m.preemption_kicks
+        );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }

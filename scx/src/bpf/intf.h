@@ -223,6 +223,15 @@ struct mlfq_stats {
 	u64 short_sleep_boosts;
 	u64 preemption_kicks;
 	u64 cpuperf_boosts;
+	/* Enqueue-path diagnostics: the early-return drop counters. */
+	u64 enq_no_tctx;
+	u64 enq_bad_weight;
+	u64 enq_no_deadline;
+	u64 enq_fastpath;
+	u64 enq_regular;
+	u64 enq_pinned_idle;
+	u64 enq_pinned_busy;
+	u64 enq_pinned_global;
 };
 
 /*
