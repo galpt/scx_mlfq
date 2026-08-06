@@ -108,7 +108,10 @@ enum mlfq_consts {
 	 * Cap on the remote CPUs scanned per dispatch slot for the lower
 	 * queues (Q2/Q3). The scan starts at a rotating per-CPU offset so
 	 * no remote CPU is permanently excluded, while the interactive
-	 * queue (Q1) scans every candidate. 0 = full scan.
+	 * queue (Q1) scans every candidate. The runtime bound
+	 * (mlfq_steal_scan) is this value clamped to the CPU count in
+	 * init(), so the window never exceeds the machine size and a small
+	 * machine does not re-peek the same remote DSQs.
 	 */
 	MLFQ_STEAL_SCAN_MAX		= 256ULL,
 
@@ -161,9 +164,8 @@ enum mlfq_consts {
 /* task_ctx flags */
 enum mlfq_task_flags {
 	MLFQ_TF_FIRST_RUN		= 1U << 0,	/* first placement */
-	MLFQ_TF_SHORT_SLEEP_BOOST	= 1U << 1,	/* boost pending, consumed */
-	MLFQ_TF_AGING_BOOSTED		= 1U << 2,	/* last stay aged to Q1 */
-	MLFQ_TF_ACCOUNTED		= 1U << 3,	/* in the queue aggregate */
+	MLFQ_TF_AGING_BOOSTED		= 1U << 1,	/* last stay aged to Q1 */
+	MLFQ_TF_ACCOUNTED		= 1U << 2,	/* in the queue aggregate */
 };
 
 /*
@@ -180,7 +182,6 @@ struct task_ctx {
 	u64 last_sleep_at;		/* scx_bpf_now() at stopping(!runnable) */
 	u64 queued_at;			/* start of the current Q2/Q3 stay */
 	u64 last_ss_boost_at;		/* last short-sleep boost, rate limit */
-	u64 dsq_id;			/* user DSQ the task is queued in, 0 when not in a queue DSQ */
 	u32 weight;			/* cached p->scx.weight [1..10000] */
 	u8  queue;			/* current queue, 1..3 */
 	u8  reenq_cnt;			/* consecutive slice exhaustions */
@@ -215,12 +216,6 @@ struct mlfq_cpu_state {
 	u64 running_deadline;		/* EEVDF deadline of the running task */
 	u32 running_weight;
 	u32 steal_scan_off;		/* rotating remote-scan start for Q2/Q3 */
-	u64 q1_dispatches;
-	u64 q2_dispatches;
-	u64 q3_dispatches;
-	u64 steal_dispatches;		/* per-CPU moves from remote queue DSQs */
-	u64 fast_path_dispatches;
-	u64 migration_disabled_placements;
 };
 
 /* System-level BPF counters, reported to userspace through the stats module. */
@@ -491,8 +486,7 @@ static __always_inline s64 mlfq_entity_lag_clamp(const struct queue_ctx *q,
  * task is eligible by construction and min-deadline selection is EEVDF
  * selection over the queued set.
  *
- * Updates tctx->vruntime, tctx->vlag (>= 0) and tctx->deadline, and
- * consumes the MLFQ_TF_SHORT_SLEEP_BOOST flag.
+ * Updates tctx->vruntime, tctx->vlag (>= 0) and tctx->deadline.
  *
  * Return: The placement deadline, also stored in tctx->deadline.
  */
@@ -532,7 +526,6 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
 	/* fair.c PLACE_DEADLINE_INITIAL: new tasks start with half a slice. */
 	if (tctx->flags & MLFQ_TF_FIRST_RUN)
 		vslice /= 2;
-	tctx->flags &= ~MLFQ_TF_SHORT_SLEEP_BOOST;
 
 	deadline = vruntime_new + vslice;
 	/*
@@ -681,7 +674,6 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
 /**
  * mlfq_demote_on_reenq - Slice-exhaustion demotion state machine.
  * @tctx: The task.
- * @t_l: Interactive threshold.
  * @t_h: CPU-bound threshold.
  *
  * Called on run-out re-enqueues (ops.enqueue() with flags == 0, the
@@ -700,11 +692,10 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * Return: true if the task was demoted.
  */
 static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
-						 u64 t_l, u64 t_h)
+						 u64 t_h)
 {
 	bool demoted = false;
 
-	(void)t_l;
 	tctx->reenq_cnt++;
 
 	if ((tctx->queue == 1 || tctx->queue == 2) &&

@@ -129,6 +129,13 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
 		first_cpu = bpf_cpumask_first(p->cpus_ptr);
 		if (first_cpu >= nr_cpu_ids)
+			/*
+			 * An empty allowed mask leaves the out-of-affinity
+			 * return in place; the kernel's own return
+			 * validation (SCX_EV_SELECT_CPU_FALLBACK) falls back
+			 * to a CPU the task may run on, so the return is
+			 * safe.
+			 */
 			return prev_cpu;
 		prev_cpu = (s32)first_cpu;
 	}

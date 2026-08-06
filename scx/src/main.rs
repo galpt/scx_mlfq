@@ -124,13 +124,13 @@ impl<'a> Scheduler<'a> {
         let topology_plan = topology::init_topology(&mut skel)?;
 
         /*
-         * Ops flags: honor exiting tasks, honor the LAST enqueue for
-         * slice-disabled tasks, never migrate migration-disabled tasks,
-         * and allow queued-wakeup selection of idle CPUs (the idle-CPU
-         * fast path depends on the latter two). On multi-node systems
-         * the built-in idle tracking is extended to consider NUMA
-         * topology, so the idle fast path and the CPU scans prefer
-         * node-local idle CPUs.
+         * Ops flags: honor exiting tasks, receive the SCX_ENQ_LAST enqueue
+         * for the last runnable task on a CPU, never migrate
+         * migration-disabled tasks, and allow queued-wakeup selection of
+         * idle CPUs (the idle-CPU fast path depends on the latter two). On
+         * multi-node systems the built-in idle tracking is extended to
+         * consider NUMA topology, so the idle fast path and the CPU scans
+         * prefer node-local idle CPUs.
          */
         skel.struct_ops.mlfq_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
@@ -221,11 +221,13 @@ impl<'a> Scheduler<'a> {
 
         let m = self.get_metrics();
         log::error!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} preempt_kicks={} steals={} keep_running={}",
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
             m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
-            m.enq_no_deadline, m.preemption_kicks, m.steals, m.keep_running
+            m.enq_no_deadline, m.promotions, m.demotions, m.aging_boosts,
+            m.short_sleep_boosts, m.cpuperf_boosts, m.preemption_kicks,
+            m.total_runtime, m.on_cpu, m.steals, m.keep_running
         );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)

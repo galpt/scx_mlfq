@@ -106,8 +106,7 @@ static __always_inline void mlfq_ema_climb_task(struct task_ctx *tctx,
  * IPC boost, the band-hysteresis promotion and the long-sleep base-mapping
  * boost. Updates the promotion and boost stats.
  */
-static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
-						 __maybe_unused,
+static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 						 struct task_ctx *tctx, u64 now)
 {
 	u64 sleep_ns = 0, base_q;
@@ -136,12 +135,16 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
 	 * I/O completions cannot chain boosts. wake_cnt stays short-sleep
 	 * based: an I/O wakeup does not count toward the promotion
 	 * hysteresis.
+	 *
+	 * SCHED_IDLE tasks are forced to Q3 by mlfq_apply_sched_idle, so
+	 * a boost would burn the rate-limit budget and inflate the counter
+	 * to no effect; it is gated on the task policy.
 	 */
-	if (mlfq_boost_eligible(sleep_ns, mlfq_short_sleep_ns,
+	if (p->policy != MLFQ_SCHED_IDLE &&
+	    mlfq_boost_eligible(sleep_ns, mlfq_short_sleep_ns,
 				mlfq_task_io_wait(p)) &&
 	    mlfq_ss_boost_allowed(tctx->last_ss_boost_at, now,
 				  mlfq_short_sleep_rate_limit_ns)) {
-		tctx->flags |= MLFQ_TF_SHORT_SLEEP_BOOST;
 		tctx->queue = 1;
 		tctx->last_ss_boost_at = now;
 		__sync_fetch_and_add(&mlfq_stats.short_sleep_boosts, 1);
@@ -185,6 +188,6 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 
 	if (mlfq_demotion_blocked(p))
 		return;
-	if (mlfq_demote_on_reenq(tctx, mlfq_t_l_ns, mlfq_t_h_ns))
+	if (mlfq_demote_on_reenq(tctx, mlfq_t_h_ns))
 		__sync_fetch_and_add(&mlfq_stats.demotions, 1);
 }

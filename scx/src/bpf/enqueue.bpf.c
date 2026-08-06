@@ -9,18 +9,28 @@
  *   RUN-OUT (enq_flags == 0) -> demotion, then placement
  *   other (fork / SCX_ENQ_LAST / class switch) -> counter reset, placement
  *   wall-clock aging check for Q2/Q3 stays, then placement
- * and the wakeup preemption decision: a higher queue, or the same queue
- * with an earlier EEVDF deadline, preempts the running task.
  *
- * The demotion path keys on the flags == 0 run-out re-enqueue, which only
- * slice exhaustion produces: put_prev_task_scx() re-enqueues the runnable
- * task with do_enqueue_task(rq, p, 0, -1), or with SCX_ENQ_LAST when
- * leaving for a higher sched class. SCX_ENQ_REENQ appears only on
- * SCX_ENQ_IMMED re-enqueues (put_prev_task_scx(), ext.c:3102) and
- * scx_bpf_reenqueue_local()/scx_bpf_dsq_reenq() (ext.c:4165, 4280), and
- * neither DSQ migrations nor generic rq migrations call ops.enqueue() for
- * queued SCX tasks, so no other path produces an enqueue without flag
- * bits.
+ * The wakeup preemption decision runs before the regular placement: a
+ * wakeup outranks the task running on the CPU it was last running on when
+ * it belongs to a higher queue, or to the same queue with an EEVDF
+ * deadline at least half a virtual slice ahead of the running task's
+ * deadline. The cross-queue case is served without a placement (the
+ * local-DSQ insert is FIFO, no deadline is needed), so it stays lock-free;
+ * the same-queue case computes the placement with accounting first and
+ * undoes the accounting when the wakeup does preempt. A wakeup whose
+ * affinity no longer includes the CPU it was last running on falls through
+ * to the regular path.
+ *
+ * The demotion path keys on the flags == 0 run-out re-enqueue. flags == 0
+ * arrives from put_prev_task_scx() for a runnable task whose slice grant
+ * was consumed: slice exhaustion and SCX_ENQ_PREEMPT preemptions both zero
+ * the running task's slice, so both produce the same flag-less re-enqueue.
+ * SCX_ENQ_LAST is passed when the task is about to enter a lower sched
+ * class and remains the only runnable ext task on the CPU. SCX_ENQ_REENQ
+ * arrives from the reenqueue paths (the IMMED-preemption re-enqueue in
+ * put_prev_task_scx() and scx_bpf_reenqueue_local()). Preemptions by a
+ * higher sched class keep the task at the local-DSQ head without calling
+ * ops.enqueue() at all.
  */
 
 static __always_inline bool mlfq_task_is_migration_disabled(const struct task_struct *p)
@@ -51,7 +61,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
 	struct mlfq_cpu_state *cpu;
-	u64 now, deadline;
+	struct queue_ctx *q;
+	u64 now, deadline, slice;
 	u32 weight, qid;
 	u8 old_queue;
 	bool wakeup, runout, inflate, local_fast_path, migration_disabled;
@@ -119,27 +130,27 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Stay bookkeeping: a wakeup ends the previous stay (sleeping resets
-	 * it) and a queue change starts a fresh one, both refreshed only at
-	 * the enqueues that begin a residency -- never at run-out
-	 * re-enqueues. A queue change also clears the consecutive
-	 * slice-exhaustion counter (band semantics). Only Q2/Q3 stays carry
-	 * a non-zero queued_at.
+	 * it), a queue change starts a fresh one, and a run-out ends the
+	 * previous stay because the task just ran a full slice. A queue
+	 * change also clears the consecutive slice-exhaustion counter (band
+	 * semantics). Only Q2/Q3 stays carry a non-zero queued_at.
 	 */
 	if (tctx->queue != old_queue) {
 		tctx->queued_at = tctx->queue >= 2 ? now : 0;
 		tctx->reenq_cnt = 0;
-	} else if (wakeup) {
+	} else if (wakeup || runout) {
 		tctx->queued_at = tctx->queue >= 2 ? now : 0;
 	}
 
 	/*
 	 * Aging: a stay of >= MLFQ_AGING_PERIOD_NS of continuous Q2/Q3
-	 * wall-clock time (queued_at is refreshed only at wakeup/queue
-	 * change, never at run-out) is elevated to a Q1 placement. A task
-	 * that sleeps between placements resets its stay at the wakeup, so
+	 * wall-clock time is elevated to a Q1 placement. queued_at re-arms
+	 * at every wakeup, queue change and run-out, so a continuously
+	 * running task never accumulates aging wall-clock time; only a task
+	 * that genuinely waits behind others in the queue keeps a stale stay
+	 * and ages. A task that sleeps resets its stay at the wakeup, so
 	 * wall-clock time spent asleep never counts toward aging.
 	 */
-	qid = tctx->queue;
 	if (tctx->queue >= 2 && !sched_idle &&
 	    !(tctx->flags & MLFQ_TF_AGING_BOOSTED) &&
 	    tctx->queued_at &&
@@ -151,6 +162,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	qid = tctx->queue;
+	slice = mlfq_queue_slice(qid);
 	/*
 	 * The enqueue runs on the rq the task is being enqueued to, so its
 	 * cpu_state is the local-curr fold input (fair.c folds the
@@ -183,7 +195,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		if (!bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
 			__sync_fetch_and_add(&mlfq_stats.enq_pinned_global, 1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL,
-					   mlfq_queue_slice(qid), enq_flags);
+					   slice, enq_flags);
 			mlfq_stat_placement(qid);
 			tctx->wake_cpu_state = 0;
 			goto done;
@@ -199,14 +211,21 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 */
 			deadline = mlfq_place_task(qid, tctx, inflate, cpu,
 						   p->pid, false);
-			if (!deadline)
+			if (!deadline) {
+				/*
+				 * Unreachable for valid inputs: the queue
+				 * maps are static and in-range. The error
+				 * call turns a future regression into a
+				 * scheduler exit into bypass instead of a
+				 * silently stranded task.
+				 */
+				scx_bpf_error("pid %d pinned-idle placement failed",
+					      p->pid);
 				return;
+			}
 			__sync_fetch_and_add(&mlfq_stats.enq_pinned_idle, 1);
-			tctx->dsq_id = 0;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-					   mlfq_queue_slice(qid), enq_flags);
-			if (cpu)
-				cpu->migration_disabled_placements++;
+					   slice, enq_flags);
 			mlfq_stat_placement(qid);
 			tctx->wake_cpu_state = 0;
 			goto done;
@@ -226,15 +245,21 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 * stay exact.
 		 */
 		deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
-		if (!deadline)
+		if (!deadline) {
+			/*
+			 * Unreachable for valid inputs: the queue maps are
+			 * static and in-range. The error call turns a
+			 * future regression into a scheduler exit into
+			 * bypass instead of a silently stranded task.
+			 */
+			scx_bpf_error("pid %d pinned-busy placement failed",
+				      p->pid);
 			return;
+		}
 		__sync_fetch_and_add(&mlfq_stats.enq_pinned_busy, 1);
-		tctx->dsq_id = mlfq_dsq_id(qid, prev_cpu);
 		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
-					 mlfq_queue_slice(qid), deadline,
+					 slice, deadline,
 					 enq_flags);
-		if (cpu)
-			cpu->migration_disabled_placements++;
 		mlfq_stat_placement(qid);
 		tctx->wake_cpu_state = 0;
 
@@ -262,18 +287,20 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	if (local_fast_path) {
 		deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid,
 					   false);
-		if (!deadline)
+		if (!deadline) {
+			/*
+			 * Unreachable for valid inputs: the queue maps are
+			 * static and in-range. The error call turns a
+			 * future regression into a scheduler exit into
+			 * bypass instead of a silently stranded task.
+			 */
+			scx_bpf_error("pid %d fast-path placement failed",
+				      p->pid);
 			return;
-		/*
-		 * The idle-CPU fast path places the task on the local DSQ,
-		 * not in a queue DSQ, so dsq_id is cleared.
-		 */
-		tctx->dsq_id = 0;
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, mlfq_queue_slice(qid),
+		}
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
 				   enq_flags);
 		__sync_fetch_and_add(&mlfq_stats.enq_fastpath, 1);
-		if (cpu)
-			cpu->fast_path_dispatches++;
 		mlfq_stat_placement(qid);
 		tctx->wake_cpu_state = 0;
 		goto done;
@@ -292,77 +319,154 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		target_cpu = prev_cpu;
 	else
 		target_cpu = bpf_get_smp_processor_id();
-
-	/*
-	 * Compute the placement before the preemption decision so the
-	 * wakeup's EEVDF deadline is available to it. The task is not
-	 * accounted yet: the preemption branch dispatches it to a local
-	 * DSQ, which never carries aggregate membership, so the accounting
-	 * step that mirrors mlfq_place_task()'s tail runs only when the
-	 * task actually enters a queue DSQ.
-	 */
-	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, false);
-	if (!deadline) {
-		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
-		return;
-	}
+	/* A concurrent affinity change may have dropped target_cpu; use the enqueueing CPU. */
+	if (!bpf_cpumask_test_cpu((u32)target_cpu, p->cpus_ptr))
+		target_cpu = bpf_get_smp_processor_id();
 
 	/*
 	 * Wakeup preemption: a wakeup outranks the task running on the CPU
 	 * it was last running on when it belongs to a higher queue, or to
-	 * the same queue with an earlier EEVDF deadline -- the
-	 * check_preempt_wakeup semantics of the fair scheduler, where the
-	 * higher-priority arrival preempts. The wakee is dispatched to
+	 * the same queue with an EEVDF deadline far enough ahead. This is
+	 * the check_preempt_wakeup semantics of the fair scheduler, where
+	 * the higher-priority arrival preempts. The wakee is dispatched to
 	 * that CPU's local DSQ with SCX_ENQ_PREEMPT, which the kernel
 	 * resolves into a preemption on the next scheduling event. The
-	 * local-DSQ insert is never accounted, matching the idle-CPU fast
-	 * path. The decision is confined to wakeups of migratable tasks
+	 * decision is confined to wakeups of migratable tasks
 	 * (migration-disabled tasks are routed above); a wakeup without a
 	 * previous CPU fails the cpu_state lookup and falls through.
+	 *
+	 * The cross-queue case is served without a placement: the local-DSQ
+	 * insert is FIFO, so no deadline is needed and no queue lock is
+	 * taken. The same-queue case computes the placement with accounting
+	 * in one lock region and undoes the accounting when the wakeup does
+	 * preempt, so the non-preempting same-queue wakeup keeps the
+	 * computed deadline for the regular vtime insert.
+	 *
+	 * A concurrent affinity change between CPU selection and enqueue
+	 * must not target a CPU outside the allowed set; the local-DSQ
+	 * insert is a same-rq operation, so the failure is a placement
+	 * violation rather than a fatal error, and the queue placement is
+	 * the correct fallback.
 	 */
 	if (wakeup && !migration_disabled) {
 		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
-		bool preempt = false;
 
 		if (prev_state && prev_state->running_pid &&
 		    prev_state->running_pid != p->pid &&
 		    prev_state->running_queue > 0) {
-			if ((s32)qid < prev_state->running_queue)
-				preempt = true;	/* higher queue than the running task */
-			else if ((s32)qid == prev_state->running_queue &&
-				 mlfq_time_before(deadline, prev_state->running_deadline))
-				preempt = true;	/* earlier deadline on the same queue */
-		}
-
-		if (preempt) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-					   mlfq_queue_slice(qid),
-					   enq_flags | SCX_ENQ_PREEMPT);
-			__sync_fetch_and_add(&mlfq_stats.preemption_kicks, 1);
-			/*
-			 * The task is on the local DSQ, not in a queue DSQ,
-			 * so dsq_id is cleared like on the idle-CPU fast
-			 * path.
-			 */
-			tctx->dsq_id = 0;
-			tctx->wake_cpu_state = 0;
-			goto done;
+			if ((s32)qid < prev_state->running_queue) {
+				/* higher queue than the running task */
+				if (bpf_cpumask_test_cpu((u32)prev_cpu,
+							 p->cpus_ptr)) {
+					scx_bpf_dsq_insert(p,
+						SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+						slice,
+						enq_flags | SCX_ENQ_PREEMPT);
+					__sync_fetch_and_add(
+						&mlfq_stats.preemption_kicks, 1);
+					tctx->wake_cpu_state = 0;
+					goto done;
+				}
+				/* affinity changed: fall through to the regular path */
+			} else if ((s32)qid == prev_state->running_queue &&
+				   prev_state->running_deadline) {
+				/*
+				 * Same queue with a recorded deadline: the
+				 * placement runs with accounting so the
+				 * non-preempting case needs no second lock
+				 * region.
+				 */
+				deadline = mlfq_place_task(qid, tctx, inflate,
+							   cpu, p->pid, true);
+				if (!deadline) {
+					/*
+					 * Unreachable for valid inputs: the
+					 * queue maps are static and
+					 * in-range. The error call turns a
+					 * future regression into a
+					 * scheduler exit into bypass
+					 * instead of a silently stranded
+					 * task.
+					 */
+					__sync_fetch_and_add(
+						&mlfq_stats.enq_no_deadline, 1);
+					scx_bpf_error("pid %d same-queue placement failed",
+						      p->pid);
+					return;
+				}
+				/*
+				 * Granularity margin: a same-queue preemption
+				 * fires only when the wakee would otherwise
+				 * wait at least half a slice past the running
+				 * task's deadline, which prevents preemption
+				 * thrash between equal-priority tasks; the
+				 * cross-queue case stays unguarded.
+				 */
+				if (mlfq_time_before(
+					    deadline +
+						    calc_delta_fair_bpf(
+							    mlfq_queue_slice(qid) >> 1,
+							    tctx->weight),
+					    prev_state->running_deadline) &&
+				    bpf_cpumask_test_cpu((u32)prev_cpu,
+							 p->cpus_ptr)) {
+					/*
+					 * The task is dispatched to the local
+					 * DSQ, which never carries aggregate
+					 * membership; undo the accounting just
+					 * taken so the aggregate keeps
+					 * mirroring DSQ membership.
+					 */
+					q = mlfq_lookup_queue(tctx->queue);
+					if (q)
+						mlfq_queue_del_task(tctx->queue,
+								    q, tctx);
+					scx_bpf_dsq_insert(p,
+						SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+						slice,
+						enq_flags | SCX_ENQ_PREEMPT);
+					__sync_fetch_and_add(
+						&mlfq_stats.preemption_kicks, 1);
+					tctx->wake_cpu_state = 0;
+					goto done;
+				}
+				/* not preempting: use the computed placement */
+				goto regular_insert;
+			}
 		}
 	}
 
 	/* Regular path: into the owning CPU's queue vtime DSQ. */
-	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
-	if (!mlfq_queue_account_only(qid, tctx)) {
+	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
+	if (!deadline) {
+		/*
+		 * Unreachable for valid inputs: the queue maps are
+		 * static and in-range. The error call turns a
+		 * future regression into a scheduler exit into
+		 * bypass instead of a silently stranded task.
+		 */
 		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
+		scx_bpf_error("pid %d regular placement failed",
+			      p->pid);
 		return;
 	}
-	tctx->dsq_id = mlfq_dsq_id(qid, target_cpu);
+
+regular_insert:
+	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
 	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
-				 mlfq_queue_slice(qid), deadline, enq_flags);
+				 slice, deadline, enq_flags);
 	mlfq_stat_placement(qid);
 
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;
+
+	/*
+	 * A run-out re-placement ran here, so the CPU's recorded deadline
+	 * is stale until the next ops.running(); refreshing it keeps the
+	 * same-queue preemption comparison on the new placement.
+	 */
+	if (runout && cpu)
+		cpu->running_deadline = tctx->deadline;
 
 	/*
 	 * A placement into another CPU's queue needs that CPU to run one

@@ -11,8 +11,8 @@
  * in dependency order:
  *   vtime.bpf.c      - EEVDF virtual-time substrate (aggregates, placement)
  *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
- *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/cpu_release
- *   select_cpu.bpf.c - per-queue CPU selection
+ *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/dequeue/cpu_release
+ *   select_cpu.bpf.c - CPU selection
  *   enqueue.bpf.c    - enqueue routing, aging, wakeup preemption
  *   dispatch.bpf.c   - queue service with quotas, cross-CPU stealing, keep path
  */
@@ -78,6 +78,7 @@ struct {
  * nr_cpu_ids is written once in init() before any other callback runs.
  */
 volatile u64 nr_cpu_ids;
+volatile u32 mlfq_steal_scan;
 volatile struct mlfq_stats mlfq_stats;
 
 /*
@@ -105,11 +106,11 @@ struct {
 } mlfq_llc_bitmaps SEC(".maps");
 
 /*
- * Constants: rodata, materialized by cargo-veristat from the
- * veristat/9950x.json config. Compile-time defaults match the constants
- * in intf.h. They are const volatile: the Rust front-end writes them
- * before load, the section is read-only afterwards, and the compiler
- * must not fold them as compile-time constants.
+ * Constants: rodata. The declared defaults match the constants in
+ * intf.h and are written by the Rust front-end before load; the section
+ * is read-only afterwards, and the compiler must not fold them as
+ * compile-time constants. The veristat configs supply the same values
+ * as verification inputs.
  */
 const volatile u64 mlfq_q1_slice_ns = MLFQ_Q1_SLICE_NS;
 const volatile u64 mlfq_q2_slice_ns = MLFQ_Q2_SLICE_NS;
@@ -199,6 +200,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
+	 * Clamp the Q2/Q3 steal-scan window to the CPU count: on a machine
+	 * with fewer CPUs than the cap, an unscaled window would re-peek
+	 * the same remote DSQs multiple times per slot.
+	 */
+	mlfq_steal_scan = nr_cpus < MLFQ_STEAL_SCAN_MAX ?
+			  nr_cpus : (u32)MLFQ_STEAL_SCAN_MAX;
+
+	/*
 	 * Create the per-CPU vtime-ordered queue DSQs. bpf_for() is an
 	 * iterator-backed loop: the bound is a runtime value (the checked
 	 * CPU count) and the iterator contract lets the verifier bound the
@@ -249,12 +258,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 			scx_bpf_error("queue %u map lookup failed", key);
 			return -EINVAL;
 		}
-		if (key == 1)
-			q->max_slice_ns = mlfq_q1_slice_ns;
-		else if (key == 2)
-			q->max_slice_ns = mlfq_q2_slice_ns;
-		else
-			q->max_slice_ns = mlfq_q3_slice_ns;
+		q->max_slice_ns = mlfq_queue_slice(key);
 	}
 
 	return 0;
@@ -269,6 +273,7 @@ SCX_OPS_DEFINE(mlfq_ops,
 	       .select_cpu		= (void *)mlfq_select_cpu,
 	       .enqueue			= (void *)mlfq_enqueue,
 	       .dispatch		= (void *)mlfq_dispatch,
+	       .dequeue			= (void *)mlfq_dequeue,
 	       .cpu_release		= (void *)mlfq_cpu_release,
 	       .running			= (void *)mlfq_running,
 	       .stopping		= (void *)mlfq_stopping,

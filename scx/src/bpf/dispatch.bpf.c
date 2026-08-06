@@ -18,17 +18,47 @@
  * head and avoids wasted moves.
  *
  * The three quotas are served by bounded loops: Q1 scans every candidate
- * CPU, Q2/Q3 scan a rotating window of at most MLFQ_STEAL_SCAN_MAX
- * candidates. Each slot is a constant number of peeks and one move, so
- * the loop bodies stay flat and the verifier state small.
+ * CPU, Q2/Q3 scan a rotating window of at most the init-clamped
+ * mlfq_steal_scan candidates. Each slot is a constant number of peeks and
+ * one move, so the loop bodies stay flat and the verifier state small.
  *
  * The keep path runs first, before the slot loops: when the CPU's queue
  * DSQs are empty and the outgoing task is still queued, the task is the
  * only runnable work this CPU can take, so it is kept with a fresh queue
- * slice instead of the CPU idling with runnable work. Resolving the keep
- * up front reads the queue state once, before the slot loops churn it,
- * and keeps the loop bodies to a single job each.
+ * slice instead of the CPU idling with runnable work. Before keeping, the
+ * three queue heads of one remote CPU (the rotating scan candidate) are
+ * probed: a CPU whose own queues are empty should still pull the
+ * most-owed remote task instead of running the previous task for a full
+ * slice. Resolving the keep up front reads the queue state once, before
+ * the slot loops churn it, and keeps the loop bodies to a single job
+ * each.
  */
+
+/*
+ * mlfq_remote_work_probe - Peek one remote CPU's queue DSQ heads.
+ * @cand: Remote CPU to probe.
+ * @cpu: Local CPU, the affinity target of the peeked tasks.
+ *
+ * Three lockless peeks, one per queue DSQ. A head that can run on @cpu
+ * means the slot loops below have work to steal.
+ *
+ * Return: true if any queue DSQ head can run on @cpu.
+ */
+static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
+{
+	struct task_struct *t;
+
+	t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(1, cand));
+	if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+		return true;
+	t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(2, cand));
+	if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+		return true;
+	t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(3, cand));
+	if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+		return true;
+	return false;
+}
 
 /*
  * mlfq_dispatch_queue - Serve one queue for up to @quota slots.
@@ -42,8 +72,8 @@
  * CPUs' same-queue DSQs, affinity-checks each (migration-disabled tasks
  * fail this automatically), and moves the earliest-deadline candidate to
  * the local DSQ. Q1 scans every candidate CPU; Q2/Q3 scan a rotating
- * window of at most MLFQ_STEAL_SCAN_MAX candidates starting at the
- * per-CPU offset, so the bounded window is fair across the system.
+ * window of at most mlfq_steal_scan candidates starting at the per-CPU
+ * offset, so the bounded window is fair across the system.
  *
  * Return: The number of tasks moved.
  */
@@ -70,10 +100,10 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 
 		/*
 		 * Q1 scans every candidate CPU; the lower queues scan a
-		 * bounded rotating window. The bound folds to a constant
-		 * at each call site.
+		 * bounded rotating window. The bound is the init-clamped
+		 * mlfq_steal_scan for Q2/Q3 and the full CPU count for Q1.
 		 */
-		bpf_for(i, 0, qid == 1 ? nr_cpus : MLFQ_STEAL_SCAN_MAX) {
+		bpf_for(i, 0, qid == 1 ? nr_cpus : mlfq_steal_scan) {
 			struct task_struct *t;
 
 			cand = (off + i) % (u32)nr_cpus;
@@ -101,16 +131,6 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 
 		scx_bpf_dsq_move_to_local(best_dsq, 0);
 		moved++;
-		if (cpu_state) {
-			if (qid == 1)
-				cpu_state->q1_dispatches++;
-			else if (qid == 2)
-				cpu_state->q2_dispatches++;
-			else
-				cpu_state->q3_dispatches++;
-			if (best_cpu != cpu)
-				cpu_state->steal_dispatches++;
-		}
 		if (best_cpu != cpu)
 			__sync_fetch_and_add(&mlfq_stats.steals, 1);
 	}
@@ -147,6 +167,12 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * because the kernel claims the task again in finish_dispatch()
 	 * (ext.c), dropping the insert if @prev was concurrently dequeued.
 	 *
+	 * Before keeping, the three queue DSQ heads of one remote CPU (the
+	 * rotating scan candidate) are probed: a CPU whose own queues are
+	 * empty should still pull the most-owed remote task instead of
+	 * running the previous task for a full slice; the probe is three
+	 * lockless peeks.
+	 *
 	 * The kernel's automatic keep path (balance_one() setting
 	 * SCX_RQ_BAL_KEEP) is available only while SCX_OPS_ENQ_LAST is
 	 * clear. This scheduler sets SCX_OPS_ENQ_LAST, so ops.dispatch()
@@ -163,13 +189,43 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 			qid = tctx->queue;
 			if (qid >= 1 && qid <= MLFQ_NR_QUEUES) {
 				u64 slice = mlfq_queue_slice(qid);
+				s32 cand;
+				bool remote_work = false;
 
-				scx_bpf_task_set_slice(prev, slice);
-				scx_bpf_dsq_insert(prev, SCX_DSQ_LOCAL, slice, 0);
-				__sync_fetch_and_add(&mlfq_stats.keep_running, 1);
+				if (nr_cpus > 1) {
+					/*
+					 * Probe the rotating scan candidate;
+					 * on a one-CPU machine there is no
+					 * remote CPU to probe.
+					 */
+					cand = cpu_state ?
+						(s32)(cpu_state->steal_scan_off %
+						      (u32)nr_cpus) : 0;
+					if (cand == cpu)
+						cand = (s32)(((u32)cand + 1) %
+							     (u32)nr_cpus);
+					remote_work = mlfq_remote_work_probe(cand, cpu);
+				}
+				if (!remote_work) {
+					scx_bpf_task_set_slice(prev, slice);
+					if (scx_bpf_dsq_insert(prev, SCX_DSQ_LOCAL,
+							       slice, 0)) {
+						__sync_fetch_and_add(
+							&mlfq_stats.keep_running, 1);
+						return;
+					}
+					/*
+					 * The outgoing task may have been
+					 * stolen by a remote CPU between its
+					 * re-enqueue and this dispatch; the
+					 * insert then fails and the slot
+					 * loops should run instead of
+					 * aborting the cycle.
+					 */
+				}
+				/* remote work or a failed keep insert: the slot loops steal */
 			}
 		}
-		return;
 	}
 
 	/*

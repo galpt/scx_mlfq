@@ -6,10 +6,11 @@
  *
  * init_task/enable initialize the task context; running() drops the task
  * from its queue aggregate and records the local-curr fold inputs;
- * stopping() advances vruntime and the EMA gauge; exit_task() removes any
- * residual aggregate contribution and deletes the task storage;
- * cpu_release() re-enqueues local-DSQ leftovers when a CPU leaves the
- * scheduler.
+ * stopping() advances vruntime and the EMA gauge; dequeue() drops the
+ * aggregate contribution of a task that blocked while queued; exit_task()
+ * removes any residual aggregate contribution and deletes the task
+ * storage; cpu_release() re-enqueues local-DSQ leftovers when a CPU
+ * leaves the scheduler.
  */
 
 static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
@@ -157,6 +158,27 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
 }
 
+void BPF_STRUCT_OPS(mlfq_dequeue, struct task_struct *p, u64 deq_flags)
+{
+	struct task_ctx *tctx;
+	struct queue_ctx *q;
+
+	tctx = mlfq_lookup_task_ctx(p);
+	if (!tctx)
+		return;
+
+	/*
+	 * A task that blocks while queued is removed from its DSQ by the
+	 * kernel before ops.dequeue runs, so dropping the aggregate
+	 * contribution here keeps the aggregate mirroring DSQ membership;
+	 * the flag-guarded del is idempotent for tasks that were never
+	 * accounted (local-DSQ/fast-path tasks).
+	 */
+	q = mlfq_lookup_queue(tctx->queue);
+	if (q)
+		mlfq_queue_del_task(tctx->queue, q, tctx);
+}
+
 void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
@@ -186,8 +208,10 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
  * re-enter the queue DSQs instead of being stranded on the released CPU.
  * Normally a no-op: by discipline the local DSQ depth is at most one task,
  * and a queued leftover is exactly the runnable task the CPU is leaving
- * behind. scx_bpf_reenqueue_local() is restricted to this callback
- * (ext.c).
+ * behind. The re-enqueued leftovers land in the releasing CPU's queue
+ * DSQs and are served by other CPUs' steal scans; the kernel's reenqueue
+ * guard and the stall watchdog cap the pathological loop.
+ * scx_bpf_reenqueue_local() is restricted to this callback (ext.c).
  */
 void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
