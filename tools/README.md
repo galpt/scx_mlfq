@@ -14,8 +14,8 @@ repeatedly. Run either with `--dry-run` first to preview what it would do.
 
 `scx_mlfq` is an experimental sched_ext CPU scheduler for Linux, written in
 Rust with a BPF component. It implements a Multilevel Feedback Queue (MLFQ)
-discipline on top of EEVDF-style virtual-time scheduling: three global queues
-(Q1/Q2/Q3) ordered by a per-task virtual deadline, with a continuous EMA-based
+discipline on top of EEVDF-style virtual-time scheduling: three queues per CPU
+(Q1/Q2/Q3), each a vtime-ordered dispatch queue, with a continuous EMA-based
 interactivity gauge (plus hysteresis) deciding which queue a task lives in.
 Interactive-first desktop/latency workloads are served from Q1, batch work is
 demoted toward Q3. Like all sched_ext schedulers it handles **non-RT tasks
@@ -34,8 +34,10 @@ kernel's sched_ext interface and `scx_mlfq --stats`.
 - A build toolchain: `git`, `cargo` (Rust, stable), and the `clang`/libbpf
   toolchain used by the `sched-ext/scx` workspace. No packages are installed
   by these scripts.
-- `scx-tools` / `scx_loader` is **optional**. scx_mlfq does not need it, and
-  scx_loader cannot manage scx_mlfq yet anyway (see FAQ).
+- `scx-tools` / `scx_loader` is **optional** for running scx_mlfq directly, but
+  it is what the CachyOS Kernel Manager GUI uses to list and switch
+  schedulers. When `/etc/scx_loader.toml` exists, the installer registers
+  scx_mlfq there (a `[scheds.scx_mlfq]` section), so the GUI can manage it.
 - **Root**. Both scripts refuse to run as a non-root user, including with
   `--dry-run`.
 
@@ -100,7 +102,7 @@ What the installer does, in order:
 4. Stops `scx.service` (errors ignored). If a scheduler is currently attached
    (`/sys/kernel/sched_ext/state` != `disabled`) **and** `scx_loader` is
    active, it also stops `scx_loader.service`. The loader is **not disabled**;
-   it may be left stopped because it cannot run scx_mlfq anyway.
+   scx_mlfq is never auto-started.
 5. Checks package ownership of `/usr/bin/scx_mlfq` with `pacman -Qo`:
    - exit 0 (owned by a package, e.g. a future upstream release) → requires
      `--force` or an interactive `y/N` before overwriting. The original is
@@ -111,15 +113,21 @@ What the installer does, in order:
      installer never silently treats a pacman error as "unowned".
 6. Stages the binary, writes the install manifest `/usr/lib/scx/scx_mlfq-beta.manifest`
    (version, `installed_sha256`, `orig_owner`, `orig_sha256`, `backup_path`,
-   `dropins`, `dropin_backup` when one was made, install time, source/branch),
+   `dropins`, `dropin_backup` when one was made, `loader_entry` when the
+   scx_loader config was updated, install time, source/branch),
    and only then swaps the binary into place with an atomic staged copy
    (`cp` → `chmod 755` → `mv -f`). **The manifest is written BEFORE the swap,
    so an interrupted run never leaves a new binary without a manifest; a
    leftover stage file is removed by the EXIT trap.**
 7. Runs `systemctl daemon-reload`.
-8. Runs a smoke test (`scx_mlfq --version`). A failure is reported as a clear
+8. Registers scx_mlfq with `scx_loader`: when `/etc/scx_loader.toml` exists,
+   appends the `[scheds.scx_mlfq]` section (empty mode arrays; the scheduler
+   is knob-free) unless it is already present, and restarts `scx_loader` if
+   it is active so the Kernel Manager GUI sees the entry immediately. The
+   manifest records `loader_entry=1`.
+9. Runs a smoke test (`scx_mlfq --version`). A failure is reported as a clear
    warning, not fatal.
-9. Prints a status summary. **scx_mlfq is NOT auto-started.**
+10. Prints a status summary. **scx_mlfq is NOT auto-started.**
 
 Start it now, one of:
 
@@ -163,6 +171,9 @@ The uninstaller is **manifest-driven and idempotent**:
   `scx.service.d/` is removed only if now empty), any recorded drop-in
   backup, the binary backup, and the manifest, then runs
   `systemctl daemon-reload`.
+- If the manifest records `loader_entry=1`, it removes the
+  `[scheds.scx_mlfq]` section from `/etc/scx_loader.toml` (preserving the
+  rest of the file) and restarts `scx_loader` if it is active.
 - It never touches `scx_loader.service`, `/etc/default/scx`, or any other
   file. Every path read from the manifest is confined before use: traversal
   components (`..`, `.`) and control characters are rejected, the path is
@@ -172,22 +183,25 @@ The uninstaller is **manifest-driven and idempotent**:
 
 ## FAQ
 
-**Why can't the CachyOS Kernel Manager GUI manage scx_mlfq?**
+**How does the CachyOS Kernel Manager GUI manage scx_mlfq?**
 
-`scx_loader` (from `scx-tools`) ships with a *hardcoded* list of supported
-schedulers, and `scx_mlfq` is not in it. Because of that, `scx_loader`,
-`scxctl`, `scx-manager`, and the CachyOS Kernel Manager GUI can neither list
-nor start scx_mlfq today. The two working beta launch paths are the direct
-run and the `scx.service` drop-in shown above. Once scx_mlfq is merged
-upstream and a future `scx-tools` includes it in the loader enum, the GUI
-will be able to manage it normally.
+The GUI asks `scx_loader` for its supported schedulers, and `scx_loader`
+reports the `[scheds.*]` sections of `/etc/scx_loader.toml` plus its
+built-in defaults. The installer appends a `[scheds.scx_mlfq]` section to
+that file, so scx_mlfq appears in the GUI and can be started, stopped and
+switched to from there like any other registered scheduler. Uninstalling
+removes the section again. (Before this registration existed, the GUI could
+not list scx_mlfq at all; the direct run and the `scx.service` drop-in
+remain available as fallback launch paths.)
 
 **How do I go back to my previous scheduler?**
 
-Stop the beta (Ctrl+C if you ran it directly, or `sudo systemctl stop
-scx.service`) and run the uninstaller. Without the installer's drop-in,
-`scx.service` uses the default scheduler configured in `/etc/default/scx`.
-You can also reinstall the packaged schedulers at any time:
+From the Kernel Manager GUI, select any other scheduler (the loader stops
+scx_mlfq and starts the new one). To remove the beta entirely, run the
+uninstaller, which also removes the `[scheds.scx_mlfq]` entry from the
+loader config. Without the installer's drop-in, `scx.service` uses the
+default scheduler configured in `/etc/default/scx`. You can also reinstall
+the packaged schedulers at any time:
 
 ```bash
 sudo pacman -S scx-scheds
@@ -213,8 +227,9 @@ After that, normal CachyOS tooling owns the binary and the GUI can manage it.
 **Does scx_mlfq have a web UI or listen on a port?**
 
 No. There is no web UI and no TCP listener (locked design decision), and the
-installer deliberately creates **no** `scx_loader.service` drop-in. Scheduler
-state is only visible through the kernel's sched_ext interface
+installer deliberately creates **no** `scx_loader.service` drop-in; the only
+loader integration is the `[scheds.scx_mlfq]` config entry. Scheduler state
+is only visible through the kernel's sched_ext interface
 (e.g. `cat /sys/kernel/sched_ext/root/ops`) and `scx_mlfq --stats`.
 
 **Is it safe to run as root / what if something goes wrong?**

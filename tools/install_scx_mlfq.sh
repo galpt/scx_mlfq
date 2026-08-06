@@ -13,8 +13,10 @@
 # Only ONE sched_ext scheduler can be attached at a time. This installer
 # stops scx.service and, only if a scheduler is currently attached and
 # scx_loader is active, also stops scx_loader.service. scx_mlfq is NOT
-# auto-started; the loader cannot manage it anyway (hardcoded scheduler
-# list), so it is left stopped rather than disabled.
+# auto-started. When /etc/scx_loader.toml exists, the installer appends a
+# [scheds.scx_mlfq] section so the CachyOS Kernel Manager GUI can list,
+# start and switch to scx_mlfq; the loader is left stopped rather than
+# disabled.
 #
 # The install manifest is written BEFORE the binary is swapped into place,
 # so an interrupted run never leaves a new binary without a manifest, and a
@@ -24,7 +26,10 @@
 # under /usr/lib/scx and replaces it).
 #
 # This script never edits /etc/default/scx and never creates a
-# scx_loader.service drop-in.
+# scx_loader.service drop-in. It does append the [scheds.scx_mlfq] section
+# to /etc/scx_loader.toml when that file exists, and records it in the
+# manifest as loader_entry=1 so the uninstaller can remove exactly that
+# section.
 #
 # Usage: sudo bash install_scx_mlfq.sh [options]
 #
@@ -56,6 +61,7 @@ DROPIN_DIR="/etc/systemd/system/scx.service.d"
 DROPIN="$DROPIN_DIR/scx_mlfq-beta.conf"
 SCX_STATE_FILE="/sys/kernel/sched_ext/state"
 SCX_OPS_FILE="/sys/kernel/sched_ext/root/ops"
+SCX_LOADER_CONFIG="/etc/scx_loader.toml"
 
 DEFAULT_REPO="https://github.com/galpt/scx.git"
 DEFAULT_BRANCH="scx_mlfq"
@@ -72,6 +78,7 @@ STAGE_FILE=""
 MANIFEST_TMP=""
 LOADER_STOPPED=""
 dropin_backup_recorded=""
+LOADER_ENTRY=""
 orig_owner="none"
 orig_sha256=""
 
@@ -91,6 +98,55 @@ sanitize() {
 # our_dropin: the exact bytes this installer owns for the scx.service drop-in.
 our_dropin() {
     printf '[Service]\nExecStart=\nExecStart=/usr/bin/scx_mlfq\n'
+}
+
+# our_loader_section: the scx_loader config entry this installer owns.
+# Empty mode arrays: scx_mlfq is knob-free, so no mode adds flags.
+our_loader_section() {
+    cat <<'EOF'
+
+[scheds.scx_mlfq]
+auto_mode = []
+gaming_mode = []
+lowlatency_mode = []
+powersave_mode = []
+server_mode = []
+EOF
+}
+
+# register_loader_entry: append the [scheds.scx_mlfq] section to the
+# scx_loader config so the Kernel Manager GUI lists scx_mlfq. The section
+# is appended atomically through a temp file; an existing section is left
+# untouched. Without a loader config there is nothing to register.
+register_loader_entry() {
+    local _tmp
+
+    if [ ! -f "$SCX_LOADER_CONFIG" ]; then
+        warn "no $SCX_LOADER_CONFIG; skipping scx_loader registration"
+        warn 'the CachyOS Kernel Manager GUI cannot list scx_mlfq without a loader config'
+        return 0
+    fi
+
+    if grep -q '^\[scheds\.scx_mlfq\]$' "$SCX_LOADER_CONFIG" 2>/dev/null; then
+        info "scx_mlfq is already registered in $SCX_LOADER_CONFIG"
+        LOADER_ENTRY="1"
+        return 0
+    fi
+
+    if [ -n "$DRY_RUN" ]; then
+        dry "append the [scheds.scx_mlfq] section to $SCX_LOADER_CONFIG"
+        return 0
+    fi
+
+    _tmp=$(mktemp "${SCX_LOADER_CONFIG}.scx_mlfq.XXXXXX") || {
+        err "cannot create a temp file next to $SCX_LOADER_CONFIG"
+        exit 1
+    }
+    cp -p -- "$SCX_LOADER_CONFIG" "$_tmp"
+    our_loader_section >> "$_tmp"
+    mv -f -- "$_tmp" "$SCX_LOADER_CONFIG"
+    ok "registered scx_mlfq in $SCX_LOADER_CONFIG"
+    LOADER_ENTRY="1"
 }
 
 # validate_flag_value: reject control characters and leading '-' in
@@ -480,6 +536,7 @@ orig_sha256=$orig_sha256
 backup_path=$BACKUP_PATH
 dropins=$DROPIN
 dropin_backup=$dropin_backup_recorded
+loader_entry=0
 install_time=$(date +%Y-%m-%dT%H:%M:%S%z)
 source=${SOURCE_DIR:-$REPO}
 branch=${BRANCH:-}
@@ -604,6 +661,17 @@ main() {
     # drop-in step backed up a conflicting file, record that in the manifest.
     if [ -n "$dropin_backup_recorded" ]; then
         run sed -i "s|^dropin_backup=.*|dropin_backup=$dropin_backup_recorded|" "$MANIFEST"
+    fi
+
+    step 'Registering scx_mlfq with scx_loader'
+    register_loader_entry
+    if [ -n "$LOADER_ENTRY" ]; then
+        run sed -i "s|^loader_entry=.*|loader_entry=$LOADER_ENTRY|" "$MANIFEST"
+        if [ -n "$DRY_RUN" ]; then
+            dry 'systemctl restart scx_loader (if active) so the GUI sees the new entry'
+        elif systemctl is-active --quiet scx_loader 2>/dev/null; then
+            run systemctl restart scx_loader                 || warn 'scx_loader restart failed; the GUI picks the entry up after the next loader start'
+        fi
     fi
 
     step 'Smoke test'

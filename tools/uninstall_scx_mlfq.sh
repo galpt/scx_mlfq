@@ -40,6 +40,7 @@ MANIFEST="$LIB_DIR/scx_mlfq-beta.manifest"
 BACKUP_PATH="$LIB_DIR/scx_mlfq.scx_mlfq-beta.bak"
 DROPIN_DIR="/etc/systemd/system/scx.service.d"
 DROPIN="$DROPIN_DIR/scx_mlfq-beta.conf"
+SCX_LOADER_CONFIG="/etc/scx_loader.toml"
 
 FORCE=""
 DRY_RUN=""
@@ -112,6 +113,7 @@ parse_manifest() {
     BACKUP=""
     DROPINS=""
     DROPIN_BACKUP=""
+    LOADER_ENTRY=""
     INSTALL_TIME=""
     SOURCE=""
     BRANCH=""
@@ -140,7 +142,7 @@ parse_manifest() {
                 ;;
         esac
         case "$key" in
-            manifest_version|name|version|installed_sha256|orig_owner|orig_sha256|backup_path|dropins|dropin_backup|install_time|source|branch) ;;
+            manifest_version|name|version|installed_sha256|orig_owner|orig_sha256|backup_path|dropins|dropin_backup|loader_entry|install_time|source|branch) ;;
             *)
                 err "manifest contains an unknown key: $(sanitize "$key")"
                 return 1
@@ -163,6 +165,7 @@ parse_manifest() {
             backup_path) BACKUP="$value" ;;
             dropins) DROPINS="$value" ;;
             dropin_backup) DROPIN_BACKUP="$value" ;;
+            loader_entry) LOADER_ENTRY="$value" ;;
             install_time) INSTALL_TIME="$value" ;;
             source) SOURCE="$value" ;;
             branch) BRANCH="$value" ;;
@@ -332,6 +335,54 @@ remove_backup() {
     fi
 }
 
+# remove_loader_entry: drop the [scheds.scx_mlfq] section the installer
+# appended to the scx_loader config. Only a section recorded in the
+# manifest is touched; the rest of the config is preserved byte for byte.
+remove_loader_entry() {
+    local _tmp
+
+    if [ "$LOADER_ENTRY" != "1" ]; then
+        info 'no scx_loader entry recorded in the manifest; nothing to remove'
+        LOADER_ENTRY_STATE="none recorded"
+        return 0
+    fi
+    if [ ! -f "$SCX_LOADER_CONFIG" ]; then
+        warn "$SCX_LOADER_CONFIG is absent; nothing to remove"
+        LOADER_ENTRY_STATE="config absent"
+        return 0
+    fi
+    if ! grep -q '^\[scheds\.scx_mlfq\]$' "$SCX_LOADER_CONFIG" 2>/dev/null; then
+        info "no [scheds.scx_mlfq] section in $SCX_LOADER_CONFIG"
+        LOADER_ENTRY_STATE="absent"
+        return 0
+    fi
+
+    if [ -n "$DRY_RUN" ]; then
+        dry "remove the [scheds.scx_mlfq] section from $SCX_LOADER_CONFIG"
+        LOADER_ENTRY_STATE="would remove"
+        return 0
+    fi
+
+    _tmp=$(mktemp "${SCX_LOADER_CONFIG}.scx_mlfq.XXXXXX") || {
+        err "cannot create a temp file next to $SCX_LOADER_CONFIG"
+        exit 1
+    }
+    awk '
+        $0 == "[scheds.scx_mlfq]" { skip = 1; next }
+        skip && /^\[/ { skip = 0 }
+        skip { next }
+        { print }
+    ' "$SCX_LOADER_CONFIG" > "$_tmp"
+    chmod --reference="$SCX_LOADER_CONFIG" "$_tmp"
+    mv -f -- "$_tmp" "$SCX_LOADER_CONFIG"
+    ok "removed the [scheds.scx_mlfq] section from $SCX_LOADER_CONFIG"
+    LOADER_ENTRY_STATE="removed"
+
+    if systemctl is-active --quiet scx_loader 2>/dev/null; then
+        run systemctl restart scx_loader             || warn 'scx_loader restart failed; the GUI updates after the next loader start'
+    fi
+}
+
 remove_manifest() {
     if [ -f "$MANIFEST" ]; then
         run rm -f "$MANIFEST"
@@ -348,6 +399,7 @@ summary() {
     printf '  %-24s %s\n' "Binary $BIN_PATH:" "$BINARY_STATE"
     printf '  %-24s %s\n' 'Backup:' "$BACKUP_STATE"
     printf '  %-24s %s\n' 'Drop-in:' "$DROPIN_STATE"
+    printf '  %-24s %s\n' 'scx_loader entry:' "$LOADER_ENTRY_STATE"
     printf '  %-24s %s\n' 'scx.service:' 'left in place (not disabled)'
     if [ -n "$DROPIN_BACKUP" ]; then
         printf '  %-24s %s\n' 'Drop-in backup:' "$DROPIN_BACKUP_STATE"
@@ -481,6 +533,9 @@ main() {
 
     step 'Removing our systemd drop-in'
     remove_dropin
+
+    step 'Removing our scx_loader entry'
+    remove_loader_entry
 
     if [ -n "$DROPIN_BACKUP" ]; then
         step 'Removing our drop-in backup'
