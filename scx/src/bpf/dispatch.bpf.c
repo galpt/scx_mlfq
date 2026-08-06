@@ -17,10 +17,12 @@
  * consuming CPU, so the BPF pre-check only prefers the earliest eligible
  * head and avoids wasted moves.
  *
- * The three quotas are served by bounded loops: Q1 scans every candidate
- * CPU, Q2/Q3 scan a rotating window of at most the init-clamped
- * mlfq_steal_scan candidates. Each slot is a constant number of peeks and
- * one move, so the loop bodies stay flat and the verifier state small.
+ * The three quotas are served by bounded loops: every queue scans a
+ * rotating window of at most the init-clamped mlfq_steal_scan candidates,
+ * starting at a per-CPU offset that drifts per dispatch call, so the
+ * window is fair across the system and no remote CPU is permanently
+ * excluded. Each slot is a constant number of peeks and one move, so the
+ * loop bodies stay flat and the verifier state small.
  *
  * The keep path runs first, before the slot loops: when the CPU's queue
  * DSQs are empty and the outgoing task is still queued, the task is the
@@ -71,9 +73,10 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * Each slot peeks the queue's own head and the heads of the candidate
  * CPUs' same-queue DSQs, affinity-checks each (migration-disabled tasks
  * fail this automatically), and moves the earliest-deadline candidate to
- * the local DSQ. Q1 scans every candidate CPU; Q2/Q3 scan a rotating
- * window of at most mlfq_steal_scan candidates starting at the per-CPU
- * offset, so the bounded window is fair across the system.
+ * the local DSQ. The candidates are a rotating window of at most
+ * mlfq_steal_scan CPUs starting at the per-CPU offset, so the bounded
+ * window is fair across the system; on machines smaller than the scan
+ * cap the window covers every CPU.
  *
  * Return: The number of tasks moved.
  */
@@ -99,11 +102,12 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		best_dsq = own_dsq;
 
 		/*
-		 * Q1 scans every candidate CPU; the lower queues scan a
-		 * bounded rotating window. The bound is the init-clamped
-		 * mlfq_steal_scan for Q2/Q3 and the full CPU count for Q1.
+		 * Every queue scans the same bounded rotating window: at
+		 * most the init-clamped mlfq_steal_scan candidates starting
+		 * at the per-CPU offset. The offset drifts per dispatch
+		 * call, so the window is fair across the system.
 		 */
-		bpf_for(i, 0, qid == 1 ? nr_cpus : mlfq_steal_scan) {
+		bpf_for(i, 0, mlfq_steal_scan) {
 			struct task_struct *t;
 
 			cand = (off + i) % (u32)nr_cpus;

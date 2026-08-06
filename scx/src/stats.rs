@@ -7,10 +7,11 @@
 
 //! Stats server, `#[derive(Stats)]` metrics and monitor loop.
 //!
-//! `Metrics` corresponds to the BPF-side `struct mlfq_stats` (a `volatile` global
-//! declared in `src/bpf/intf.h`, defined in `src/bpf/main.bpf.c`) plus a
-//! userspace uptime gauge. Field names match the BPF struct 1:1; the `top`
-//! stats op reports deltas over the poll interval.
+//! `Metrics` corresponds to the BPF-side `struct mlfq_stats`: the type is
+//! defined in `src/bpf/intf.h` and the `volatile` instance lives in
+//! `src/bpf/main.bpf.c`, plus a userspace uptime gauge. Field names match
+//! the BPF struct 1:1; the `top` stats op reports deltas over the poll
+//! interval.
 
 use std::io::Write;
 use std::sync::atomic::AtomicBool;

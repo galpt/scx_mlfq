@@ -105,13 +105,12 @@ enum mlfq_consts {
 	MLFQ_DISPATCH_MAX_BATCH		= 32ULL,
 
 	/*
-	 * Cap on the remote CPUs scanned per dispatch slot for the lower
-	 * queues (Q2/Q3). The scan starts at a rotating per-CPU offset so
-	 * no remote CPU is permanently excluded, while the interactive
-	 * queue (Q1) scans every candidate. The runtime bound
-	 * (mlfq_steal_scan) is this value clamped to the CPU count in
-	 * init(), so the window never exceeds the machine size and a small
-	 * machine does not re-peek the same remote DSQs.
+	 * Cap on the remote CPUs scanned per dispatch slot. The scan
+	 * starts at a rotating per-CPU offset so no remote CPU is
+	 * permanently excluded. The runtime bound (mlfq_steal_scan) is
+	 * this value clamped to the CPU count in init(), so the window
+	 * never exceeds the machine size and a small machine does not
+	 * re-peek the same remote DSQs.
 	 */
 	MLFQ_STEAL_SCAN_MAX		= 256ULL,
 
@@ -171,7 +170,7 @@ enum mlfq_task_flags {
 /*
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the per-queue clock and only meaningful relative
- * to the owning queue's zero_vruntime. The struct is 88 bytes.
+ * to the owning queue's zero_vruntime. The struct is 80 bytes.
  */
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */

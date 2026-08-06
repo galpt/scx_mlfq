@@ -24,6 +24,11 @@ The scheduler is deliberately knob-free. Every scheduling constant is a compile-
 - The queues are per-CPU user dispatch queues. A CPU serves the earliest-eligible task across its own queues and the remote CPUs' same-queue queues, so NUMA locality comes from wakeup placement while idle CPUs pull the most-owed tasks from wherever they sit.
 - sched_ext cannot schedule RT and DL tasks: the kernel resolves them to the rt and dl classes before sched_ext, so this scheduler handles SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks only.
 
-## Production Ready?
+## Status
 
-The scheduler passes the CI stress simulation, including the affinity-pinned stressor variant, and runs without stalls under full CPU load and in regular desktop use.
+The scheduler passes the project's CI stress simulation, including the
+affinity-pinned stressor variant, and has been exercised under full CPU
+load and in regular desktop use without stalls. As an experimental
+scheduler its approximations are documented under Limitations, and
+real-time and deadline tasks are scheduled by the kernel classes and
+bypass the scheduler entirely.
