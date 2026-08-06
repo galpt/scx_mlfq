@@ -7,7 +7,9 @@
  * init_task/enable initialize the task context; running() drops the task
  * from its queue aggregate and records the local-curr fold inputs;
  * stopping() advances vruntime and the EMA gauge; exit_task() removes any
- * residual aggregate contribution and deletes the task storage.
+ * residual aggregate contribution and deletes the task storage;
+ * cpu_release() re-enqueues local-DSQ leftovers when a CPU leaves the
+ * scheduler.
  */
 
 static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
@@ -176,4 +178,18 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
 		mlfq_queue_del_task(qid, q, tctx);
 
 	bpf_task_storage_delete(&task_ctx_stor, p);
+}
+
+/*
+ * CPU release (hotplug offline, exit drain, higher-priority class take-over):
+ * push any leftover local-DSQ tasks back through ops.enqueue() so they
+ * re-enter the queue DSQs instead of being stranded on the released CPU.
+ * Normally a no-op: by discipline the local DSQ depth is at most one task,
+ * and a queued leftover is exactly the runnable task the CPU is leaving
+ * behind. scx_bpf_reenqueue_local() is restricted to this callback
+ * (ext.c).
+ */
+void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
+{
+	scx_bpf_reenqueue_local();
 }

@@ -53,6 +53,10 @@ pub struct Metrics {
     pub preemption_kicks: u64,
     #[stat(desc = "Q1 cpuperf target boosts set on running")]
     pub cpuperf_boosts: u64,
+    #[stat(desc = "Dispatch moves from remote queue DSQs")]
+    pub steals: u64,
+    #[stat(desc = "Solo-task keep-running grants on empty dispatch")]
+    pub keep_running: u64,
     #[stat(desc = "Enqueues dropped for missing task state")]
     pub enq_no_tctx: u64,
     #[stat(desc = "Enqueues dropped for bad weight")]
@@ -112,6 +116,8 @@ impl Metrics {
             short_sleep_boosts: self.short_sleep_boosts.wrapping_sub(rhs.short_sleep_boosts),
             preemption_kicks: self.preemption_kicks.wrapping_sub(rhs.preemption_kicks),
             cpuperf_boosts: self.cpuperf_boosts.wrapping_sub(rhs.cpuperf_boosts),
+            steals: self.steals.wrapping_sub(rhs.steals),
+            keep_running: self.keep_running.wrapping_sub(rhs.keep_running),
             enq_no_tctx: self.enq_no_tctx.wrapping_sub(rhs.enq_no_tctx),
             enq_bad_weight: self.enq_bad_weight.wrapping_sub(rhs.enq_bad_weight),
             enq_no_deadline: self.enq_no_deadline.wrapping_sub(rhs.enq_no_deadline),

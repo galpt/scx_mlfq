@@ -105,6 +105,14 @@ enum mlfq_consts {
 	MLFQ_DISPATCH_MAX_BATCH		= 32ULL,
 
 	/*
+	 * Cap on the remote CPUs scanned per dispatch slot for the lower
+	 * queues (Q2/Q3). The scan starts at a rotating per-CPU offset so
+	 * no remote CPU is permanently excluded, while the interactive
+	 * queue (Q1) scans every candidate. 0 = full scan.
+	 */
+	MLFQ_STEAL_SCAN_MAX		= 256ULL,
+
+	/*
 	 * sched_ext cpuperf level (scx_bpf_cpuperf_set(), the schedutil
 	 * target hint). The perf argument is a linear relative level in
 	 * [0, SCX_CPUPERF_ONE]; SCX_CPUPERF_ONE is 0x400 (1024), the
@@ -206,10 +214,11 @@ struct mlfq_cpu_state {
 	u64 running_vruntime;		/* local-curr fold input */
 	u64 running_deadline;		/* EEVDF deadline of the running task */
 	u32 running_weight;
-	u32 pad;
+	u32 steal_scan_off;		/* rotating remote-scan start for Q2/Q3 */
 	u64 q1_dispatches;
 	u64 q2_dispatches;
 	u64 q3_dispatches;
+	u64 steal_dispatches;		/* per-CPU moves from remote queue DSQs */
 	u64 fast_path_dispatches;
 	u64 preemption_kicks;
 	u64 migration_disabled_placements;
@@ -228,6 +237,9 @@ struct mlfq_stats {
 	u64 short_sleep_boosts;
 	u64 preemption_kicks;
 	u64 cpuperf_boosts;
+	/* Dispatch-path counters: remote-DSQ moves and solo-task keep grants. */
+	u64 steals;
+	u64 keep_running;
 	/* Enqueue-path diagnostics: the early-return drop counters. */
 	u64 enq_no_tctx;
 	u64 enq_bad_weight;
