@@ -61,10 +61,9 @@ See `tools/README.md` for the full instructions. In short, run
 
 ```sh
 sudo bash tools/install_scx_mlfq.sh --dry-run   # preflight, read-only
-sudo bash tools/install_scx_mlfq.sh             # build + install
-sudo bash tools/install_scx_mlfq_loader.sh      # optional: GUI dropdown support
-sudo bash tools/install_scx_mlfq_gui.sh         # optional: GUI select + apply
-sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of all three
+sudo bash tools/install_scx_mlfq.sh             # full install (scheduler + GUI integration)
+sudo bash tools/install_scx_mlfq.sh --beta-only # scheduler binary only
+sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of everything
 ```
 
 The install script builds the scheduler from a git branch (default `galpt/scx`

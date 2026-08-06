@@ -4,15 +4,15 @@ This directory contains the beta-testing tooling for **scx_mlfq** on CachyOS:
 
 | File | Purpose |
 |---|---|
-| `install_scx_mlfq.sh` | Build and install (or replace) the beta scheduler binary |
-| `install_scx_mlfq_loader.sh` | Build and install a patched `scx_loader` so the Kernel Manager GUI can select scx_mlfq |
-| `install_scx_mlfq_gui.sh` | Build and install a patched `libscxctl-ui.so` so the GUI can fetch flags for scx_mlfq and apply it |
-| `uninstall_scx_mlfq.sh` | Manifest-driven clean removal of the beta binary, the patched loader and the patched GUI library, safe even after upstream ships `scx_mlfq` in a package |
-| `scx_loader-mlfq.patch` | The patch applied to the published `scx_loader` crate by the loader and GUI installers |
+| `install_scx_mlfq.sh` | **Single install entry point**: scheduler binary + loader + GUI integration |
+| `uninstall_scx_mlfq.sh` | **Single uninstall entry point**: clean removal of everything, safe even after upstream ships `scx_mlfq` in a package |
+| `install_scx_mlfq_loader.sh` | Internal: patched `scx_loader` layer (invoked by the installer; run directly to rebuild it after a package upgrade) |
+| `install_scx_mlfq_gui.sh` | Internal: patched `libscxctl-ui.so` layer (invoked by the installer; run directly to rebuild it after a package upgrade) |
+| `scx_loader-mlfq.patch` | The patch applied to the published `scx_loader` crate by the loader and GUI layers |
 
-All four scripts are bash, must be run as **root** (`sudo`), and are safe to
-run repeatedly. Run any of them with `--dry-run` first to preview what it
-would do.
+The install and uninstall scripts are bash, must be run as **root**
+(`sudo`), and are safe to run repeatedly. Run them with `--dry-run` first
+to preview what they would do.
 
 ## What scx_mlfq is
 
@@ -52,6 +52,15 @@ kernel's sched_ext interface and `scx_mlfq --stats`.
 sudo bash install_scx_mlfq.sh [options]
 ```
 
+This is the only command needed. By default it installs all three layers:
+
+1. the scheduler binary and its `scx.service` drop-in,
+2. the patched `scx_loader` (the GUI dropdown), and
+3. the patched GUI library (select and apply in the GUI).
+
+Pass `--beta-only` to install only the scheduler binary and drop-in,
+skipping the GUI integration.
+
 Defaults (matching the beta-testing workflow):
 
 | Option | Default |
@@ -67,6 +76,8 @@ Options:
 - `--source-dir DIR` - build from a local `scx` workspace instead of cloning.
   `DIR` must contain `Cargo.toml` with `scheds/experimental/scx_mlfq` listed
   as a workspace member. `--repo`/`--branch` are ignored when set.
+- `--beta-only` - install only the scheduler binary and its drop-in,
+  skipping the loader and GUI integration layers.
 - `--force` - skip the interactive confirmation when `/usr/bin/scx_mlfq` is
   owned by a package; also backs up and replaces a conflicting pre-existing
   drop-in instead of refusing.
@@ -77,7 +88,7 @@ Options:
 Examples:
 
 ```bash
-# Default: clone galpt/scx branch scx_mlfq and install
+# Default: clone galpt/scx branch scx_mlfq and install everything
 sudo bash install_scx_mlfq.sh
 
 # Preview without touching the system
@@ -85,6 +96,9 @@ sudo bash install_scx_mlfq.sh --dry-run
 
 # Build from a local scx tree
 sudo bash install_scx_mlfq.sh --source-dir /home/user/scx
+
+# Scheduler only, no GUI integration
+sudo bash install_scx_mlfq.sh --beta-only
 
 # Reinstall over a package-owned binary without prompting
 sudo bash install_scx_mlfq.sh --force
@@ -149,7 +163,10 @@ sudo systemctl restart scx.service
 
 The GUI asks `scx_loader` for its supported schedulers, and the loader's
 list is compiled into the binary (`SupportedSched` enum). scx_mlfq is not
-in the shipped list, so the GUI cannot select it without this step.
+in the shipped list, so the GUI cannot select it without this step. The
+installer above runs this script automatically; run it directly only to
+rebuild the layer, for example after a package upgrade replaced the stock
+loader.
 
 ```bash
 sudo bash install_scx_mlfq_loader.sh [options]
@@ -189,7 +206,9 @@ The GUI front-ends (the Kernel Manager scheduler page and scx-manager)
 link `libscxctl-ui.so`, which embeds a Rust client whose
 supported-scheduler list comes from the published `scx_loader` crate.
 Even with the patched loader binary above, that embedded list does not
-know scx_mlfq, so the GUI cannot fetch its flags or apply it.
+know scx_mlfq, so the GUI cannot fetch its flags or apply it. The
+installer above runs this script automatically; run it directly only to
+rebuild the layer.
 
 ```bash
 sudo bash install_scx_mlfq_gui.sh [options]

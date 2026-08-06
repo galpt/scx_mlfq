@@ -20,6 +20,8 @@
 # The build needs the GUI build dependencies: cmake, ninja, Qt 6 base and
 # tools, and the Rust toolchain. No packages are installed by this script.
 #
+# This script is normally invoked by install_scx_mlfq.sh; run it directly to rebuild the GUI layer after a package upgrade has replaced it.
+#
 # Usage: sudo bash install_scx_mlfq_gui.sh [options]
 #
 # Options:
@@ -189,9 +191,12 @@ clone_and_vendor() {
         "$BUILD_DIR/scx-manager/scx-rustlib/Cargo.toml"
 
     info 'building the GUI (release)'
+    # Own the cargo target directory explicitly: the caller
+    # (install_scx_mlfq.sh) may have exported CARGO_TARGET_DIR for its own
+    # build, and corrosion would inherit it otherwise.
     if ! (cd "$BUILD_DIR/scx-manager" \
-          && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-          && cmake --build build -j"$(nproc)"); then
+          && CARGO_TARGET_DIR="$BUILD_DIR/cargo-target" cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+          && CARGO_TARGET_DIR="$BUILD_DIR/cargo-target" cmake --build build -j"$(nproc)"); then
         err 'cmake build failed'
         err 'the build needs cmake, ninja, Qt 6 base and tools, and the Rust toolchain'
         exit 1

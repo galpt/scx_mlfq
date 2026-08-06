@@ -23,6 +23,8 @@
 # scx_loader.service is enabled, so the patched loader (and with it the
 # GUI entry for scx_mlfq) survives reboots.
 #
+# This script is normally invoked by install_scx_mlfq.sh; run it directly to rebuild the loader layer after a package upgrade has replaced it.
+#
 # Usage: sudo bash install_scx_mlfq_loader.sh [options]
 #
 # Options:
@@ -210,14 +212,16 @@ fetch_and_patch_crate() {
     ok 'patch applied'
 
     info 'building the patched loader (release profile)'
-    if ! (cd "$CRATE_DIR" && cargo build --release); then
+    # Own the target directory explicitly: the caller (install_scx_mlfq.sh)
+    # may have exported CARGO_TARGET_DIR for its own build.
+    if ! (cd "$CRATE_DIR" && CARGO_TARGET_DIR="$BUILD_DIR/target" cargo build --release); then
         err 'cargo build failed'
         exit 1
     fi
 }
 
 install_loader_binary() {
-    local _built="$CRATE_DIR/target/release/scx_loader"
+    local _built="$BUILD_DIR/target/release/scx_loader"
 
     if [ -n "$DRY_RUN" ]; then
         dry "install the built loader to $LOADER_BIN"

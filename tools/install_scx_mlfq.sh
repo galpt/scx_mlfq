@@ -3,12 +3,14 @@
 #
 # Copyright (c) 2026 Galih Tama <galpt@v.recipes>
 #
-# scx_mlfq beta installer for CachyOS (sched_ext).
-#
-# Builds scx_mlfq from the galpt/scx fork (default branch "scx_mlfq"),
-# installs it as /usr/bin/scx_mlfq, records the install in a manifest, and
-# installs a systemd drop-in so `systemctl restart scx.service` starts
-# scx_mlfq instead of the packaged default scheduler.
+# scx_mlfq installer for CachyOS (sched_ext). This is the single entry
+# point: it builds scx_mlfq from the galpt/scx fork (default branch
+# "scx_mlfq"), installs it as /usr/bin/scx_mlfq, records the install in a
+# manifest, installs a systemd drop-in so `systemctl restart scx.service`
+# starts scx_mlfq instead of the packaged default scheduler, and then
+# invokes the loader and GUI integration scripts so the CachyOS Kernel
+# Manager GUI can select, apply and switch to scx_mlfq. Pass --beta-only
+# to skip the GUI integration and install just the scheduler.
 #
 # Only ONE sched_ext scheduler can be attached at a time. This installer
 # stops scx.service and, only if a scheduler is currently attached and
@@ -42,6 +44,8 @@
 #                      DIR must contain Cargo.toml with
 #                      scheds/experimental/scx_mlfq listed as a member.
 #                      --repo/--branch are ignored when this is set.
+#   --beta-only        Install only the scheduler binary and its drop-in;
+#                      skip the loader and GUI integration steps.
 #   --force            Skip the interactive confirmation when overwriting a
 #                      package-owned /usr/bin/scx_mlfq; also backs up and
 #                      replaces a conflicting pre-existing drop-in.
@@ -71,6 +75,7 @@ BRANCH="$DEFAULT_BRANCH"
 SOURCE_DIR=""
 FORCE=""
 DRY_RUN=""
+BETA_ONLY=""
 BUILD_DIR=""
 SRC_DIR=""
 BIN_BUILT=""
@@ -180,6 +185,8 @@ Options:
                      DIR must contain Cargo.toml with
                      scheds/experimental/scx_mlfq listed as a member.
                      --repo/--branch are ignored when this is set.
+  --beta-only        Install only the scheduler binary and its drop-in;
+                     skip the loader and GUI integration steps.
   --force            Skip the interactive confirmation when overwriting a
                      package-owned /usr/bin/scx_mlfq; also backs up and
                      replaces a conflicting pre-existing drop-in.
@@ -678,6 +685,28 @@ main() {
     step 'Smoke test'
     smoke_test
 
+    if [ -z "$BETA_ONLY" ]; then
+        local _it_args=()
+        [ -n "$FORCE" ] && _it_args+=(--force)
+        [ -n "$DRY_RUN" ] && _it_args+=(--dry-run)
+
+        step 'Loader integration (patched scx_loader for the GUI dropdown)'
+        if ! bash "$(dirname "$0")/install_scx_mlfq_loader.sh" "${_it_args[@]}"; then
+            err 'loader integration failed; the scheduler itself is installed'
+            err "re-run the loader integration with:  sudo bash $(dirname "$0")/install_scx_mlfq_loader.sh"
+            exit 1
+        fi
+
+        step 'GUI integration (patched libscxctl-ui for select and apply)'
+        if ! bash "$(dirname "$0")/install_scx_mlfq_gui.sh" "${_it_args[@]}"; then
+            err 'GUI integration failed; the scheduler and loader are installed'
+            err "re-run the GUI integration with:  sudo bash $(dirname "$0")/install_scx_mlfq_gui.sh"
+            exit 1
+        fi
+    else
+        info '--beta-only: skipping the loader and GUI integration steps'
+    fi
+
     step 'Status summary'
     status_summary
 
@@ -711,6 +740,10 @@ while [ "$#" -gt 0 ]; do
             validate_flag_value '--source-dir' "$2"
             SOURCE_DIR="$2"
             shift 2
+            ;;
+        --beta-only)
+            BETA_ONLY="1"
+            shift
             ;;
         --force)
             FORCE="1"
