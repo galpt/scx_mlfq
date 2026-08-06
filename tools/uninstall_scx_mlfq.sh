@@ -397,6 +397,32 @@ remove_loader_entry() {
     fi
 }
 
+# remove_mlfq_default: the Kernel Manager GUI writes
+# default_sched = "scx_mlfq" into the loader config when scx_mlfq is
+# applied as the default scheduler. The stock loader rejects the whole
+# config file when the default scheduler is an unknown variant, so the
+# line must be removed when scx_mlfq leaves the system.
+remove_mlfq_default() {
+    if [ ! -f "$SCX_LOADER_CONFIG" ]; then
+        LOADER_DEFAULT_STATE="no config"
+        return 0
+    fi
+    if ! grep -E '^default_sched[[:space:]]*=[[:space:]]*["'"'"']scx_mlfq["'"'"'][[:space:]]*$'          "$SCX_LOADER_CONFIG" >/dev/null 2>&1; then
+        LOADER_DEFAULT_STATE="absent"
+        return 0
+    fi
+
+    if [ -n "$DRY_RUN" ]; then
+        dry "remove the default_sched = \"scx_mlfq\" line from $SCX_LOADER_CONFIG"
+        LOADER_DEFAULT_STATE="would remove"
+        return 0
+    fi
+
+    sed -i '/^default_sched[[:space:]]*=[[:space:]]*["'"'"']scx_mlfq["'"'"'][[:space:]]*$/d'         "$SCX_LOADER_CONFIG"
+    ok "removed the default_sched = \"scx_mlfq\" line from $SCX_LOADER_CONFIG"
+    LOADER_DEFAULT_STATE="removed"
+}
+
 # our_loader_dropin: the exact bytes the loader installer owns for the
 # scx_loader.service override.
 our_loader_dropin() {
@@ -669,6 +695,7 @@ summary() {
     printf '  %-24s %s\n' 'Backup:' "$BACKUP_STATE"
     printf '  %-24s %s\n' 'Drop-in:' "$DROPIN_STATE"
     printf '  %-24s %s\n' 'scx_loader entry:' "$LOADER_ENTRY_STATE"
+    printf '  %-24s %s\n' 'mlfq default:' "$LOADER_DEFAULT_STATE"
     printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
     printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
     printf '  %-24s %s\n' 'GUI library:' "$GUI_LIB_STATE"
@@ -826,6 +853,7 @@ main() {
 
     step 'Removing our scx_loader entry'
     remove_loader_entry
+    remove_mlfq_default
 
     step 'Removing the patched scx_loader'
     remove_loader_patch
