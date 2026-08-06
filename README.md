@@ -22,8 +22,8 @@ sits below the fair class, so this scheduler handles non-RT tasks only.
 ```
 scx/    scheduler sources, a drop-in for scheds/experimental/scx_mlfq/
         in a checkout of sched-ext/scx (see below)
-tools/  CachyOS beta-testing scripts (install / uninstall, GUI loader
-        integration via a patched scx_loader; see tools/README.md)
+tools/  CachyOS beta-testing scripts (install / uninstall, GUI integration
+        via a patched scx_loader and libscxctl-ui; see tools/README.md)
 LICENSE GPL-2.0
 ```
 
@@ -63,7 +63,8 @@ See `tools/README.md` for the full instructions. In short, run
 sudo bash tools/install_scx_mlfq.sh --dry-run   # preflight, read-only
 sudo bash tools/install_scx_mlfq.sh             # build + install
 sudo bash tools/install_scx_mlfq_loader.sh      # optional: GUI dropdown support
-sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of both
+sudo bash tools/install_scx_mlfq_gui.sh         # optional: GUI select + apply
+sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of all three
 ```
 
 The install script builds the scheduler from a git branch (default `galpt/scx`

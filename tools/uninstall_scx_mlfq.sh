@@ -45,6 +45,8 @@ LOADER_BIN="/usr/local/bin/scx_loader"
 LOADER_DROPIN_DIR="/etc/systemd/system/scx_loader.service.d"
 LOADER_DROPIN="$LOADER_DROPIN_DIR/mlfq-loader.conf"
 LOADER_MANIFEST="$LIB_DIR/scx_mlfq-loader.manifest"
+GUI_MANIFEST="$LIB_DIR/scx_mlfq-gui.manifest"
+GUI_LIB="/usr/lib/libscxctl-ui.so.1.15.12"
 
 FORCE=""
 DRY_RUN=""
@@ -512,6 +514,144 @@ remove_loader_patch() {
     fi
 }
 
+# parse_gui_manifest: strict key=value parser for the GUI manifest.
+# Same discipline as the beta and loader manifests.
+parse_gui_manifest() {
+    local line key value seen=""
+
+    GUI_LIB_MF=""
+    GUI_BACKUP_MF=""
+    GUI_SHA256=""
+    GUI_ORIG_SHA256=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            *=*) ;;
+            *)
+                err "GUI manifest line is missing '=': $(sanitize "$line")"
+                return 1
+                ;;
+        esac
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            *[!A-Za-z0-9_]*)
+                err "GUI manifest contains an invalid key: $(sanitize "$key")"
+                return 1
+                ;;
+        esac
+        case "$value" in
+            *[$'\t\n\r\v\f']*)
+                err "GUI manifest value for '$key' contains control characters"
+                return 1
+                ;;
+        esac
+        case "$key" in
+            name|version|gui_lib|gui_backup|gui_sha256|orig_owner|orig_sha256|install_time) ;;
+            *)
+                err "GUI manifest contains an unknown key: $(sanitize "$key")"
+                return 1
+                ;;
+        esac
+        case " $seen " in
+            *" $key "*)
+                err "GUI manifest contains duplicate key: $key"
+                return 1
+                ;;
+        esac
+        seen="$seen $key"
+        case "$key" in
+            gui_lib) GUI_LIB_MF="$value" ;;
+            gui_backup) GUI_BACKUP_MF="$value" ;;
+            gui_sha256) GUI_SHA256="$value" ;;
+            orig_sha256) GUI_ORIG_SHA256="$value" ;;
+        esac
+    done < "$GUI_MANIFEST"
+}
+
+# restore_gui_lib: undo the GUI library replacement. The library is
+# restored only when the backup is a regular file and the current library
+# still matches the patched build recorded in the manifest; otherwise the
+# package has already taken the file back and only the backup/manifest are
+# removed.
+restore_gui_lib() {
+    local CURRENT_SHA GUI_LIB_REAL GUI_BACKUP_REAL RESTORED_SHA
+
+    if [ -z "$GUI_LIB_MF" ] && [ -z "$GUI_BACKUP_MF" ]; then
+        info 'no GUI library recorded in the manifest; nothing to restore'
+        GUI_LIB_STATE="none recorded"
+        return 0
+    fi
+
+    # Confine the recorded paths.
+    case "$GUI_LIB_MF" in
+        *'/../'*|*'/./'*|*$'\n'*|*$'\r'*)
+            err 'refusing GUI manifest library path containing traversal or control characters'
+            exit 1
+            ;;
+    esac
+    GUI_LIB_REAL=$(realpath -m -- "$GUI_LIB_MF") || exit 1
+    case "$GUI_LIB_REAL" in
+        /usr/lib/libscxctl-ui.so.1.15.12) GUI_LIB="$GUI_LIB_MF" ;;
+        *)
+            err "refusing unexpected GUI library path in manifest: $(sanitize "$GUI_LIB_MF")"
+            exit 1
+            ;;
+    esac
+    case "$GUI_BACKUP_MF" in
+        *'/../'*|*'/./'*|*$'\n'*|*$'\r'*)
+            err 'refusing GUI manifest backup path containing traversal or control characters'
+            exit 1
+            ;;
+    esac
+    GUI_BACKUP_REAL=$(realpath -m -- "$GUI_BACKUP_MF") || exit 1
+    case "$GUI_BACKUP_REAL" in
+        /usr/lib/scx/*) GUI_BACKUP="$GUI_BACKUP_MF" ;;
+        *)
+            err "refusing unexpected GUI backup path in manifest: $(sanitize "$GUI_BACKUP_MF")"
+            exit 1
+            ;;
+    esac
+
+    CURRENT_SHA=$(sha256_of "$GUI_LIB")
+    if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$GUI_SHA256" ]; then
+        # Our patched library is still in place; restore the original.
+        if [ ! -f "$GUI_BACKUP" ] || [ -L "$GUI_BACKUP" ]; then
+            err "GUI backup is missing or is a symlink: $GUI_BACKUP"
+            exit 1
+        fi
+        run mv -f "$GUI_BACKUP" "$GUI_LIB"
+        if [ ! -f "$GUI_LIB" ] || [ -L "$GUI_LIB" ]; then
+            err "$GUI_LIB is missing or a symlink after restore; refusing to chmod"
+            exit 1
+        fi
+        run chmod 755 "$GUI_LIB"
+        RESTORED_SHA=$(sha256_of "$GUI_LIB")
+        if [ -n "$GUI_ORIG_SHA256" ] && [ "$RESTORED_SHA" = "$GUI_ORIG_SHA256" ]; then
+            ok "$GUI_LIB restored from backup (sha256 verified against the manifest)"
+        else
+            warn "$GUI_LIB restored, but its sha256 differs from the recorded original"
+        fi
+        GUI_LIB_STATE="restored"
+    else
+        warn 'current GUI library differs from the patched build this installer put in place; not touching it'
+        if [ -n "$CURRENT_SHA" ]; then
+            warn "  current:  $CURRENT_SHA"
+            warn "  recorded: $GUI_SHA256"
+        else
+            warn "  $GUI_LIB is absent"
+        fi
+        if [ -f "$GUI_BACKUP" ] && [ ! -L "$GUI_BACKUP" ]; then
+            run rm -f "$GUI_BACKUP"
+            ok "removed GUI backup $GUI_BACKUP"
+        fi
+        GUI_LIB_STATE="left untouched"
+    fi
+    run rm -f "$GUI_MANIFEST"
+    ok "removed GUI manifest $GUI_MANIFEST"
+}
+
 remove_manifest() {
     if [ -f "$MANIFEST" ]; then
         run rm -f "$MANIFEST"
@@ -531,6 +671,7 @@ summary() {
     printf '  %-24s %s\n' 'scx_loader entry:' "$LOADER_ENTRY_STATE"
     printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
     printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
+    printf '  %-24s %s\n' 'GUI library:' "$GUI_LIB_STATE"
     printf '  %-24s %s\n' 'scx.service:' 'left in place (not disabled)'
     if [ -n "$DROPIN_BACKUP" ]; then
         printf '  %-24s %s\n' 'Drop-in backup:' "$DROPIN_BACKUP_STATE"
@@ -549,9 +690,8 @@ main() {
     step 'scx_mlfq beta uninstaller for CachyOS'
     check_root
 
-    if [ ! -f "$MANIFEST" ] && [ ! -f "$LOADER_MANIFEST" ]; then
-        printf '\nNothing to uninstall: no manifest at %s and no loader manifest at %s.\n' \
-            "$MANIFEST" "$LOADER_MANIFEST"
+    if [ ! -f "$MANIFEST" ] && [ ! -f "$LOADER_MANIFEST" ] && [ ! -f "$GUI_MANIFEST" ]; then
+        printf '\nNothing to uninstall: no beta, loader or GUI manifest found.\n'
         printf 'This script only removes files recorded by the %s installers;\n' "$BIN_NAME"
         printf 'no files were touched.\n'
         exit 0
@@ -574,6 +714,13 @@ main() {
         if ! parse_loader_manifest; then
             err 'refusing to touch any file; inspect the loader manifest manually:'
             err "  cat $LOADER_MANIFEST"
+            exit 1
+        fi
+    fi
+    if [ -f "$GUI_MANIFEST" ]; then
+        if ! parse_gui_manifest; then
+            err 'refusing to touch any file; inspect the GUI manifest manually:'
+            err "  cat $GUI_MANIFEST"
             exit 1
         fi
     fi
@@ -682,6 +829,9 @@ main() {
 
     step 'Removing the patched scx_loader'
     remove_loader_patch
+
+    step 'Restoring the GUI library'
+    restore_gui_lib
 
     if [ -n "$DROPIN_BACKUP" ]; then
         step 'Removing our drop-in backup'

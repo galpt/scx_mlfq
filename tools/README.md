@@ -6,10 +6,11 @@ This directory contains the beta-testing tooling for **scx_mlfq** on CachyOS:
 |---|---|
 | `install_scx_mlfq.sh` | Build and install (or replace) the beta scheduler binary |
 | `install_scx_mlfq_loader.sh` | Build and install a patched `scx_loader` so the Kernel Manager GUI can select scx_mlfq |
-| `uninstall_scx_mlfq.sh` | Manifest-driven clean removal of the beta binary and the patched loader, safe even after upstream ships `scx_mlfq` in a package |
-| `scx_loader-mlfq.patch` | The patch applied to the published `scx_loader` crate by `install_scx_mlfq_loader.sh` |
+| `install_scx_mlfq_gui.sh` | Build and install a patched `libscxctl-ui.so` so the GUI can fetch flags for scx_mlfq and apply it |
+| `uninstall_scx_mlfq.sh` | Manifest-driven clean removal of the beta binary, the patched loader and the patched GUI library, safe even after upstream ships `scx_mlfq` in a package |
+| `scx_loader-mlfq.patch` | The patch applied to the published `scx_loader` crate by the loader and GUI installers |
 
-All three scripts are bash, must be run as **root** (`sudo`), and are safe to
+All four scripts are bash, must be run as **root** (`sudo`), and are safe to
 run repeatedly. Run any of them with `--dry-run` first to preview what it
 would do.
 
@@ -42,7 +43,7 @@ kernel's sched_ext interface and `scx_mlfq --stats`.
   schedulers. The GUI can manage scx_mlfq only after
   `install_scx_mlfq_loader.sh` has added scx_mlfq to the loader's
   compiled-in scheduler list (see the loader section below).
-- **Root**. All three scripts refuse to run as a non-root user, including
+- **Root**. All four scripts refuse to run as a non-root user, including
   with `--dry-run`.
 
 ## Installing
@@ -179,10 +180,48 @@ What it does, in order:
    (its own manifest, separate from the beta manifest), so the uninstaller
    can undo exactly this step.
 
-After it finishes, the Kernel Manager GUI lists scx_mlfq and can start,
-stop and switch to it like any other registered scheduler. Switching back
-and forth between scx_mlfq and the packaged schedulers works entirely from
-the GUI.
+After it finishes, the Kernel Manager GUI dropdown lists scx_mlfq. One
+more step is needed before the GUI can apply it (see below).
+
+## GUI integration (select and apply scx_mlfq in the GUI)
+
+The GUI front-ends (the Kernel Manager scheduler page and scx-manager)
+link `libscxctl-ui.so`, which embeds a Rust client whose
+supported-scheduler list comes from the published `scx_loader` crate.
+Even with the patched loader binary above, that embedded list does not
+know scx_mlfq, so the GUI cannot fetch its flags or apply it.
+
+```bash
+sudo bash install_scx_mlfq_gui.sh [options]
+```
+
+Options:
+
+- `--force` - replace a conflicting pre-existing GUI library without
+  prompting (still backed up first).
+- `--dry-run` - validate inputs and print every action without cloning,
+  building, or changing the system.
+- `--help`, `-h` - print help.
+
+What it does, in order:
+
+1. Clones `CachyOS/scx-manager` at a pinned commit (project version
+   1.15.12, the version shipped by CachyOS), vendors the patched
+   `scx_loader` crate into its Rust library as a path dependency, and
+   applies `tools/scx_loader-mlfq.patch`.
+2. Builds the project with cmake (needs cmake, ninja, Qt 6 base and
+   tools, and the Rust toolchain; no packages are installed by the
+   script).
+3. Backs up `/usr/lib/libscxctl-ui.so.1.15.12` and replaces it with the
+   build result. Both GUI front-ends resolve the library by soname, so
+   no other file needs replacing.
+4. Records the install in `/usr/lib/scx/scx_mlfq-gui.manifest` (own
+   manifest, with the original's sha256), so the uninstaller restores
+   the packaged library.
+
+After it finishes, selecting scx_mlfq in the GUI shows no flag error and
+Apply works; switching back and forth between scx_mlfq and the packaged
+schedulers works entirely from the GUI.
 
 ## Uninstalling
 
@@ -224,6 +263,11 @@ The uninstaller is **manifest-driven and idempotent**:
   record) and the loader drop-in (only when it byte-matches), reloads
   systemd so the stock loader's `ExecStart` takes effect, and restarts an
   active loader. The loader service itself is never disabled.
+- If the GUI manifest exists, it restores the packaged
+  `/usr/lib/libscxctl-ui.so.1.15.12` from the recorded backup (only when
+  the current library still matches the patched build; otherwise the
+  package has already taken the file back and only the backup and
+  manifest are removed).
 - It never disables or modifies `scx_loader.service` (an active loader may
   be restarted so the stock binary takes effect) and never touches
   `/etc/default/scx` or any other file. Every path read from the manifests
@@ -312,12 +356,13 @@ and `scx_mlfq --stats`.
   nothing, it is a safe way to check the installer's decisions (including
   whether `/usr/bin/scx_mlfq` is currently package-owned).
 - The installers use only owned temporary build directories (under
-  `/tmp/scx_mlfq-build.*` and `/tmp/scx_mlfq-loader-build.*`, created with
-  `mktemp`) and remove them on exit.
+  `/tmp/scx_mlfq-build.*`, `/tmp/scx_mlfq-loader-build.*` and
+  `/tmp/scx_mlfq-gui-build.*`, created with `mktemp`) and remove them on
+  exit.
 
 ## Safety notes for reviewers
 
-- All three scripts use `set -euo pipefail`, an unconditional EUID/root
+- All four scripts use `set -euo pipefail`, an unconditional EUID/root
   gate, no `eval`, and no `rm -rf` outside the owned temporary build
   directories.
   File removals are `rm -f` on manifest-recorded paths that are first

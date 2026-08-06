@@ -138,7 +138,7 @@ EOF
 }
 
 check_loader_service() {
-    if ! systemctl list-unit-files 'scx_loader*' --no-legend 2>/dev/null | grep -q .; then
+    if [ "$(systemctl list-unit-files 'scx_loader*' --no-legend 2>/dev/null | grep -c .)" -eq 0 ]; then
         warn 'scx_loader.service is not installed; the GUI cannot manage schedulers without it'
         confirm_continue 'Continue anyway? The patched loader will be installed but unused.' || exit 0
     fi
@@ -304,7 +304,8 @@ verify_registration() {
     fi
 
     if OUT=$(busctl --system get-property org.scx.Loader /org/scx/Loader \
-            org.scx.Loader SupportedSchedulers 2>/dev/null) && printf '%s' "$OUT" | grep -q 'scx_mlfq'; then
+            org.scx.Loader SupportedSchedulers 2>/dev/null) \
+       && [ "$(printf '%s' "$OUT" | grep -c 'scx_mlfq')" -ge 1 ]; then
         ok 'scx_mlfq is registered with the running scx_loader; the GUI can select it'
     else
         warn 'could not confirm scx_mlfq in the loader SupportedSchedulers list'
