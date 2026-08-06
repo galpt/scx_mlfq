@@ -206,6 +206,41 @@ static __always_inline u64 mlfq_place_task(u32 qid, struct task_ctx *tctx,
 }
 
 /*
+ * Account @tctx into queue @qid's aggregate without recomputing a
+ * placement. The enqueue path separates the placement decision (which
+ * must run without accounting so a wakeup can be redirected to a local
+ * DSQ before anything is charged) from the accounting step, which runs
+ * only when the task actually enters a queue DSQ. The sequence mirrors
+ * the tail of mlfq_place_task(): account_add under the lock, then the
+ * zero_vruntime advance, so the aggregate keys stay relative to the
+ * current base.
+ *
+ * Return: true on success, false on queue/lock lookup failure.
+ */
+static __always_inline bool mlfq_queue_account_only(u32 qid,
+						    struct task_ctx *tctx)
+{
+	struct queue_ctx *q = mlfq_lookup_queue(qid);
+	struct bpf_spin_lock *lock = mlfq_lookup_queue_lock(qid);
+
+	if (!q || !lock)
+		return false;
+
+	bpf_spin_lock(lock);
+	mlfq_queue_account_add(q, tctx);
+	mlfq_queue_advance_zero(q);
+#if MLFQ_CHECK
+	if (!mlfq_check_queue_ctx(q) || !mlfq_check_aggregate_bounds(q))
+		scx_bpf_error("q%u aggregate inconsistent s=%lld W=%llu n=%llu",
+			      qid, q->sum_w_vruntime, q->sum_weight,
+			      q->nr_queued);
+#endif
+	bpf_spin_unlock(lock);
+
+	return true;
+}
+
+/*
  * Remove @tctx from queue @q's aggregate (ops.running()/exit_task()).
  * Caller looks up @q by tctx->queue.
  */

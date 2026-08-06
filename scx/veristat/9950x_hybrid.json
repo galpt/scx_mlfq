@@ -19,7 +19,7 @@
                 },{
                     "mlfq_aging_period_ns": 1000000000
                 },{
-                    "mlfq_short_sleep_ns": 1000000
+                    "mlfq_short_sleep_ns": 32000000
                 },{
                     "mlfq_short_sleep_rate_limit_ns": 2000000
                 },{

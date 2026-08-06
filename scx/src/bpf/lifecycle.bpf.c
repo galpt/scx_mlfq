@@ -66,9 +66,11 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 
 	/*
 	 * The task left its queue to run: drop it from the aggregate so
-	 * V_q reflects the queued set, and record the local-curr fold
-	 * inputs. Fast-path and migration-disabled tasks
-	 * were never accounted and are skipped by the ACCOUNTED flag.
+	 * V_q reflects the queued set, and record the running task's
+	 * EEVDF state -- the local-curr fold inputs and the deadline the
+	 * wakeup preemption decision compares against. Fast-path and
+	 * migration-disabled tasks were never accounted and are skipped
+	 * by the ACCOUNTED flag.
 	 */
 	q = mlfq_lookup_queue(tctx->queue);
 	if (q)
@@ -79,6 +81,7 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 		cpu->running_queue = tctx->queue;
 		cpu->running_pid = p->pid;
 		cpu->running_vruntime = tctx->vruntime;
+		cpu->running_deadline = tctx->deadline;
 		cpu->running_weight = tctx->weight;
 	}
 
@@ -88,22 +91,19 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 	__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
 
 	/*
-	 * cpufreq interaction: state the running task's performance class
-	 * through the sched_ext cpuperf API. The kernel stores the target
-	 * per CPU and it persists until overwritten, so setting it on every
-	 * ops.running() makes the last value always reflect the task now on
-	 * the CPU, and schedutil then picks the frequency. Q1 (interactive)
-	 * and Q2 (default) run at the maximum level, Q3 (CPU-bound) at half
-	 * for power efficiency. The counter reports Q1 placements as the
-	 * interactive boost signal.
+	 * cpufreq interaction: the interactive queue requests the maximum
+	 * performance level through the sched_ext cpuperf API. The kernel
+	 * stores the target per CPU and it persists until overwritten, so
+	 * setting it on every ops.running() makes the last value always
+	 * reflect the interactive task now on the CPU, and schedutil then
+	 * picks the frequency. The other queues leave the target untouched
+	 * so the kernel's governor drives the frequency without
+	 * throttling. The counter reports Q1 placements as the interactive
+	 * boost signal.
 	 */
 	if (tctx->queue == 1) {
 		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), MLFQ_CPUPERF_Q1);
 		__sync_fetch_and_add(&mlfq_stats.cpuperf_boosts, 1);
-	} else if (tctx->queue == 2) {
-		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), MLFQ_CPUPERF_Q2);
-	} else {
-		scx_bpf_cpuperf_set(scx_bpf_task_cpu(p), MLFQ_CPUPERF_Q3);
 	}
 }
 
@@ -145,6 +145,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 			cpu->running_queue = 0;
 			cpu->running_pid = 0;
 			cpu->running_vruntime = 0;
+			cpu->running_deadline = 0;
 			cpu->running_weight = 0;
 		}
 	}

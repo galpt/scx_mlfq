@@ -72,8 +72,14 @@ enum mlfq_consts {
 	/* EMA decay half-life. */
 	MLFQ_EMA_HALF_LIFE_NS		= (24ULL * NSEC_PER_MSEC),
 
-	/* Short-sleep boost window. */
-	MLFQ_SHORT_SLEEP_NS		= (1ULL * NSEC_PER_MSEC),
+	/*
+	 * Short-sleep boost window: covers periodic wakeup cadences such
+	 * as the 60 Hz frame interval, so latency-sensitive consumers of
+	 * CPU are recognized as interactive even when their runtime
+	 * consumption would otherwise classify them as CPU-bound; the
+	 * per-task boost rate limit keeps the churn bounded.
+	 */
+	MLFQ_SHORT_SLEEP_NS		= (32ULL * NSEC_PER_MSEC),
 	MLFQ_SHORT_SLEEP_RATE_LIMIT_NS	= (2ULL * NSEC_PER_MSEC),
 	MLFQ_HYSTERESIS_SLEEP_NS	= (4ULL * NSEC_PER_MSEC),
 
@@ -99,19 +105,17 @@ enum mlfq_consts {
 	MLFQ_DISPATCH_MAX_BATCH		= 32ULL,
 
 	/*
-	 * sched_ext cpuperf levels (scx_bpf_cpuperf_set(), the schedutil
+	 * sched_ext cpuperf level (scx_bpf_cpuperf_set(), the schedutil
 	 * target hint). The perf argument is a linear relative level in
 	 * [0, SCX_CPUPERF_ONE]; SCX_CPUPERF_ONE is 0x400 (1024), the
 	 * maximum level. The kernel stores the target per-CPU and it
 	 * persists until overwritten, so ops.running() states the level of
 	 * the task now on the CPU on every context switch and schedutil
-	 * follows. Q1 (interactive) and Q2 (default) run at the maximum
-	 * level, Q3 (CPU-bound) at half.
+	 * follows. The interactive queue requests the maximum level; the
+	 * other queues leave the target untouched so the governor drives
+	 * the frequency without throttling.
 	 */
-	MLFQ_CPUPERF_ONE			= 1024ULL,
 	MLFQ_CPUPERF_Q1			= 1024ULL,
-	MLFQ_CPUPERF_Q2			= 1024ULL,
-	MLFQ_CPUPERF_Q3			= 512ULL,
 
 	MLFQ_NR_QUEUES			= 3ULL,
 
@@ -200,6 +204,7 @@ struct mlfq_cpu_state {
 	s32 running_queue;		/* queue of the running task, 0 none */
 	u32 running_pid;
 	u64 running_vruntime;		/* local-curr fold input */
+	u64 running_deadline;		/* EEVDF deadline of the running task */
 	u32 running_weight;
 	u32 pad;
 	u64 q1_dispatches;

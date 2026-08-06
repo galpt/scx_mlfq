@@ -32,6 +32,8 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
  * from the bindgen-generated constants (the same source `topology.rs`
  * cross-checks its constants against), so an intf.h change propagates here
  * automatically and the `defaults_match_intf_h` test pins the binding.
+ * SHORT_SLEEP_NS is the one explicit value and the test pins it to the
+ * intf.h constant.
  */
 
 /// Per-queue request sizes.
@@ -55,8 +57,10 @@ const EMA_HALF_LIFE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_EMA_HALF_LIFE_NS
 /// Aging period.
 const AGING_PERIOD_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_AGING_PERIOD_NS as u64;
 
-/// Short-sleep boost window.
-const SHORT_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_NS as u64;
+/// Short-sleep boost window: periodic wakeup cadences such as the 60 Hz
+/// frame interval stay interactive; the per-task boost rate limit bounds
+/// the churn.
+const SHORT_SLEEP_NS: u64 = 32 * NSEC_PER_MSEC;
 const SHORT_SLEEP_RATE_LIMIT_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS as u64;
 const HYSTERESIS_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS as u64;

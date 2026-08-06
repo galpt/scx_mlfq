@@ -9,7 +9,8 @@
  *   RUN-OUT (enq_flags == 0) -> demotion, then placement
  *   other (fork / SCX_ENQ_LAST / class switch) -> counter reset, placement
  *   wall-clock aging check for Q2/Q3 stays, then placement
- * and the queue-preemptive wakeup kicks.
+ * and the wakeup preemption decision: a higher queue, or the same queue
+ * with an earlier EEVDF deadline, preempts the running task.
  *
  * The demotion path keys on the flags == 0 run-out re-enqueue, which only
  * slice exhaustion produces: put_prev_task_scx() re-enqueues the runnable
@@ -275,13 +276,69 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	else
 		target_cpu = bpf_get_smp_processor_id();
 
-	/* Regular path: into the owning CPU's queue vtime DSQ. */
-	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
+	/*
+	 * Compute the placement before the preemption decision so the
+	 * wakeup's EEVDF deadline is available to it. The task is not
+	 * accounted yet: the preemption branch dispatches it to a local
+	 * DSQ, which never carries aggregate membership, so the accounting
+	 * step that mirrors mlfq_place_task()'s tail runs only when the
+	 * task actually enters a queue DSQ.
+	 */
+	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, false);
 	if (!deadline) {
 		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 		return;
 	}
+
+	/*
+	 * Wakeup preemption: a wakeup outranks the task running on the CPU
+	 * it was last running on when it belongs to a higher queue, or to
+	 * the same queue with an earlier EEVDF deadline -- the
+	 * check_preempt_wakeup semantics of the fair scheduler, where the
+	 * higher-priority arrival preempts. The wakee is dispatched to
+	 * that CPU's local DSQ with SCX_ENQ_PREEMPT, which the kernel
+	 * resolves into a preemption on the next scheduling event. The
+	 * local-DSQ insert is never accounted, matching the idle-CPU fast
+	 * path. The decision is confined to wakeups of migratable tasks
+	 * (migration-disabled tasks are routed above); a wakeup without a
+	 * previous CPU fails the cpu_state lookup and falls through.
+	 */
+	if (wakeup && !migration_disabled) {
+		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
+		bool preempt = false;
+
+		if (prev_state && prev_state->running_pid &&
+		    prev_state->running_pid != p->pid &&
+		    prev_state->running_queue > 0) {
+			if ((s32)qid < prev_state->running_queue)
+				preempt = true;	/* higher queue than the running task */
+			else if ((s32)qid == prev_state->running_queue &&
+				 mlfq_time_before(deadline, prev_state->running_deadline))
+				preempt = true;	/* earlier deadline on the same queue */
+		}
+
+		if (preempt) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+					   mlfq_queue_slice(qid),
+					   enq_flags | SCX_ENQ_PREEMPT);
+			__sync_fetch_and_add(&mlfq_stats.preemption_kicks, 1);
+			/*
+			 * The task is on the local DSQ, not in a queue DSQ,
+			 * so dsq_id is cleared like on the idle-CPU fast
+			 * path.
+			 */
+			tctx->dsq_id = 0;
+			tctx->wake_cpu_state = 0;
+			goto done;
+		}
+	}
+
+	/* Regular path: into the owning CPU's queue vtime DSQ. */
 	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
+	if (!mlfq_queue_account_only(qid, tctx)) {
+		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
+		return;
+	}
 	tctx->dsq_id = mlfq_dsq_id(qid, target_cpu);
 	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
 				 mlfq_queue_slice(qid), deadline, enq_flags);
@@ -290,24 +347,16 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;
 
-done:
 	/*
-	 * Wakeup preemption: a higher-priority arrival
-	 * preempts the lower-priority task running on prev_cpu. The kick is
-	 * restricted to genuine promotions, into Q1 from Q2 or Q3 and into
-	 * Q2 from Q3, which keeps borderline-promotion IPI storms out. Never
-	 * kick the wakee itself and never kick the local CPU.
+	 * A placement into another CPU's queue needs that CPU to run one
+	 * more scheduling cycle so a queued task is not stranded on a
+	 * nohz-idle CPU; the idle kick is a cheap flag that is consumed
+	 * when the CPU next goes idle. The enqueueing CPU needs no kick:
+	 * its own dispatch drains the queue in the same scheduling cycle.
 	 */
-	if (wakeup && !migration_disabled) {
-		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
-		bool promoted = (qid == 1 && old_queue >= 2) ||
-				(qid == 2 && old_queue == 3);
+	if (target_cpu != bpf_get_smp_processor_id())
+		scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
 
-		if (promoted && prev_state && prev_state->running_queue > (s32)qid &&
-		    prev_state->running_pid != p->pid &&
-		    prev_cpu != bpf_get_smp_processor_id()) {
-			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_PREEMPT);
-			prev_state->preemption_kicks++;
-		}
-	}
+done:
+	;
 }
