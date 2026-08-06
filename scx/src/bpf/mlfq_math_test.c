@@ -253,28 +253,31 @@ static void test_demote_hysteresis(void)
 	mlfq_demote_on_reenq(&t, 250000, 2000000);
 	TEST_OK(t.reenq_cnt == 1 && t.queue == 1,
 		"single run-out with ema > T_L does not demote Q1->Q2");
-	TEST_OK(mlfq_demote_on_reenq(&t, 250000, 2000000) &&
-		t.queue == 2 && t.reenq_cnt == 0,
-		"two run-outs demote Q1->Q2 and reset reenq_cnt");
+	mlfq_demote_on_reenq(&t, 250000, 2000000);
+	TEST_OK(t.reenq_cnt == 2 && t.queue == 1,
+		"two run-outs with ema below T_H do not demote Q1->Q2");
 
 	t.queue = 1;
-	t.ema = 3000000;	/* > T_H: immediate demotion */
+	t.ema = 3000000;	/* > T_H */
 	t.reenq_cnt = 0;
-	TEST_OK(mlfq_demote_on_reenq(&t, 250000, 2000000) && t.queue == 2,
-		"ema > T_H demotes Q1->Q2 on the first run-out");
+	for (int i = 0; i < 7; i++)
+		mlfq_demote_on_reenq(&t, 250000, 2000000);
+	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
+		"seven run-outs with ema > T_H do not demote Q1->Q2");
+	TEST_OK(mlfq_demote_on_reenq(&t, 250000, 2000000) &&
+		t.queue == 2 && t.reenq_cnt == 0,
+		"eight run-outs demote Q1->Q2 and reset reenq_cnt");
 
 	t.queue = 2;
 	t.ema = 3000000;	/* > T_H */
 	t.reenq_cnt = 0;
-	mlfq_demote_on_reenq(&t, 250000, 2000000);
-	TEST_OK(mlfq_demote_on_reenq(&t, 250000, 2000000) && t.queue == 3,
-		"two run-outs demote Q2->Q3");
-
-	t.queue = 2;
-	t.ema = 5000000;	/* > 2*T_H: immediate */
-	t.reenq_cnt = 0;
-	TEST_OK(mlfq_demote_on_reenq(&t, 250000, 2000000) && t.queue == 3,
-		"ema > 2*T_H demotes Q2->Q3 on the first run-out");
+	for (int i = 0; i < 7; i++)
+		mlfq_demote_on_reenq(&t, 250000, 2000000);
+	TEST_OK(t.reenq_cnt == 7 && t.queue == 2,
+		"seven run-outs with ema > T_H do not demote Q2->Q3");
+	TEST_OK(mlfq_demote_on_reenq(&t, 250000, 2000000) &&
+		t.queue == 3 && t.reenq_cnt == 0,
+		"eight run-outs demote Q2->Q3 and reset reenq_cnt");
 }
 
 static void test_mlfq_check_predicates(void)

@@ -129,13 +129,13 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p
 
 	/*
 	 * IPC boost: a wakeup from I/O or a short sleep is treated as
-	 * interactive and placed with a halved vslice at the front of Q1
-	 * semantics, rate-limited per task (the stand-in for the kernel's
-	 * futex/IPC wakeup fast paths). mlfq_ss_boost_allowed() grants the
-	 * boost only once the previous rate-limit window has elapsed, so a
-	 * burst of short sleeps or I/O completions cannot chain boosts.
-	 * wake_cnt stays short-sleep based: an I/O wakeup does not count
-	 * toward the promotion hysteresis.
+	 * interactive and placed in Q1, rate-limited per task (the
+	 * stand-in for the kernel's futex/IPC wakeup fast paths).
+	 * mlfq_ss_boost_allowed() grants the boost only once the previous
+	 * rate-limit window has elapsed, so a burst of short sleeps or
+	 * I/O completions cannot chain boosts. wake_cnt stays short-sleep
+	 * based: an I/O wakeup does not count toward the promotion
+	 * hysteresis.
 	 */
 	if (mlfq_boost_eligible(sleep_ns, mlfq_short_sleep_ns,
 				mlfq_task_io_wait(p)) &&

@@ -472,7 +472,7 @@ static __always_inline s64 mlfq_entity_lag_clamp(const struct queue_ctx *q,
  *   vruntime_new = V_q - lag
  *   if (vruntime_new > V_q) vruntime_new = V_q   # eligibility clamp
  *   vslice = calc_delta_fair(slice_q, weight)
- *   if (FIRST_RUN or short-sleep boost) vslice /= 2
+ *   if (FIRST_RUN) vslice /= 2
  *   deadline = vruntime_new + vslice
  *
  * The eligibility clamp is DELAY_ZERO semantics: a task ahead of the fair
@@ -518,7 +518,8 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
 	}
 
 	vslice = calc_delta_fair_bpf(q->max_slice_ns, (u32)w);
-	if (tctx->flags & (MLFQ_TF_FIRST_RUN | MLFQ_TF_SHORT_SLEEP_BOOST))
+	/* fair.c PLACE_DEADLINE_INITIAL: new tasks start with half a slice. */
+	if (tctx->flags & MLFQ_TF_FIRST_RUN)
 		vslice /= 2;
 	tctx->flags &= ~MLFQ_TF_SHORT_SLEEP_BOOST;
 
@@ -677,9 +678,13 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * slice exhaustions accumulate in reenq_cnt, which gates the band
  * crossings.
  *
- * Hysteresis: Q1->Q2 when ema > T_L and reenq_cnt >= 2,
- * or immediately when ema > T_H; Q2->Q3 when ema > T_H and reenq_cnt >= 2,
- * or immediately when ema > 2*T_H.
+ * Demotion requires a sustained run without sleeping: eight consecutive
+ * exhaustions (about 8 ms at the interactive slice) must accumulate
+ * while the gauge is above the CPU-bound threshold. A task that sleeps
+ * between bursts is re-boosted at its wakeup, which resets reenq_cnt,
+ * so a bursty consumer of CPU such as a video decoder keeps its queue
+ * for the whole burst. An impostor that never sleeps accumulates the
+ * counter and is demoted after the same sustained window.
  *
  * Return: true if the task was demoted.
  */
@@ -688,16 +693,12 @@ static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
 {
 	bool demoted = false;
 
+	(void)t_l;
 	tctx->reenq_cnt++;
 
-	if (tctx->queue == 1 &&
-	    ((tctx->ema > t_l && tctx->reenq_cnt >= 2) || tctx->ema > t_h)) {
-		tctx->queue = 2;
-		demoted = true;
-	} else if (tctx->queue == 2 &&
-		   ((tctx->ema > t_h && tctx->reenq_cnt >= 2) ||
-		    tctx->ema > 2 * t_h)) {
-		tctx->queue = 3;
+	if ((tctx->queue == 1 || tctx->queue == 2) &&
+	    tctx->ema > t_h && tctx->reenq_cnt >= 8) {
+		tctx->queue++;
 		demoted = true;
 	}
 
