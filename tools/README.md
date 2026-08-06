@@ -5,10 +5,13 @@ This directory contains the beta-testing tooling for **scx_mlfq** on CachyOS:
 | File | Purpose |
 |---|---|
 | `install_scx_mlfq.sh` | Build and install (or replace) the beta scheduler binary |
-| `uninstall_scx_mlfq.sh` | Manifest-driven clean removal, safe even after upstream ships `scx_mlfq` in a package |
+| `install_scx_mlfq_loader.sh` | Build and install a patched `scx_loader` so the Kernel Manager GUI can select scx_mlfq |
+| `uninstall_scx_mlfq.sh` | Manifest-driven clean removal of the beta binary and the patched loader, safe even after upstream ships `scx_mlfq` in a package |
+| `scx_loader-mlfq.patch` | The patch applied to the published `scx_loader` crate by `install_scx_mlfq_loader.sh` |
 
-Both scripts are bash, must be run as **root** (`sudo`), and are safe to run
-repeatedly. Run either with `--dry-run` first to preview what it would do.
+All three scripts are bash, must be run as **root** (`sudo`), and are safe to
+run repeatedly. Run any of them with `--dry-run` first to preview what it
+would do.
 
 ## What scx_mlfq is
 
@@ -39,8 +42,8 @@ kernel's sched_ext interface and `scx_mlfq --stats`.
   schedulers. The GUI can manage scx_mlfq only after
   `install_scx_mlfq_loader.sh` has added scx_mlfq to the loader's
   compiled-in scheduler list (see the loader section below).
-- **Root**. Both scripts refuse to run as a non-root user, including with
-  `--dry-run`.
+- **Root**. All three scripts refuse to run as a non-root user, including
+  with `--dry-run`.
 
 ## Installing
 
@@ -148,8 +151,17 @@ list is compiled into the binary (`SupportedSched` enum). scx_mlfq is not
 in the shipped list, so the GUI cannot select it without this step.
 
 ```bash
-sudo bash install_scx_mlfq_loader.sh [--dry-run]
+sudo bash install_scx_mlfq_loader.sh [options]
 ```
+
+Options:
+
+- `--force` - back up and replace a conflicting pre-existing loader drop-in
+  (to `/usr/lib/scx/scx_loader.service.d.mlfq-loader.conf.bak`) instead of
+  refusing.
+- `--dry-run` - validate inputs and print every action without downloading,
+  building, or changing the system.
+- `--help`, `-h` - print help.
 
 What it does, in order:
 
@@ -180,9 +192,9 @@ sudo bash uninstall_scx_mlfq.sh [--force] [--dry-run]
 
 The uninstaller is **manifest-driven and idempotent**:
 
-- If no manifest exists it prints `Nothing to uninstall` and exits 0 without
-  touching any file.
-- The manifest is parsed **strictly**: duplicate keys, unknown keys, and
+- If neither the beta manifest nor the loader manifest exists it prints
+  `Nothing to uninstall` and exits 0 without touching any file.
+- Both manifests are parsed **strictly**: duplicate keys, unknown keys, and
   values containing control characters abort the run without touching
   anything.
 - It stops `scx.service` if it is active (safe: it may be running the beta),
@@ -212,8 +224,10 @@ The uninstaller is **manifest-driven and idempotent**:
   record) and the loader drop-in (only when it byte-matches), reloads
   systemd so the stock loader's `ExecStart` takes effect, and restarts an
   active loader. The loader service itself is never disabled.
-- It never touches `scx_loader.service`, `/etc/default/scx`, or any other
-  file. Every path read from the manifest is confined before use: traversal
+- It never disables or modifies `scx_loader.service` (an active loader may
+  be restarted so the stock binary takes effect) and never touches
+  `/etc/default/scx` or any other file. Every path read from the manifests
+  is confined before use: traversal
   components (`..`, `.`) and control characters are rejected, the path is
   canonicalized with `realpath`, and it must resolve inside its expected
   directory (`/usr/lib/scx/` for backups, the exact drop-in path for the
@@ -261,21 +275,27 @@ sudo bash uninstall_scx_mlfq.sh
 
 The uninstaller restores the package-owned file from its backup (or, if the
 package already re-placed the file, just removes the backup and manifest).
-After that, normal CachyOS tooling owns the binary and the GUI can manage it.
+After that, normal CachyOS tooling owns the binary; the GUI manages
+scx_mlfq directly once CachyOS also adds it to the loader's scheduler list
+(their pattern when packaging a new scheduler), and until then the
+patched-loader installer above keeps working.
 
 **Does scx_mlfq have a web UI or listen on a port?**
 
-No. There is no web UI and no TCP listener (locked design decision), and the
-installer deliberately creates **no** `scx_loader.service` drop-in; the only
-loader integration is the `[scheds.scx_mlfq]` config entry. Scheduler state
-is only visible through the kernel's sched_ext interface
-(e.g. `cat /sys/kernel/sched_ext/root/ops`) and `scx_mlfq --stats`.
+No. There is no web UI and no TCP listener (locked design decision). The
+beta installer creates **no** `scx_loader.service` drop-in; the loader
+integration is the `[scheds.scx_mlfq]` config entry (per-mode flags) plus,
+when `install_scx_mlfq_loader.sh` is used, the `mlfq-loader.conf` service
+override for the patched loader. Scheduler state is only visible through
+the kernel's sched_ext interface (e.g. `cat /sys/kernel/sched_ext/root/ops`)
+and `scx_mlfq --stats`.
 
 **Is it safe to run as root / what if something goes wrong?**
 
-- Only **one** sched_ext scheduler can be attached at a time; both scripts
-  stop the currently attached scheduler gracefully (the kernel then reverts
-  to CFS automatically).
+- Only **one** sched_ext scheduler can be attached at a time. The beta
+  installer and the uninstaller stop the currently attached scheduler
+  gracefully (the kernel then reverts to CFS automatically); the loader
+  installer never starts or stops schedulers.
 - The scripts never edit `/etc/default/scx`, never disable `scx_loader` or
   `scx.service`, and never remove `scx.service` itself.
 - The uninstaller never touches a file without a manifest.
@@ -291,13 +311,15 @@ is only visible through the kernel's sched_ext interface
 - `--dry-run` requires root, performs no clone and no build, and changes
   nothing, it is a safe way to check the installer's decisions (including
   whether `/usr/bin/scx_mlfq` is currently package-owned).
-- The installer uses only owned temporary build directories (under
-  `/tmp/scx_mlfq-build.*`, created with `mktemp`) and removes them on exit.
+- The installers use only owned temporary build directories (under
+  `/tmp/scx_mlfq-build.*` and `/tmp/scx_mlfq-loader-build.*`, created with
+  `mktemp`) and remove them on exit.
 
 ## Safety notes for reviewers
 
-- Both scripts use `set -euo pipefail`, an unconditional EUID/root gate, no
-  `eval`, and no `rm -rf` outside the owned temporary build directory.
+- All three scripts use `set -euo pipefail`, an unconditional EUID/root
+  gate, no `eval`, and no `rm -rf` outside the owned temporary build
+  directories.
   File removals are `rm -f` on manifest-recorded paths that are first
   confined: traversal/control-character rejection, `realpath`
   canonicalization, a directory prefix re-check, and a regular-file
