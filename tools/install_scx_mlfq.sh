@@ -594,9 +594,10 @@ next_steps() {
     printf '       sudo systemctl restart scx.service\n'
     printf '\n'
     printf 'Notes:\n'
-    printf '  - scx_loader/scxctl/scx-manager and the CachyOS Kernel Manager GUI\n'
-    printf '    cannot list or start scx_mlfq yet (hardcoded scheduler list in the\n'
-    printf '    loader). The loader may have been left stopped; it is NOT disabled.'
+    printf '  - The GUI lists schedulers through scx_loader, whose supported list\n'
+    printf '    is compiled into the binary. Run install_scx_mlfq_loader.sh to add\n'
+    printf '    scx_mlfq to it; until then the GUI cannot select scx_mlfq.\n'
+    printf '    The loader may have been left stopped; it is NOT disabled.'
     if [ -n "$LOADER_STOPPED" ]; then
         printf ' (this installer stopped it)'
     fi

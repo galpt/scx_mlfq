@@ -41,6 +41,10 @@ BACKUP_PATH="$LIB_DIR/scx_mlfq.scx_mlfq-beta.bak"
 DROPIN_DIR="/etc/systemd/system/scx.service.d"
 DROPIN="$DROPIN_DIR/scx_mlfq-beta.conf"
 SCX_LOADER_CONFIG="/etc/scx_loader.toml"
+LOADER_BIN="/usr/local/bin/scx_loader"
+LOADER_DROPIN_DIR="/etc/systemd/system/scx_loader.service.d"
+LOADER_DROPIN="$LOADER_DROPIN_DIR/mlfq-loader.conf"
+LOADER_MANIFEST="$LIB_DIR/scx_mlfq-loader.manifest"
 
 FORCE=""
 DRY_RUN=""
@@ -114,6 +118,10 @@ parse_manifest() {
     DROPINS=""
     DROPIN_BACKUP=""
     LOADER_ENTRY=""
+    LOADER_BIN_MF=""
+    LOADER_DROPIN_MF=""
+    LOADER_SHA256=""
+    LOADER_VERSION=""
     INSTALL_TIME=""
     SOURCE=""
     BRANCH=""
@@ -142,7 +150,7 @@ parse_manifest() {
                 ;;
         esac
         case "$key" in
-            manifest_version|name|version|installed_sha256|orig_owner|orig_sha256|backup_path|dropins|dropin_backup|loader_entry|install_time|source|branch) ;;
+            manifest_version|name|version|installed_sha256|orig_owner|orig_sha256|backup_path|dropins|dropin_backup|loader_entry|loader_bin|loader_dropin|loader_sha256|loader_version|install_time|source|branch) ;;
             *)
                 err "manifest contains an unknown key: $(sanitize "$key")"
                 return 1
@@ -166,6 +174,10 @@ parse_manifest() {
             dropins) DROPINS="$value" ;;
             dropin_backup) DROPIN_BACKUP="$value" ;;
             loader_entry) LOADER_ENTRY="$value" ;;
+            loader_bin) LOADER_BIN_MF="$value" ;;
+            loader_dropin) LOADER_DROPIN_MF="$value" ;;
+            loader_sha256) LOADER_SHA256="$value" ;;
+            loader_version) LOADER_VERSION="$value" ;;
             install_time) INSTALL_TIME="$value" ;;
             source) SOURCE="$value" ;;
             branch) BRANCH="$value" ;;
@@ -383,6 +395,123 @@ remove_loader_entry() {
     fi
 }
 
+# our_loader_dropin: the exact bytes the loader installer owns for the
+# scx_loader.service override.
+our_loader_dropin() {
+    printf '[Service]\nExecStart=\nExecStart=%s\n' "$LOADER_BIN"
+}
+
+# parse_loader_manifest: strict key=value parser for the loader manifest.
+# Duplicate keys, unknown keys, and values with control characters are
+# rejected. Populates the LOADER_* globals used by remove_loader_patch().
+parse_loader_manifest() {
+    local line key value seen=""
+
+    LOADER_BIN_MF=""
+    LOADER_DROPIN_MF=""
+    LOADER_SHA256=""
+    LOADER_VERSION=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            *=*) ;;
+            *)
+                err "loader manifest line is missing '=': $(sanitize "$line")"
+                return 1
+                ;;
+        esac
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            *[!A-Za-z0-9_]*)
+                err "loader manifest contains an invalid key: $(sanitize "$key")"
+                return 1
+                ;;
+        esac
+        case "$value" in
+            *[$'\t\n\r\v\f']*)
+                err "loader manifest value for '$key' contains control characters"
+                return 1
+                ;;
+        esac
+        case "$key" in
+            name|version|loader_bin|loader_dropin|loader_sha256|loader_dropin_backup|install_time) ;;
+            *)
+                err "loader manifest contains an unknown key: $(sanitize "$key")"
+                return 1
+                ;;
+        esac
+        case " $seen " in
+            *" $key "*)
+                err "loader manifest contains duplicate key: $key"
+                return 1
+                ;;
+        esac
+        seen="$seen $key"
+        case "$key" in
+            loader_bin) LOADER_BIN_MF="$value" ;;
+            loader_dropin) LOADER_DROPIN_MF="$value" ;;
+            loader_sha256) LOADER_SHA256="$value" ;;
+            loader_version) LOADER_VERSION="$value" ;;
+        esac
+    done < "$LOADER_MANIFEST"
+}
+
+# remove_loader_patch: undo the patched-loader install. The drop-in is
+# removed only when it byte-matches the content the loader installer
+# writes; the binary only when its sha256 matches the manifest record.
+# The stock loader then takes over at the next service start.
+remove_loader_patch() {
+    if [ -z "$LOADER_BIN_MF" ] && [ -z "$LOADER_DROPIN_MF" ]; then
+        info 'no patched loader recorded in the manifest; nothing to remove'
+        LOADER_BIN_STATE="none recorded"
+        LOADER_DROPIN_STATE="none recorded"
+        return 0
+    fi
+
+    if [ -n "$LOADER_BIN_MF" ]; then
+        if [ -f "$LOADER_BIN" ] && [ -n "$LOADER_SHA256" ]            && [ "$(sha256_of "$LOADER_BIN")" = "$LOADER_SHA256" ]; then
+            run rm -f "$LOADER_BIN"
+            ok "removed patched loader $LOADER_BIN"
+            LOADER_BIN_STATE="removed"
+        elif [ -e "$LOADER_BIN" ]; then
+            warn "$LOADER_BIN differs from the recorded patched loader; leaving it"
+            LOADER_BIN_STATE="left (sha mismatch)"
+        else
+            info "$LOADER_BIN is already absent"
+            LOADER_BIN_STATE="absent"
+        fi
+    fi
+
+    if [ -n "$LOADER_DROPIN_MF" ]; then
+        if [ -f "$LOADER_DROPIN" ] && cmp -s "$LOADER_DROPIN" <(our_loader_dropin); then
+            run rm -f "$LOADER_DROPIN"
+            ok "removed loader drop-in $LOADER_DROPIN"
+            LOADER_DROPIN_STATE="removed"
+        elif [ -e "$LOADER_DROPIN" ]; then
+            warn "loader drop-in $LOADER_DROPIN does not byte-match the content the loader installer writes; leaving it"
+            LOADER_DROPIN_STATE="left (content mismatch)"
+        else
+            info "loader drop-in not present: $LOADER_DROPIN"
+            LOADER_DROPIN_STATE="absent"
+        fi
+        # Remove the parent directory only if it is now empty.
+        if [ -d "$LOADER_DROPIN_DIR" ] && [ -z "$(ls -A "$LOADER_DROPIN_DIR" 2>/dev/null || true)" ]; then
+            run rmdir "$LOADER_DROPIN_DIR" || true
+        fi
+    fi
+
+    if [ -n "$LOADER_BIN_STATE" ] && [ -n "$LOADER_DROPIN_STATE" ]        && { [ "$LOADER_BIN_STATE" = "removed" ] || [ "$LOADER_BIN_STATE" = "absent" ]; }        && { [ "$LOADER_DROPIN_STATE" = "removed" ] || [ "$LOADER_DROPIN_STATE" = "absent" ]; }; then
+        if systemctl is-active --quiet scx_loader 2>/dev/null; then
+            # The drop-in that pointed at the patched loader is gone; reload
+            # the unit first so the restart uses the stock ExecStart.
+            run systemctl daemon-reload || true
+            run systemctl restart scx_loader                 || warn 'scx_loader restart failed; the stock loader takes over at the next start'
+        fi
+    fi
+}
+
 remove_manifest() {
     if [ -f "$MANIFEST" ]; then
         run rm -f "$MANIFEST"
@@ -400,6 +529,8 @@ summary() {
     printf '  %-24s %s\n' 'Backup:' "$BACKUP_STATE"
     printf '  %-24s %s\n' 'Drop-in:' "$DROPIN_STATE"
     printf '  %-24s %s\n' 'scx_loader entry:' "$LOADER_ENTRY_STATE"
+    printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
+    printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
     printf '  %-24s %s\n' 'scx.service:' 'left in place (not disabled)'
     if [ -n "$DROPIN_BACKUP" ]; then
         printf '  %-24s %s\n' 'Drop-in backup:' "$DROPIN_BACKUP_STATE"
@@ -418,21 +549,33 @@ main() {
     step 'scx_mlfq beta uninstaller for CachyOS'
     check_root
 
-    if [ ! -f "$MANIFEST" ]; then
-        printf '\nNothing to uninstall: no manifest at %s.\n' "$MANIFEST"
-        printf 'This script only removes files recorded by the %s installer;\n' "$BIN_NAME"
+    if [ ! -f "$MANIFEST" ] && [ ! -f "$LOADER_MANIFEST" ]; then
+        printf '\nNothing to uninstall: no manifest at %s and no loader manifest at %s.\n' \
+            "$MANIFEST" "$LOADER_MANIFEST"
+        printf 'This script only removes files recorded by the %s installers;\n' "$BIN_NAME"
         printf 'no files were touched.\n'
         exit 0
     fi
 
     if [ -n "$DRY_RUN" ]; then
-        warn 'DRY-RUN: reading the manifest and printing actions only; no changes.'
+        warn 'DRY-RUN: reading the manifests and printing actions only; no changes.'
     fi
 
-    if ! parse_manifest; then
-        err 'refusing to touch any file; inspect the manifest manually:'
-        err "  cat $MANIFEST"
-        exit 1
+    if [ -f "$MANIFEST" ]; then
+        if ! parse_manifest; then
+            err 'refusing to touch any file; inspect the manifest manually:'
+            err "  cat $MANIFEST"
+            exit 1
+        fi
+    else
+        info "no beta manifest at $MANIFEST; only the loader manifest will be processed"
+    fi
+    if [ -f "$LOADER_MANIFEST" ]; then
+        if ! parse_loader_manifest; then
+            err 'refusing to touch any file; inspect the loader manifest manually:'
+            err "  cat $LOADER_MANIFEST"
+            exit 1
+        fi
     fi
 
     if [ -n "$MANIFEST_VERSION" ] && [ "$MANIFEST_VERSION" != "1" ]; then
@@ -441,11 +584,11 @@ main() {
     if [ -n "$NAME" ] && [ "$NAME" != "$BIN_NAME" ]; then
         warn "manifest name=$NAME does not match $BIN_NAME; proceeding conservatively"
     fi
-    if [ -n "$VERSION" ] || [ -n "$INSTALL_TIME" ] || [ -n "$SOURCE" ] || [ -n "$BRANCH" ]; then
-        info "manifest record: version=${VERSION:-unknown} install_time=${INSTALL_TIME:-unknown} source=${SOURCE:-unknown} branch=${BRANCH:-unknown}"
+    if [ -n "$VERSION" ] || [ -n "$INSTALL_TIME" ] || [ -n "$SOURCE" ] || [ -n "$BRANCH" ] || [ -n "$LOADER_VERSION" ]; then
+        info "manifest record: version=${VERSION:-unknown} install_time=${INSTALL_TIME:-unknown} source=${SOURCE:-unknown} branch=${BRANCH:-unknown} loader_version=${LOADER_VERSION:-unknown}"
     fi
 
-    if [ -z "$INSTALLED_SHA256" ] || [ -z "$ORIG_OWNER" ]; then
+    if [ -f "$MANIFEST" ] && { [ -z "$INSTALLED_SHA256" ] || [ -z "$ORIG_OWNER" ]; }; then
         err "manifest $MANIFEST is missing required fields (installed_sha256, orig_owner)"
         err 'refusing to touch any file; inspect the manifest manually:'
         err "  cat $MANIFEST"
@@ -537,6 +680,9 @@ main() {
     step 'Removing our scx_loader entry'
     remove_loader_entry
 
+    step 'Removing the patched scx_loader'
+    remove_loader_patch
+
     if [ -n "$DROPIN_BACKUP" ]; then
         step 'Removing our drop-in backup'
         remove_dropin_backup
@@ -547,6 +693,10 @@ main() {
 
     step 'Removing our manifest'
     remove_manifest
+    if [ -f "$LOADER_MANIFEST" ]; then
+        run rm -f "$LOADER_MANIFEST"
+        ok "removed loader manifest $LOADER_MANIFEST"
+    fi
 
     step 'Reloading systemd'
     run systemctl daemon-reload || warn 'systemctl daemon-reload failed'

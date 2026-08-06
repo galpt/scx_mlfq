@@ -1,0 +1,60 @@
+diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/config.rs scx_loader-1.1.2/src/config.rs
+--- scx_loader-1.1.2.orig/src/config.rs	2026-08-06 17:25:20.656318870 +0700
++++ scx_loader-1.1.2/src/config.rs	2026-08-06 17:18:24.963384172 +0700
+@@ -110,6 +110,7 @@
+         SupportedSched::Pandemonium,
+         SupportedSched::Flow,
+         SupportedSched::Forge,
++        SupportedSched::Mlfq,
+     ];
+     let scheds_map = HashMap::from(supported_scheds.map(init_default_config_entry));
+     Config {
+@@ -260,7 +261,8 @@
+         | SupportedSched::Pandemonium
+         | SupportedSched::Flash
+         | SupportedSched::Flow
+-        | SupportedSched::Forge => vec![],
++        | SupportedSched::Forge
++        | SupportedSched::Mlfq => vec![],
+     }
+ }
+ 
+diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/lib.rs scx_loader-1.1.2/src/lib.rs
+--- scx_loader-1.1.2.orig/src/lib.rs	2026-08-06 17:25:20.656359748 +0700
++++ scx_loader-1.1.2/src/lib.rs	2026-08-06 17:19:09.651496039 +0700
+@@ -46,6 +46,8 @@
+     Flow,
+     #[serde(rename = "scx_forge")]
+     Forge,
++    #[serde(rename = "scx_mlfq")]
++    Mlfq,
+ }
+ 
+ impl FromStr for SupportedSched {
+@@ -60,6 +62,7 @@
+             "scx_flash" => Ok(SupportedSched::Flash),
+             "scx_flow" => Ok(SupportedSched::Flow),
+             "scx_forge" => Ok(SupportedSched::Forge),
++            "scx_mlfq" => Ok(SupportedSched::Mlfq),
+             "scx_lavd" => Ok(SupportedSched::Lavd),
+             "scx_pandemonium" => Ok(SupportedSched::Pandemonium),
+             "scx_p2dq" => Ok(SupportedSched::P2DQ),
+@@ -89,6 +92,7 @@
+             SupportedSched::Flow => "scx_flow",
+             SupportedSched::Forge => "scx_forge",
+             SupportedSched::Lavd => "scx_lavd",
++            SupportedSched::Mlfq => "scx_mlfq",
+             SupportedSched::Pandemonium => "scx_pandemonium",
+             SupportedSched::P2DQ => "scx_p2dq",
+             SupportedSched::Tickless => "scx_tickless",
+diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/main.rs scx_loader-1.1.2/src/main.rs
+--- scx_loader-1.1.2.orig/src/main.rs	2026-08-06 17:25:20.656391949 +0700
++++ scx_loader-1.1.2/src/main.rs	2026-08-06 17:18:24.963315872 +0700
+@@ -124,6 +124,7 @@
+             "scx_tickless",
+             "scx_rustland",
+             "scx_rusty",
++            "scx_mlfq",
+         ]
+     }
+ 
