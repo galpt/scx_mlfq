@@ -84,7 +84,6 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 		cpu->running_queue = tctx->queue;
 		cpu->running_pid = p->pid;
 		cpu->running_vruntime = tctx->vruntime;
-		cpu->running_deadline = tctx->deadline;
 		cpu->running_weight = tctx->weight;
 	}
 
@@ -148,7 +147,6 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 			cpu->running_queue = 0;
 			cpu->running_pid = 0;
 			cpu->running_vruntime = 0;
-			cpu->running_deadline = 0;
 			cpu->running_weight = 0;
 		}
 	}

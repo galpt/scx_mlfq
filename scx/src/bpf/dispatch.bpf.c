@@ -12,10 +12,12 @@
  * picks the earliest EEVDF deadline among the queue's own head and the
  * heads of remote CPUs' same-queue DSQs (affinity-prechecked), so an idle
  * CPU drains the most-owed task in the system for that queue, not only
- * its own. The kernel enforces affinity on the move itself:
- * consume_dispatch_q() in ext.c skips heads that cannot run on the
- * consuming CPU, so the BPF pre-check only prefers the earliest eligible
- * head and avoids wasted moves.
+ * its own. A remote task is migrated only when its deadline is at least
+ * one of its virtual slices ahead of the local head, so a near-tie
+ * deadline does not cost the task its cache warmth. The kernel enforces
+ * affinity on the move itself: consume_dispatch_q() in ext.c skips heads
+ * that cannot run on the consuming CPU, so the BPF pre-check only prefers
+ * the earliest eligible head and avoids wasted moves.
  *
  * The three quotas are served by bounded loops: every queue scans a
  * rotating window of at most the init-clamped mlfq_steal_scan candidates,
@@ -73,10 +75,13 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * Each slot peeks the queue's own head and the heads of the candidate
  * CPUs' same-queue DSQs, affinity-checks each (migration-disabled tasks
  * fail this automatically), and moves the earliest-deadline candidate to
- * the local DSQ. The candidates are a rotating window of at most
- * mlfq_steal_scan CPUs starting at the per-CPU offset, so the bounded
- * window is fair across the system; on machines smaller than the scan
- * cap the window covers every CPU.
+ * the local DSQ. A remote candidate must beat the local head by at least
+ * one of its own virtual slices, otherwise the local head is served and
+ * the task keeps its cache warmth; with no local head the earliest
+ * eligible remote head is taken freely. The candidates are a rotating
+ * window of at most mlfq_steal_scan CPUs starting at the per-CPU offset,
+ * so the bounded window is fair across the system; on machines smaller
+ * than the scan cap the window covers every CPU.
  *
  * Return: The number of tasks moved.
  */
@@ -115,6 +120,22 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 				continue;
 			t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
 			if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+				continue;
+			/*
+			 * A remote candidate is taken only when it beats
+			 * the local head by at least one of its own
+			 * virtual slices; migrating a task for a smaller
+			 * deadline difference would trade its cache
+			 * warmth for nothing. Without a local head the
+			 * earliest eligible remote head is taken freely.
+			 */
+			if (best_cpu == cpu && best &&
+			    !mlfq_time_before(
+				    t->scx.dsq_vtime +
+					    calc_delta_fair_bpf(
+						    mlfq_queue_slice(qid),
+						    (u32)t->scx.weight),
+				    best->scx.dsq_vtime))
 				continue;
 			/*
 			 * Prefer the earlier deadline, the same

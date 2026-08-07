@@ -212,7 +212,6 @@ struct mlfq_cpu_state {
 	s32 running_queue;		/* queue of the running task, 0 none */
 	u32 running_pid;
 	u64 running_vruntime;		/* local-curr fold input */
-	u64 running_deadline;		/* EEVDF deadline of the running task */
 	u32 running_weight;
 	u32 steal_scan_off;		/* rotating remote-scan start for Q2/Q3 */
 };

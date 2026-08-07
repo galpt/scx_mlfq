@@ -12,14 +12,13 @@
  *
  * The wakeup preemption decision runs before the regular placement: a
  * wakeup outranks the task running on the CPU it was last running on when
- * it belongs to a higher queue, or to the same queue with an EEVDF
- * deadline at least half a virtual slice ahead of the running task's
- * deadline. The cross-queue case is served without a placement (the
- * local-DSQ insert is FIFO, no deadline is needed), so it stays lock-free;
- * the same-queue case computes the placement with accounting first and
- * undoes the accounting when the wakeup does preempt. A wakeup whose
- * affinity no longer includes the CPU it was last running on falls through
- * to the regular path.
+ * it belongs to a higher queue, and is dispatched to that CPU's local DSQ
+ * with SCX_ENQ_PREEMPT. The local-DSQ insert is FIFO, so no deadline is
+ * needed and no queue lock is taken. Same-queue wakeups never preempt:
+ * they join the queue DSQ and are served by virtual-time order at
+ * dispatch, so a running task is not displaced mid-slice by a task of its
+ * own priority. A wakeup whose affinity no longer includes the CPU it was
+ * last running on falls through to the regular path.
  *
  * The demotion path keys on the flags == 0 run-out re-enqueue. flags == 0
  * arrives from put_prev_task_scx() for a runnable task whose slice grant
@@ -61,7 +60,6 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
 	struct mlfq_cpu_state *cpu;
-	struct queue_ctx *q;
 	u64 now, deadline, slice;
 	u32 weight, qid;
 	u8 old_queue;
@@ -325,114 +323,34 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Wakeup preemption: a wakeup outranks the task running on the CPU
-	 * it was last running on when it belongs to a higher queue, or to
-	 * the same queue with an EEVDF deadline far enough ahead. This is
+	 * it was last running on when it belongs to a higher queue. This is
 	 * the check_preempt_wakeup semantics of the fair scheduler, where
-	 * the higher-priority arrival preempts. The wakee is dispatched to
+	 * the higher-priority arrival preempts: the wakee is dispatched to
 	 * that CPU's local DSQ with SCX_ENQ_PREEMPT, which the kernel
 	 * resolves into a preemption on the next scheduling event. The
-	 * decision is confined to wakeups of migratable tasks
-	 * (migration-disabled tasks are routed above); a wakeup without a
-	 * previous CPU fails the cpu_state lookup and falls through.
-	 *
-	 * The cross-queue case is served without a placement: the local-DSQ
-	 * insert is FIFO, so no deadline is needed and no queue lock is
-	 * taken. The same-queue case computes the placement with accounting
-	 * in one lock region and undoes the accounting when the wakeup does
-	 * preempt, so the non-preempting same-queue wakeup keeps the
-	 * computed deadline for the regular vtime insert.
-	 *
-	 * A concurrent affinity change between CPU selection and enqueue
-	 * must not target a CPU outside the allowed set; the local-DSQ
-	 * insert is a same-rq operation, so the failure is a placement
-	 * violation rather than a fatal error, and the queue placement is
-	 * the correct fallback.
+	 * local-DSQ insert is FIFO, so no placement and no queue lock are
+	 * needed. Same-queue wakeups do not preempt: they join the queue
+	 * DSQ and are served by virtual-time order at dispatch, so a
+	 * running task is never displaced mid-slice by a task of its own
+	 * priority. A concurrent affinity change between CPU selection and
+	 * enqueue must not target a CPU outside the allowed set; the
+	 * local-DSQ insert is a same-rq operation, so the failure is a
+	 * placement violation rather than a fatal error, and the queue
+	 * placement is the correct fallback.
 	 */
 	if (wakeup && !migration_disabled) {
 		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
 
 		if (prev_state && prev_state->running_pid &&
 		    prev_state->running_pid != p->pid &&
-		    prev_state->running_queue > 0) {
-			if ((s32)qid < prev_state->running_queue) {
-				/* higher queue than the running task */
-				if (bpf_cpumask_test_cpu((u32)prev_cpu,
-							 p->cpus_ptr)) {
-					scx_bpf_dsq_insert(p,
-						SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-						slice,
-						enq_flags | SCX_ENQ_PREEMPT);
-					__sync_fetch_and_add(
-						&mlfq_stats.preemption_kicks, 1);
-					tctx->wake_cpu_state = 0;
-					goto done;
-				}
-				/* affinity changed: fall through to the regular path */
-			} else if ((s32)qid == prev_state->running_queue &&
-				   prev_state->running_deadline) {
-				/*
-				 * Same queue with a recorded deadline: the
-				 * placement runs with accounting so the
-				 * non-preempting case needs no second lock
-				 * region.
-				 */
-				deadline = mlfq_place_task(qid, tctx, inflate,
-							   cpu, p->pid, true);
-				if (!deadline) {
-					/*
-					 * Unreachable for valid inputs: the
-					 * queue maps are static and
-					 * in-range. The error call turns a
-					 * future regression into a
-					 * scheduler exit into bypass
-					 * instead of a silently stranded
-					 * task.
-					 */
-					__sync_fetch_and_add(
-						&mlfq_stats.enq_no_deadline, 1);
-					scx_bpf_error("pid %d same-queue placement failed",
-						      p->pid);
-					return;
-				}
-				/*
-				 * Granularity margin: a same-queue preemption
-				 * fires only when the wakee would otherwise
-				 * wait at least half a slice past the running
-				 * task's deadline, which prevents preemption
-				 * thrash between equal-priority tasks; the
-				 * cross-queue case stays unguarded.
-				 */
-				if (mlfq_time_before(
-					    deadline +
-						    calc_delta_fair_bpf(
-							    mlfq_queue_slice(qid) >> 1,
-							    tctx->weight),
-					    prev_state->running_deadline) &&
-				    bpf_cpumask_test_cpu((u32)prev_cpu,
-							 p->cpus_ptr)) {
-					/*
-					 * The task is dispatched to the local
-					 * DSQ, which never carries aggregate
-					 * membership; undo the accounting just
-					 * taken so the aggregate keeps
-					 * mirroring DSQ membership.
-					 */
-					q = mlfq_lookup_queue(tctx->queue);
-					if (q)
-						mlfq_queue_del_task(tctx->queue,
-								    q, tctx);
-					scx_bpf_dsq_insert(p,
-						SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-						slice,
-						enq_flags | SCX_ENQ_PREEMPT);
-					__sync_fetch_and_add(
-						&mlfq_stats.preemption_kicks, 1);
-					tctx->wake_cpu_state = 0;
-					goto done;
-				}
-				/* not preempting: use the computed placement */
-				goto regular_insert;
-			}
+		    prev_state->running_queue > 0 &&
+		    (s32)qid < prev_state->running_queue &&
+		    bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+					   slice, enq_flags | SCX_ENQ_PREEMPT);
+			__sync_fetch_and_add(&mlfq_stats.preemption_kicks, 1);
+			tctx->wake_cpu_state = 0;
+			goto done;
 		}
 	}
 
@@ -451,7 +369,6 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-regular_insert:
 	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
 	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
 				 slice, deadline, enq_flags);
@@ -459,14 +376,6 @@ regular_insert:
 
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;
-
-	/*
-	 * A run-out re-placement ran here, so the CPU's recorded deadline
-	 * is stale until the next ops.running(); refreshing it keeps the
-	 * same-queue preemption comparison on the new placement.
-	 */
-	if (runout && cpu)
-		cpu->running_deadline = tctx->deadline;
 
 	/*
 	 * A placement into another CPU's queue needs that CPU to run one
