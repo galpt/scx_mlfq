@@ -59,11 +59,10 @@ static __always_inline void mlfq_stat_placement(u8 qid)
 void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
-	struct mlfq_cpu_state *cpu;
 	u64 now, deadline, slice;
 	u32 weight, qid;
 	u8 old_queue;
-	bool wakeup, runout, inflate, local_fast_path, migration_disabled;
+	bool wakeup, runout, local_fast_path, migration_disabled;
 	bool sched_idle;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 	s32 target_cpu;
@@ -161,13 +160,6 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 
 	qid = tctx->queue;
 	slice = mlfq_queue_slice(qid);
-	/*
-	 * The enqueue runs on the rq the task is being enqueued to, so its
-	 * cpu_state is the local-curr fold input (fair.c folds the
-	 * enqueueing cfs_rq's curr; see mlfq_queue_fold_local()).
-	 */
-	cpu = mlfq_lookup_cpu_state(bpf_get_smp_processor_id());
-	inflate = wakeup || runout;
 
 #if MLFQ_CHECK
 	if (!mlfq_check_queue(tctx->queue) || !mlfq_check_weight(tctx->weight))
@@ -207,8 +199,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * which keeps balance_one() from skipping
 			 * ops.dispatch() for the tasks queued behind it.
 			 */
-			deadline = mlfq_place_task(qid, tctx, inflate, cpu,
-						   p->pid, false);
+			deadline = mlfq_place_task(qid, tctx, p->pid);
 			if (!deadline) {
 				/*
 				 * Unreachable for valid inputs: the queue
@@ -217,6 +208,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 				 * scheduler exit into bypass instead of a
 				 * silently stranded task.
 				 */
+				__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 				scx_bpf_error("pid %d pinned-idle placement failed",
 					      p->pid);
 				return;
@@ -236,13 +228,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 * boundary, so the task is served without ever parking in
 		 * the local DSQ, which would shadow every other runnable
 		 * task on the CPU until the stall watchdog fires.
-		 *
-		 * The task is added to the queue aggregate because it now
-		 * participates in the queue DSQ, and the aggregate must
-		 * mirror DSQ membership for the virtual-time average to
-		 * stay exact.
 		 */
-		deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
+		deadline = mlfq_place_task(qid, tctx, p->pid);
 		if (!deadline) {
 			/*
 			 * Unreachable for valid inputs: the queue maps are
@@ -250,6 +237,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * future regression into a scheduler exit into
 			 * bypass instead of a silently stranded task.
 			 */
+			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 			scx_bpf_error("pid %d pinned-busy placement failed",
 				      p->pid);
 			return;
@@ -283,8 +271,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_VALID) &&
 			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_IDLE);
 	if (local_fast_path) {
-		deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid,
-					   false);
+		deadline = mlfq_place_task(qid, tctx, p->pid);
 		if (!deadline) {
 			/*
 			 * Unreachable for valid inputs: the queue maps are
@@ -292,6 +279,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * future regression into a scheduler exit into
 			 * bypass instead of a silently stranded task.
 			 */
+			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 			scx_bpf_error("pid %d fast-path placement failed",
 				      p->pid);
 			return;
@@ -355,7 +343,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/* Regular path: into the owning CPU's queue vtime DSQ. */
-	deadline = mlfq_place_task(qid, tctx, inflate, cpu, p->pid, true);
+	deadline = mlfq_place_task(qid, tctx, p->pid);
 	if (!deadline) {
 		/*
 		 * Unreachable for valid inputs: the queue maps are

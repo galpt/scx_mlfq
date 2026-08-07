@@ -9,9 +9,9 @@
  * This file defines the BPF maps, volatiles, and ops dispatch table.
  * The scheduling logic is organized into separate modules included below,
  * in dependency order:
- *   vtime.bpf.c      - EEVDF virtual-time substrate (aggregates, placement)
+ *   vtime.bpf.c      - EEVDF virtual-time substrate (frontier clock, placement)
  *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
- *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/dequeue/cpu_release
+ *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/cpu_release
  *   select_cpu.bpf.c - CPU selection
  *   enqueue.bpf.c    - enqueue routing, aging, wakeup preemption
  *   dispatch.bpf.c   - queue service with quotas, cross-CPU stealing, keep path
@@ -38,9 +38,7 @@ struct {
 } task_ctx_stor SEC(".maps");
 
 /*
- * Per-queue aggregate state, keyed by queue id 1..3 (slot 0 unused).
- * The per-queue spinlock guarding the scalars lives in queue_locks so
- * intf.h stays native/bindgen-safe.
+ * Per-queue frontier state, keyed by queue id 1..3 (slot 0 unused).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -48,17 +46,6 @@ struct {
 	__type(key, u32);
 	__type(value, struct queue_ctx);
 } queue_ctx_stor SEC(".maps");
-
-struct mlfq_queue_lock {
-	struct bpf_spin_lock lock;
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MLFQ_NR_QUEUES + 1);
-	__type(key, u32);
-	__type(value, struct mlfq_queue_lock);
-} queue_locks SEC(".maps");
 
 /*
  * Per-CPU state, keyed by cpu id. Bounds are validated against
@@ -251,7 +238,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 		return -EINVAL;
 	}
 
-	/* Initialize the per-queue aggregates. */
+	/* Initialize the per-queue request slices. */
 	for (key = 1; key <= MLFQ_NR_QUEUES; key++) {
 		q = mlfq_lookup_queue(key);
 		if (!q) {
@@ -273,7 +260,6 @@ SCX_OPS_DEFINE(mlfq_ops,
 	       .select_cpu		= (void *)mlfq_select_cpu,
 	       .enqueue			= (void *)mlfq_enqueue,
 	       .dispatch		= (void *)mlfq_dispatch,
-	       .dequeue			= (void *)mlfq_dequeue,
 	       .cpu_release		= (void *)mlfq_cpu_release,
 	       .running			= (void *)mlfq_running,
 	       .stopping		= (void *)mlfq_stopping,

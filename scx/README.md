@@ -20,7 +20,7 @@ The scheduler is deliberately knob-free. Every scheduling constant is a compile-
 
 ## Limitations
 
-- The EEVDF substrate is approximated where BPF cannot express the kernel's exact machinery. Eligibility is enforced at placement with DELAY_ZERO semantics instead of an augmented-tree walk, only the local CPU's running task is folded into the weighted average, and the aggregate math is s64-only. Each approximation is documented in the code.
+- The EEVDF substrate is approximated where BPF cannot express the kernel's exact machinery. Eligibility is enforced at placement with DELAY_ZERO semantics instead of an augmented-tree walk, and the weighted-average virtual time is replaced by a per-queue frontier clock: placement clamps each task's lag to within one lag bound of the frontier, which preserves the bounded-lag safety property without a shared, lock-protected aggregate. Each approximation is documented in the code.
 - The queues are per-CPU user dispatch queues. A CPU serves the earliest-eligible task across its own queues and the remote CPUs' same-queue queues, migrating a remote task only when it is at least one of its virtual slices ahead of the local head, so NUMA locality comes from wakeup placement while idle CPUs pull clearly-owed tasks from wherever they sit.
 - sched_ext cannot schedule RT and DL tasks: the kernel resolves them to the rt and dl classes before sched_ext, so this scheduler handles SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks only.
 

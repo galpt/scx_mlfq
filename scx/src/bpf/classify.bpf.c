@@ -137,8 +137,8 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * hysteresis.
 	 *
 	 * SCHED_IDLE tasks are forced to Q3 by mlfq_apply_sched_idle, so
-	 * a boost would burn the rate-limit budget and inflate the counter
-	 * to no effect; it is gated on the task policy.
+	 * a boost would burn the rate-limit budget and push the counter
+	 * up to no effect; it is gated on the task policy.
 	 */
 	if (p->policy != MLFQ_SCHED_IDLE &&
 	    mlfq_boost_eligible(sleep_ns, mlfq_short_sleep_ns,
