@@ -35,10 +35,15 @@
 #
 # Usage: sudo bash install_scx_mlfq.sh [options]
 #
+# The scheduler sources come from the standalone repository
+# (https://github.com/galpt/scx_mlfq.git, branch main); the workspace
+# repository provides the sched-ext build environment and the scheduler
+# crate is copied into its scheds/experimental/scx_mlfq/ directory.
+#
 # Options:
-#   --repo URL         Git repository to clone and build
+#   --repo URL         Git repository to use as the build workspace
 #                      (default: https://github.com/galpt/scx.git)
-#   --branch NAME      Branch to clone and build
+#   --branch NAME      Branch of the build workspace
 #                      (default: scx_mlfq)
 #   --source-dir DIR   Build from a local scx workspace instead of cloning.
 #                      DIR must contain Cargo.toml with
@@ -67,9 +72,13 @@ SCX_STATE_FILE="/sys/kernel/sched_ext/state"
 SCX_OPS_FILE="/sys/kernel/sched_ext/root/ops"
 SCX_LOADER_CONFIG="/etc/scx_loader.toml"
 
+DEFAULT_STANDALONE_REPO="https://github.com/galpt/scx_mlfq.git"
+DEFAULT_STANDALONE_BRANCH="main"
 DEFAULT_REPO="https://github.com/galpt/scx.git"
 DEFAULT_BRANCH="scx_mlfq"
 
+STANDALONE_REPO="$DEFAULT_STANDALONE_REPO"
+STANDALONE_BRANCH="$DEFAULT_STANDALONE_BRANCH"
 REPO="$DEFAULT_REPO"
 BRANCH="$DEFAULT_BRANCH"
 SOURCE_DIR=""
@@ -177,9 +186,9 @@ scx_mlfq beta installer for CachyOS
 Usage: sudo bash install_scx_mlfq.sh [options]
 
 Options:
-  --repo URL         Git repository to clone and build
+  --repo URL         Git repository to use as the build workspace
                      (default: https://github.com/galpt/scx.git)
-  --branch NAME      Branch to clone and build
+  --branch NAME      Branch of the build workspace
                      (default: scx_mlfq)
   --source-dir DIR   Build from a local scx workspace instead of cloning.
                      DIR must contain Cargo.toml with
@@ -193,6 +202,12 @@ Options:
   --dry-run          Validate inputs and print every action without
                      changing the system. Does NOT clone or build.
   --help, -h         Print this help text and exit.
+
+The scheduler sources are always taken from the standalone repository
+(https://github.com/galpt/scx_mlfq.git, branch main); the workspace
+repository only provides the sched-ext build environment. The scheduler
+crate is copied into scheds/experimental/scx_mlfq/ of the workspace
+before building.
 EOF
 }
 
@@ -323,18 +338,39 @@ build_source() {
             exit 1
         fi
         if [ -n "$DRY_RUN" ]; then
+            dry "git clone --branch $STANDALONE_BRANCH --depth 1 -- $STANDALONE_REPO (into a temporary build dir)"
             dry "git clone --branch $BRANCH --depth 1 -- $REPO (into a temporary build dir)"
+            dry "rsync -a --delete --exclude target --exclude veristat <standalone>/scx/ <workspace>/scheds/experimental/scx_mlfq/"
             dry "cargo build --release -p scx_mlfq"
             return 0
         fi
         BUILD_DIR=$(mktemp -d /tmp/scx_mlfq-build.XXXXXX)
+        info "cloning $STANDALONE_REPO (branch $STANDALONE_BRANCH) into $BUILD_DIR/mlfq"
+        if ! git clone --branch "$STANDALONE_BRANCH" --depth 1 -- "$STANDALONE_REPO" \
+                "$BUILD_DIR/mlfq" 2>/dev/null; then
+            err "git clone failed for $(sanitize "$STANDALONE_REPO") (branch $STANDALONE_BRANCH)"
+            err 'check the standalone repository URL and network access'
+            exit 1
+        fi
         info "cloning $REPO (branch $BRANCH) into $BUILD_DIR/src"
-        if ! git clone --branch "$BRANCH" --depth 1 -- "$REPO" "$BUILD_DIR/src"; then
+        if ! git clone --branch "$BRANCH" --depth 1 -- "$REPO" "$BUILD_DIR/src" 2>/dev/null; then
             err "git clone failed for $(sanitize "$REPO") (branch $BRANCH)"
             err 'check the --repo/--branch values and network access'
             exit 1
         fi
         SRC_DIR="$BUILD_DIR/src"
+        CRATE_DIR="$SRC_DIR/scheds/experimental/scx_mlfq"
+        if [ ! -d "$CRATE_DIR" ]; then
+            err "the workspace $REPO (branch $BRANCH) has no scheds/experimental/scx_mlfq"
+            err 'the workspace must list the scheduler as a member of its Cargo.toml'
+            exit 1
+        fi
+        info "copying the scheduler sources from the standalone repository into the workspace"
+        if ! rsync -a --delete --exclude target --exclude veristat \
+                "$BUILD_DIR/mlfq/scx/" "$CRATE_DIR/"; then
+            err "rsync of the scheduler sources failed"
+            exit 1
+        fi
     fi
 
     info "building package scx_mlfq (release profile)"

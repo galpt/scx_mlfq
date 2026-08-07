@@ -66,12 +66,13 @@ sudo bash tools/install_scx_mlfq.sh --beta-only # scheduler binary only
 sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of everything
 ```
 
-The install script builds the scheduler from a git branch (default `galpt/scx`
-branch `scx_mlfq`, or `--source-dir` for a local checkout), installs
-`/usr/bin/scx_mlfq`, and records everything in a manifest under
-`/usr/lib/scx/` so the uninstall script restores the previous state,
-including the case where a future upstream release ships scx_mlfq in the
-distro package.
+The install script builds the scheduler from this repository: it clones
+the standalone repo, copies the `scx/` sources into a sched-ext workspace
+(cloned from `galpt/scx`, branch `scx_mlfq`, or `--source-dir` for a local
+workspace), installs `/usr/bin/scx_mlfq`, and records everything in a
+manifest under `/usr/lib/scx/` so the uninstall script restores the
+previous state, including the case where a future upstream release ships
+scx_mlfq in the distro package.
 
 ## License
 
