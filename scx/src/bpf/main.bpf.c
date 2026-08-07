@@ -9,7 +9,7 @@
  * This file defines the BPF maps, volatiles, and ops dispatch table.
  * The scheduling logic is organized into separate modules included below,
  * in dependency order:
- *   vtime.bpf.c      - EEVDF virtual-time substrate (frontier clock, placement)
+ *   vtime.bpf.c      - EEVDF virtual-time substrate (virtual clock, placement)
  *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
  *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/cpu_release
  *   select_cpu.bpf.c - CPU selection
@@ -38,7 +38,7 @@ struct {
 } task_ctx_stor SEC(".maps");
 
 /*
- * Per-queue frontier state, keyed by queue id 1..3 (slot 0 unused).
+ * Per-queue virtual-clock state, keyed by queue id 1..3 (slot 0 unused).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -49,11 +49,11 @@ struct {
 
 /*
  * Per-CPU state, keyed by cpu id. Bounds are validated against
- * nr_cpu_ids (<= 1024, checked in init()).
+ * nr_cpu_ids (<= MLFQ_MAX_CPUS, checked in init()).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1024);
+	__uint(max_entries, MLFQ_MAX_CPUS);
 	__type(key, u32);
 	__type(value, struct mlfq_cpu_state);
 } cpu_state_stor SEC(".maps");
@@ -170,9 +170,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	s32 ret;
 
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
-	if (nr_cpu_ids > 1024) {
-		scx_bpf_error("nr_cpu_ids (%llu) exceeds max supported (1024)",
-			      nr_cpu_ids);
+	if (nr_cpu_ids > MLFQ_MAX_CPUS) {
+		scx_bpf_error("nr_cpu_ids (%llu) exceeds max supported (%llu)",
+			      nr_cpu_ids, (u64)MLFQ_MAX_CPUS);
 		return -E2BIG;
 	}
 

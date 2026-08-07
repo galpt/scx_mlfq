@@ -163,13 +163,12 @@ enum mlfq_consts {
 /* task_ctx flags */
 enum mlfq_task_flags {
 	MLFQ_TF_FIRST_RUN		= 1U << 0,	/* first placement */
-	MLFQ_TF_AGING_BOOSTED		= 1U << 1,	/* last stay aged to Q1 */
 };
 
 /*
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the owning queue's virtual-time clock and is
- * re-anchored to the queue's frontier at every placement. The struct is
+ * re-anchored to the queue's clock at every placement. The struct is
  * 80 bytes.
  */
 struct task_ctx {
@@ -195,18 +194,18 @@ struct task_ctx {
 #define MLFQ_WAKE_CPU_VALID	0x02U
 
 /*
- * Per-queue virtual-time frontier. clock is the service point the queue
+ * Per-queue virtual clock. clock is the service point the queue
  * has reached: it advances monotonically as the queue's tasks run, and
  * placement anchors a task's lag to it. No weighted-average aggregate is
  * maintained because computing it needs consistent reads of two shared
  * sums, which in BPF would require mutual exclusion; the bounded-lag
- * theorem is instead enforced by clamping the task lag to the frontier at
+ * theorem is instead enforced by clamping the task lag to the clock at
  * placement, which is exact enough for the safety properties and keeps
  * the placement lock-free.
  */
 struct queue_ctx {
 	/*
-	 * Virtual-time frontier of the queue. Read without a lock by
+	 * Virtual clock of the queue. Read without a lock by
 	 * every placement; the aligned 64-bit load is atomic on the
 	 * supported targets, and a stale read only lowers the clock,
 	 * which the placement clamp absorbs.
@@ -384,7 +383,7 @@ static __always_inline u64 calc_delta_fair_bpf(u64 delta, u32 weight)
  * @weight: Task weight.
  *
  * limit = calc_delta_fair(max_slice + TICK, weight): a task is placed at
- * most one request plus one tick behind the queue's frontier clock, the
+ * most one request plus one tick behind the queue's virtual clock, the
  * bounded-lag horizon of entity_lag() in kernel/sched/fair.c.
  *
  * Return: The lag bound in virtual-time nsecs.
@@ -395,11 +394,11 @@ static __always_inline u64 mlfq_lag_limit(const struct queue_ctx *q, u32 weight)
 }
 
 /**
- * mlfq_queue_advance_clock - Advance a queue's frontier clock.
+ * mlfq_queue_advance_clock - Advance a queue's virtual clock.
  * @q: The queue.
  * @vruntime: The virtual runtime just charged for the queue.
  *
- * The frontier follows the service given to the queue: it is advanced to
+ * The clock follows the service given to the queue: it is advanced to
  * @vruntime whenever @vruntime is ahead of it, as a monotone max update.
  * The clock never moves backward: the compare-and-swap stores only when
  * the clock still holds the value the advance read, and the winner of a
@@ -425,7 +424,7 @@ static __always_inline void mlfq_queue_advance_clock(struct queue_ctx *q,
  * @q: The queue being placed into.
  * @tctx: The task being placed.
  *
- * EEVDF placement against the queue's frontier clock:
+ * EEVDF placement against the queue's virtual clock:
  *
  *   limit        = calc_delta_fair(max_slice + TICK, weight)
  *   lag          = clamp(clock - vruntime, 0, limit)
@@ -435,9 +434,9 @@ static __always_inline void mlfq_queue_advance_clock(struct queue_ctx *q,
  *   deadline     = vruntime_new + vslice
  *
  * A task that has fallen behind the service point is re-anchored within
- * one lag limit of the frontier, the bounded-lag property of fair.c
- * entity_lag(); a task that is ahead of the frontier is placed at the
- * frontier itself, the fair.c DELAY_ZERO semantics that do not carry
+ * one lag limit of the clock, the bounded-lag property of fair.c
+ * entity_lag(); a task that is ahead of the clock is placed at the
+ * clock itself, the fair.c DELAY_ZERO semantics that do not carry
  * leading credit. The stored lag is therefore bounded in [0, limit], and
  * every queued task is eligible by construction, so min-deadline
  * selection over the queue DSQs is EEVDF selection over the queued set.
@@ -456,8 +455,8 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
 
 	/*
 	 * The lag is measured in the wrapping order of the virtual-time
-	 * clock: a task ahead of the frontier sits at it (fair.c
-	 * DELAY_ZERO), a task behind is clamped to the frontier minus
+	 * clock: a task ahead of the clock sits at it (fair.c
+	 * DELAY_ZERO), a task behind is clamped to the clock minus
 	 * the bound. The wrapping-aware comparison keeps the u64 epoch
 	 * boundary indistinguishable from any other point.
 	 */

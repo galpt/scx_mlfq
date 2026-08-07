@@ -47,7 +47,7 @@ use scx_utils::uei_exited;
 use scx_utils::uei_report;
 use scx_utils::UserExitInfo;
 
-use config::ConfigBuilder;
+use config::Config;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mlfq";
@@ -59,7 +59,7 @@ fn full_version() -> String {
 #[derive(Debug, Parser)]
 #[command(name = SCHEDULER_NAME, version, disable_version_flag = true)]
 struct Opts {
-    /// Serve scheduler statistics over the unix socket at the given interval.
+    /// Enable periodic statistics monitoring at the given interval.
     #[clap(long)]
     stats: Option<f64>,
 
@@ -67,7 +67,7 @@ struct Opts {
     #[clap(long)]
     monitor: Option<f64>,
 
-    /// Enable BPF debugging via /sys/kernel/tracing/trace_pipe.
+    /// Enable verbose libbpf/BPF debug logging.
     #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
     debug: bool,
 
@@ -115,7 +115,8 @@ impl<'a> Scheduler<'a> {
 
         // Write the validated constants into rodata before load; the rodata
         // section becomes read-only once the object is loaded.
-        let config = ConfigBuilder::default().build()?;
+        let config = Config::default();
+        config.validate()?;
         config.apply(&mut skel)?;
         info!("Config: {}", config.describe());
 
@@ -220,7 +221,7 @@ impl<'a> Scheduler<'a> {
         }
 
         let m = self.get_metrics();
-        log::error!(
+        log::info!(
             "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
@@ -231,6 +232,12 @@ impl<'a> Scheduler<'a> {
         );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
+    }
+}
+
+impl Drop for Scheduler<'_> {
+    fn drop(&mut self) {
+        info!("Unregister {SCHEDULER_NAME} scheduler");
     }
 }
 
@@ -249,8 +256,8 @@ fn main() -> Result<()> {
 
     let monitor_only = opts.monitor.is_some();
 
-    // Print the version before any other work, so the install script's
-    // smoke test (and `scx_mlfq -V`) works without attaching anything.
+    // Print the version before any other work, so `scx_mlfq -V` works
+    // without attaching anything.
     if opts.version {
         println!("{} {}", SCHEDULER_NAME, full_version());
         return Ok(());

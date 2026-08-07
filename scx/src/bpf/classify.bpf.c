@@ -111,8 +111,6 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 {
 	u64 sleep_ns = 0, base_q;
 
-	tctx->flags &= ~MLFQ_TF_AGING_BOOSTED;
-
 	if (tctx->last_sleep_at && mlfq_time_before(tctx->last_sleep_at, now)) {
 		sleep_ns = now - tctx->last_sleep_at;
 		tctx->ema = mlfq_ema_decay(tctx->ema, sleep_ns,
@@ -183,7 +181,6 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 						 struct task_ctx *tctx)
 {
-	tctx->flags &= ~MLFQ_TF_AGING_BOOSTED;
 	tctx->wake_cnt = 0;
 
 	if (mlfq_demotion_blocked(p))

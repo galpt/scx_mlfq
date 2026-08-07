@@ -14,7 +14,7 @@
  * wakeup outranks the task running on the CPU it was last running on when
  * it belongs to a higher queue, and is dispatched to that CPU's local DSQ
  * with SCX_ENQ_PREEMPT. The local-DSQ insert is FIFO, so no deadline is
- * needed and no queue lock is taken. Same-queue wakeups never preempt:
+ * needed and no shared state is touched. Same-queue wakeups never preempt:
  * they join the queue DSQ and are served by virtual-time order at
  * dispatch, so a running task is not displaced mid-slice by a task of its
  * own priority. A wakeup whose affinity no longer includes the CPU it was
@@ -30,6 +30,12 @@
  * put_prev_task_scx() and scx_bpf_reenqueue_local()). Preemptions by a
  * higher sched class keep the task at the local-DSQ head without calling
  * ops.enqueue() at all.
+ *
+ * Every placement calls mlfq_place_task(), which can only fail when the
+ * queue map lookup fails. The queue maps are static and in-range, so a
+ * failed placement is unreachable for valid inputs; the error call on
+ * each failure path turns a future regression into a scheduler exit into
+ * bypass instead of a silently stranded task.
  */
 
 static __always_inline bool mlfq_task_is_migration_disabled(const struct task_struct *p)
@@ -54,6 +60,19 @@ static __always_inline void mlfq_stat_placement(u8 qid)
 		__sync_fetch_and_add(&mlfq_stats.q2_placements, 1);
 	else
 		__sync_fetch_and_add(&mlfq_stats.q3_placements, 1);
+}
+
+/*
+ * A placement into another CPU's queue needs that CPU to run one more
+ * scheduling cycle so a queued task is not stranded on a nohz-idle CPU;
+ * the idle kick is a cheap flag that is consumed when the CPU next goes
+ * idle. The enqueueing CPU needs no kick: its own dispatch drains the
+ * queue in the same scheduling cycle.
+ */
+static __always_inline void mlfq_idle_kick(u64 cpu)
+{
+	if (cpu != bpf_get_smp_processor_id())
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
@@ -149,12 +168,10 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	 * wall-clock time spent asleep never counts toward aging.
 	 */
 	if (tctx->queue >= 2 && !sched_idle &&
-	    !(tctx->flags & MLFQ_TF_AGING_BOOSTED) &&
 	    tctx->queued_at &&
 	    !mlfq_time_before(now, tctx->queued_at + mlfq_aging_period_ns)) {
 		tctx->queue = 1;
 		tctx->reenq_cnt = 0;
-		tctx->flags |= MLFQ_TF_AGING_BOOSTED;
 		__sync_fetch_and_add(&mlfq_stats.aging_boosts, 1);
 	}
 
@@ -186,7 +203,6 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			__sync_fetch_and_add(&mlfq_stats.enq_pinned_global, 1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL,
 					   slice, enq_flags);
-			mlfq_stat_placement(qid);
 			tctx->wake_cpu_state = 0;
 			goto done;
 		}
@@ -201,13 +217,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 */
 			deadline = mlfq_place_task(qid, tctx, p->pid);
 			if (!deadline) {
-				/*
-				 * Unreachable for valid inputs: the queue
-				 * maps are static and in-range. The error
-				 * call turns a future regression into a
-				 * scheduler exit into bypass instead of a
-				 * silently stranded task.
-				 */
+				/* Unreachable for valid inputs; see the header note. */
 				__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 				scx_bpf_error("pid %d pinned-idle placement failed",
 					      p->pid);
@@ -231,12 +241,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		deadline = mlfq_place_task(qid, tctx, p->pid);
 		if (!deadline) {
-			/*
-			 * Unreachable for valid inputs: the queue maps are
-			 * static and in-range. The error call turns a
-			 * future regression into a scheduler exit into
-			 * bypass instead of a silently stranded task.
-			 */
+			/* Unreachable for valid inputs; see the header note. */
 			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 			scx_bpf_error("pid %d pinned-busy placement failed",
 				      p->pid);
@@ -248,17 +253,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 					 enq_flags);
 		mlfq_stat_placement(qid);
 		tctx->wake_cpu_state = 0;
-
-		/*
-		 * A placement into another CPU's queue needs that CPU to
-		 * run one more scheduling cycle; the idle kick is a cheap
-		 * flag that is consumed when the CPU next goes idle, and
-		 * it guarantees the queued task is not stranded on a
-		 * nohz-idle CPU. The enqueueing CPU needs no kick: its own
-		 * dispatch drains the queue in the same scheduling cycle.
-		 */
-		if (prev_cpu != bpf_get_smp_processor_id())
-			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
+		mlfq_idle_kick(prev_cpu);
 		goto done;
 	}
 
@@ -273,12 +268,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	if (local_fast_path) {
 		deadline = mlfq_place_task(qid, tctx, p->pid);
 		if (!deadline) {
-			/*
-			 * Unreachable for valid inputs: the queue maps are
-			 * static and in-range. The error call turns a
-			 * future regression into a scheduler exit into
-			 * bypass instead of a silently stranded task.
-			 */
+			/* Unreachable for valid inputs; see the header note. */
 			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 			scx_bpf_error("pid %d fast-path placement failed",
 				      p->pid);
@@ -316,8 +306,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	 * the higher-priority arrival preempts: the wakee is dispatched to
 	 * that CPU's local DSQ with SCX_ENQ_PREEMPT, which the kernel
 	 * resolves into a preemption on the next scheduling event. The
-	 * local-DSQ insert is FIFO, so no placement and no queue lock are
-	 * needed. Same-queue wakeups do not preempt: they join the queue
+	 * local-DSQ insert is FIFO, so no placement and no shared state
+	 * needs to be touched. Same-queue wakeups do not preempt: they join the queue
 	 * DSQ and are served by virtual-time order at dispatch, so a
 	 * running task is never displaced mid-slice by a task of its own
 	 * priority. A concurrent affinity change between CPU selection and
@@ -345,12 +335,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Regular path: into the owning CPU's queue vtime DSQ. */
 	deadline = mlfq_place_task(qid, tctx, p->pid);
 	if (!deadline) {
-		/*
-		 * Unreachable for valid inputs: the queue maps are
-		 * static and in-range. The error call turns a
-		 * future regression into a scheduler exit into
-		 * bypass instead of a silently stranded task.
-		 */
+		/* Unreachable for valid inputs; see the header note. */
 		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 		scx_bpf_error("pid %d regular placement failed",
 			      p->pid);
@@ -365,15 +350,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;
 
-	/*
-	 * A placement into another CPU's queue needs that CPU to run one
-	 * more scheduling cycle so a queued task is not stranded on a
-	 * nohz-idle CPU; the idle kick is a cheap flag that is consumed
-	 * when the CPU next goes idle. The enqueueing CPU needs no kick:
-	 * its own dispatch drains the queue in the same scheduling cycle.
-	 */
-	if (target_cpu != bpf_get_smp_processor_id())
-		scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
+	mlfq_idle_kick(target_cpu);
 
 done:
 	;

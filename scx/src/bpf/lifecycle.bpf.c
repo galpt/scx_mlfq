@@ -7,7 +7,7 @@
  * init_task/enable initialize the task context; running() records the
  * running task's queue and pid, the wakeup-preemption inputs;
  * stopping() charges vruntime and the EMA gauge for the run segment and
- * advances the owning queue's frontier clock with the virtual time just
+ * advances the owning queue's virtual clock with the virtual time just
  * charged; exit_task() deletes the task storage; cpu_release() re-enqueues
  * local-DSQ leftovers when a CPU leaves the scheduler.
  */
@@ -120,8 +120,8 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		mlfq_update_vruntime(tctx, delta);
 		mlfq_ema_climb_task(tctx, delta);
 		/*
-		 * Advance the owning queue's frontier clock with the
-		 * virtual time just charged: the frontier follows the
+		 * Advance the owning queue's virtual clock with the
+		 * virtual time just charged: the clock follows the
 		 * service given to the queue, and placement anchors new
 		 * arrivals to it. The queue lookup can fail when the task's
 		 * queue state was not carried over, which is tolerated: the

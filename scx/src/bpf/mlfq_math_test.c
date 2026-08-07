@@ -55,7 +55,7 @@ static void test_place_entity(void)
 	struct queue_ctx q;
 	struct task_ctx t;
 
-	/* Empty frontier at 0, weight 100, Q2 slice: deadline == vslice == 2ms. */
+	/* Empty clock at 0, weight 100, Q2 slice: deadline == vslice == 2ms. */
 	q = make_q(0, 2000000);
 	memset(&t, 0, sizeof(t));
 	t.weight = 100;
@@ -64,7 +64,7 @@ static void test_place_entity(void)
 		"first placement: vruntime 0, vlag 0, deadline 2ms");
 
 	/*
-	 * A task far behind the frontier is clamped to clock - limit, the
+	 * A task far behind the clock is clamped to clock - limit, the
 	 * fair.c bounded-lag property: lag saturates at limit and the
 	 * placed vruntime never falls more than one lag bound behind the
 	 * service point. limit = 3ms virtual at weight 100.
@@ -78,7 +78,7 @@ static void test_place_entity(void)
 		"behind task clamped to clock - limit, lag at the bound");
 
 	/*
-	 * An ahead task is placed at the frontier (fair.c DELAY_ZERO):
+	 * An ahead task is placed at the clock (fair.c DELAY_ZERO):
 	 * leading credit is not carried, so the negative lag case is
 	 * collapsed to zero.
 	 */
@@ -91,7 +91,7 @@ static void test_place_entity(void)
 		"ahead task placed at the clock, vlag 0");
 
 	/*
-	 * An in-band task (within one lag limit behind the frontier) keeps
+	 * An in-band task (within one lag limit behind the clock) keeps
 	 * its vruntime; its lag and deadline follow the placement formulas.
 	 */
 	q = make_q(1000000, 2000000);
@@ -122,14 +122,14 @@ static void test_place_entity(void)
 	q = make_q(0ULL - 1000000ULL, 1000000);	/* clock one slice before wrap */
 	memset(&t, 0, sizeof(t));
 	t.weight = 100;
-	t.vruntime = q.clock;	/* task exactly at the frontier, lag 0 */
+	t.vruntime = q.clock;	/* task exactly at the clock, lag 0 */
 	TEST_OK(mlfq_place_entity(&q, &t) == 1 && t.deadline == 1,
 		"wrapped deadline that would be zero is bumped to 1");
 }
 
 /*
  * The lag bound scales with the weight: a weight-1 task may lag up to
- * 100x the request size behind the frontier, a weight-10000 task only
+ * 100x the request size behind the clock, a weight-10000 task only
  * 1% of it. The clamp holds at both extremes.
  */
 static void test_place_entity_weight_edges(void)
@@ -158,7 +158,7 @@ static void test_place_entity_weight_edges(void)
 /*
  * Placement, charge and re-placement form the per-queue service loop:
  * the clock advances to the vruntime just charged, and the next
- * placement of the same task measures its lag from the fresh frontier.
+ * placement of the same task measures its lag from the fresh clock.
  */
 static void test_place_charge_replacement(void)
 {
@@ -168,18 +168,18 @@ static void test_place_charge_replacement(void)
 	q = make_q(1ULL << 40, 2000000);
 	memset(&t, 0, sizeof(t));
 	t.weight = 100;
-	t.vruntime = q.clock - 1000000;	/* one ms behind the frontier */
+	t.vruntime = q.clock - 1000000;	/* one ms behind the clock */
 	mlfq_place_entity(&q, &t);
 	TEST_OK(t.vruntime == q.clock - 1000000 && t.vlag == 1000000,
 		"in-band task placed with its lag preserved");
 
 	mlfq_queue_advance_clock(&q, t.vruntime);
 	TEST_OK(q.clock == (1ULL << 40),
-		"a task behind the frontier does not move it");
+		"a task behind the clock does not advance it");
 
 	/*
 	 * The task runs a full slice: the charge is its vruntime plus
-	 * the slice's virtual time, which lands ahead of the frontier.
+	 * the slice's virtual time, which lands ahead of the clock.
 	 */
 	t.vruntime += 2000000;
 	mlfq_queue_advance_clock(&q, t.vruntime);
@@ -189,7 +189,7 @@ static void test_place_charge_replacement(void)
 	t.vruntime = q.clock - 500000;	/* now only 0.5 ms behind */
 	mlfq_place_entity(&q, &t);
 	TEST_OK(t.vruntime == q.clock - 500000 && t.vlag == 500000,
-		"re-placement measures the lag from the advanced frontier");
+		"re-placement measures the lag from the advanced clock");
 }
 
 static void test_clock_advance(void)
@@ -198,13 +198,13 @@ static void test_clock_advance(void)
 
 	mlfq_queue_advance_clock(&q, 5000);
 	TEST_OK(q.clock == 5000,
-		"advance to a larger vruntime moves the frontier");
+		"advance to a larger vruntime advances the clock");
 	mlfq_queue_advance_clock(&q, 100);
 	TEST_OK(q.clock == 5000,
 		"advance to a smaller vruntime is ignored (monotone)");
 	mlfq_queue_advance_clock(&q, 5000);
 	TEST_OK(q.clock == 5000,
-		"equal vruntime leaves the frontier unchanged");
+		"equal vruntime leaves the clock unchanged");
 
 	q = make_q(0ULL - 100ULL, 2000000);
 	mlfq_queue_advance_clock(&q, 10);

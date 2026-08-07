@@ -4,9 +4,9 @@
  *
  * EEVDF virtual-time substrate, included by main.bpf.c via #include.
  *
- * The pure math (calc_delta_fair_bpf, the frontier clock advance, and
+ * The pure math (calc_delta_fair_bpf, the virtual-clock advance, and
  * place_entity) lives in intf.h so the native unit-test harness compiles
- * it directly. This module wires that math to the per-queue frontier
+ * it directly. This module wires that math to the per-queue virtual
  * clock: the lock-free placement entry point used by enqueue(), the
  * monotone clock advance that follows the service given to a queue, and
  * the vruntime charging used by the lifecycle path.
@@ -18,9 +18,9 @@ static __always_inline struct queue_ctx *mlfq_lookup_queue(u32 qid)
 }
 
 /*
- * Place @tctx into queue @qid against the queue's frontier clock. No lock
- * is taken: the frontier is updated only through the monotone clock
- * advance, and the placement clamp bounds any error a momentarily stale
+ * Place @tctx into queue @qid against the queue's virtual clock. No lock
+ * is taken: the clock is updated only through the monotone advance, and
+ * the placement clamp bounds any error a momentarily stale
  * clock can introduce, so the bounded-lag safety properties hold without
  * mutual exclusion.
  *

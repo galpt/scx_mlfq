@@ -124,7 +124,12 @@ pub fn plan_llcs(cpu_to_llc: &[(u32, u32)], primary_cpus: &[u32], max_llcs: usiz
         return plan;
     }
 
-    let nr = cpu_to_llc.iter().map(|&(_, llc)| llc).max().unwrap() + 1;
+    let nr = cpu_to_llc
+        .iter()
+        .map(|&(_, llc)| llc)
+        .max()
+        .unwrap()
+        .saturating_add(1);
     if nr as usize > max_llcs {
         warn!(
             "{} LLC domains exceed the supported maximum ({}), disabling LLC-aware placement",
@@ -394,6 +399,15 @@ mod tests {
         // 33 domains exceed the 32-domain bound: disable LLC awareness.
         let map: Vec<(u32, u32)> = (0..33).map(|i| (i, i)).collect();
         let plan = plan_llcs(&map, &[], MAX_LLCS);
+        assert_eq!(plan.nr_llcs, 0);
+        assert!(plan.llc_cpus.is_empty());
+    }
+
+    #[test]
+    fn llc_plan_saturates_on_u32_max_llc_id() {
+        // A llc_id of u32::MAX must not wrap the domain count to zero,
+        // which would pass the cap check and later index out of bounds.
+        let plan = plan_llcs(&[(0, 0), (1, u32::MAX)], &[], MAX_LLCS);
         assert_eq!(plan.nr_llcs, 0);
         assert!(plan.llc_cpus.is_empty());
     }

@@ -26,16 +26,18 @@
  * excluded. Each slot is a constant number of peeks and one move, so the
  * loop bodies stay flat and the verifier state small.
  *
- * The keep path runs first, before the slot loops: when the CPU's queue
- * DSQs are empty and the outgoing task is still queued, the task is the
- * only runnable work this CPU can take, so it is kept with a fresh queue
- * slice instead of the CPU idling with runnable work. Before keeping, the
- * three queue heads of one remote CPU (the rotating scan candidate) are
- * probed: a CPU whose own queues are empty should still pull the
- * most-owed remote task instead of running the previous task for a full
- * slice. Resolving the keep up front reads the queue state once, before
- * the slot loops churn it, and keeps the loop bodies to a single job
- * each.
+ * The keep path runs first, before the slot loops. balance() runs before
+ * put_prev_task() in the scheduling pass, and with SCX_OPS_ENQ_LAST set
+ * the kernel does not keep prev automatically, so when prev is still
+ * queued and all three of the CPU's queue DSQs are empty, the keep path
+ * grants prev a fresh slice and inserts it into the local DSQ;
+ * balance_one()'s post-dispatch keep (prev_on_rq && slice) then runs it
+ * without a context switch. Before keeping, the three queue heads of one
+ * remote CPU (the rotating scan candidate) are probed: a CPU whose own
+ * queues are empty should still pull the most-owed remote task instead
+ * of running the previous task for a full slice. Resolving the keep up
+ * front reads the queue state once, before the slot loops churn it, and
+ * keeps the loop bodies to a single job each.
  */
 
 /*
@@ -173,22 +175,30 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
-	 * Advance the rotating scan start once per dispatch call. Q1
-	 * always scans every candidate, so only the bounded Q2/Q3 windows
-	 * consume the offset; per-call rotation keeps the window fair
-	 * across CPUs without a per-slot cost.
+	 * Advance the rotating scan start once per dispatch call. All
+	 * three queues share the same bounded window: every slot scans at
+	 * most the init-clamped mlfq_steal_scan candidates. On machines at
+	 * or below the scan cap the window covers every CPU, so the offset
+	 * rotation only matters on larger machines, where per-call rotation
+	 * keeps the window fair across CPUs without a per-slot cost.
 	 */
 	if (cpu_state)
 		cpu_state->steal_scan_off++;
 
 	/*
 	 * Keep the outgoing task when nothing else is dispatchable here.
-	 * If @prev is still queued and all three of the CPU's queue DSQs
-	 * are empty, @prev is the only runnable work this CPU can take;
-	 * the alternative is switching to idle with runnable work, which
-	 * leaves the CPU parked until an external wakeup. Replenish the
-	 * queue slice and place @prev on the local DSQ; the pick path then
-	 * runs it without a context switch. Spurious inserts are safe
+	 * balance() runs before put_prev_task() in the scheduling pass,
+	 * and with SCX_OPS_ENQ_LAST set the kernel does not keep prev
+	 * automatically (ext.c). So when @prev is still queued and all
+	 * three of the CPU's queue DSQs are empty, @prev is the only
+	 * runnable work this CPU can take; the alternative is switching to
+	 * idle with runnable work, which leaves the CPU parked until an
+	 * external wakeup. Replenishing the queue slice makes balance_one()'s
+	 * post-dispatch keep (prev_on_rq && slice) run @prev again without
+	 * a context switch. The task stays queued in the local DSQ until
+	 * the next real context switch; running()/stopping() do not fire
+	 * while prev is simply kept (next == prev), so service accounting
+	 * resumes at the next actual switch. Spurious inserts are safe
 	 * because the kernel claims the task again in finish_dispatch()
 	 * (ext.c), dropping the insert if @prev was concurrently dequeued.
 	 *
@@ -197,11 +207,6 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * empty should still pull the most-owed remote task instead of
 	 * running the previous task for a full slice; the probe is three
 	 * lockless peeks.
-	 *
-	 * The kernel's automatic keep path (balance_one() setting
-	 * SCX_RQ_BAL_KEEP) is available only while SCX_OPS_ENQ_LAST is
-	 * clear. This scheduler sets SCX_OPS_ENQ_LAST, so ops.dispatch()
-	 * itself must make the keep effective.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
 	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
