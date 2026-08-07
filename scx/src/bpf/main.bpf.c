@@ -269,5 +269,15 @@ SCX_OPS_DEFINE(mlfq_ops,
 	       .init_task		= (void *)mlfq_init_task,
 	       .exit_task		= (void *)mlfq_exit_task,
 	       .dispatch_max_batch	= MLFQ_DISPATCH_MAX_BATCH,
-	       .timeout_ms		= 5000,
+	       /*
+		* The kernel's own default watchdog timeout. A shorter one
+		* would trip on machines where real-time tasks saturate the
+		* CPUs: the RT class is not throttled below its budget, so
+		* the watchdog work can be starved for the whole burst, and
+		* the scheduler would exit even though nothing in its own
+		* queues stalled. The watchdog still fires on a genuinely
+		* stalled queue within the kernel's maximum detection
+		* latency.
+		*/
+	       .timeout_ms		= 30000,
 	       .name			= "mlfq");
