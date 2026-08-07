@@ -26,8 +26,8 @@
  * the running task's slice, so both produce the same flag-less re-enqueue.
  * SCX_ENQ_LAST is passed when the task is about to enter a lower sched
  * class and remains the only runnable ext task on the CPU. SCX_ENQ_REENQ
- * arrives from the reenqueue paths (the IMMED-preemption re-enqueue in
- * put_prev_task_scx() and scx_bpf_reenqueue_local()). Preemptions by a
+ * arrives only from scx_bpf_reenqueue_local(), which ops.cpu_release()
+ * calls to fold the local DSQ back into the queue DSQs. Preemptions by a
  * higher sched class keep the task at the local-DSQ head without calling
  * ops.enqueue() at all.
  *
@@ -35,7 +35,10 @@
  * queue map lookup fails. The queue maps are static and in-range, so a
  * failed placement is unreachable for valid inputs; the error call on
  * each failure path turns a future regression into a scheduler exit into
- * bypass instead of a silently stranded task.
+ * bypass instead of a silently stranded task. The two FIFO local-DSQ
+ * paths (pinned-idle and the idle-CPU fast path) skip placement entirely:
+ * the insert does not consume a deadline, so placement is deferred to the
+ * next real placement, which re-anchors the task under the lag clamp.
  */
 
 static __always_inline bool mlfq_task_is_migration_disabled(const struct task_struct *p)
@@ -214,15 +217,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * cycle and the local DSQ drains immediately after,
 			 * which keeps balance_one() from skipping
 			 * ops.dispatch() for the tasks queued behind it.
+			 * The FIFO local-DSQ insert does not consume a
+			 * deadline, so placement is deferred to the next
+			 * real placement, which re-anchors the task under
+			 * the lag clamp.
 			 */
-			deadline = mlfq_place_task(qid, tctx, p->pid);
-			if (!deadline) {
-				/* Unreachable for valid inputs; see the header note. */
-				__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
-				scx_bpf_error("pid %d pinned-idle placement failed",
-					      p->pid);
-				return;
-			}
 			__sync_fetch_and_add(&mlfq_stats.enq_pinned_idle, 1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
 					   slice, enq_flags);
@@ -266,14 +265,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_VALID) &&
 			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_IDLE);
 	if (local_fast_path) {
-		deadline = mlfq_place_task(qid, tctx, p->pid);
-		if (!deadline) {
-			/* Unreachable for valid inputs; see the header note. */
-			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
-			scx_bpf_error("pid %d fast-path placement failed",
-				      p->pid);
-			return;
-		}
+		/*
+		 * The FIFO local-DSQ insert does not consume a deadline,
+		 * so placement is deferred to the next real placement,
+		 * which re-anchors the task under the lag clamp.
+		 */
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
 				   enq_flags);
 		__sync_fetch_and_add(&mlfq_stats.enq_fastpath, 1);

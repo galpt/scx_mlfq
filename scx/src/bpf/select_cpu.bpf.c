@@ -114,7 +114,6 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	struct task_ctx *tctx;
 	const struct mlfq_bitmap *primary_bm;
-	const struct cpumask *idle_cpumask;
 	u32 first_cpu, waker_cpu, waker_llc;
 	s32 cpu_id = -1;
 
@@ -188,14 +187,16 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 */
 	if (tctx->queue == 1) {
 		if (mlfq_primary_all) {
-			idle_cpumask = scx_bpf_get_idle_cpumask();
-			if (!bpf_cpumask_empty(idle_cpumask)) {
-				cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr,
-							       SCX_PICK_IDLE_CORE);
-				if (cpu_id < 0)
-					cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			}
-			scx_bpf_put_idle_cpumask(idle_cpumask);
+			/*
+			 * pick_idle_cpu() returns an error when no idle CPU
+			 * exists, so the idle-cpumask acquire and the empty
+			 * pre-check would only add an acquire/release pair
+			 * without changing the result.
+			 */
+			cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr,
+						       SCX_PICK_IDLE_CORE);
+			if (cpu_id < 0)
+				cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 		} else {
 			cpu_id = mlfq_pick_idle_primary(p, primary_bm);
 			if (cpu_id < 0)

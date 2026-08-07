@@ -8,36 +8,46 @@
  * The kernel serves SCX_DSQ_LOCAL before ops.dispatch() (the dispatch
  * loop in ext.c), so this callback only fills the local DSQ from the
  * per-CPU queue DSQs. Each CPU serves its own three queue DSQs in Q1..Q3
- * priority order, each queue bounded by dispatch_max_batch. Every slot
- * picks the earliest EEVDF deadline among the queue's own head and the
- * heads of remote CPUs' same-queue DSQs (affinity-prechecked), so an idle
- * CPU drains the most-owed task in the system for that queue, not only
- * its own. A remote task is migrated only when its deadline is at least
- * one of its virtual slices ahead of the local head, so a near-tie
- * deadline does not cost the task its cache warmth. The kernel enforces
- * affinity on the move itself: consume_dispatch_q() in ext.c skips heads
- * that cannot run on the consuming CPU, so the BPF pre-check only prefers
- * the earliest eligible head and avoids wasted moves.
+ * priority order, each queue bounded by dispatch_max_batch. A queue's own
+ * DSQ is consumed first, directly from its head: the kernel keeps each
+ * vtime DSQ's list in deadline order (scx_dsq_priq_less), so every
+ * scx_bpf_dsq_move_to_local() pops the min-deadline head without a peek
+ * or a scan, and the kernel re-validates affinity on the move. When the
+ * own queue does not fill its quota, the remaining slots scan a bounded
+ * window of remote CPUs' same-queue DSQs, gated by a cheap nr_queued
+ * check before each peek; among the eligible remote heads the earliest
+ * deadline wins. The kernel enforces affinity on the move itself:
+ * consume_dispatch_q() in ext.c skips heads that cannot run on the
+ * consuming CPU, so the BPF pre-check only prefers the earliest eligible
+ * head and avoids wasted moves.
  *
- * The three quotas are served by bounded loops: every queue scans a
- * rotating window of at most the init-clamped mlfq_steal_scan candidates,
- * starting at a per-CPU offset that drifts per dispatch call, so the
- * window is fair across the system and no remote CPU is permanently
- * excluded. Each slot is a constant number of peeks and one move, so the
- * loop bodies stay flat and the verifier state small.
+ * The three quotas are served by bounded loops: every queue consumes its
+ * own DSQ with a quota-bounded move loop, then scans a rotating window of
+ * at most the init-clamped mlfq_steal_scan candidates, starting at a
+ * per-CPU offset that drifts per dispatch call, so the window is fair
+ * across the system and no remote CPU is permanently excluded. The loop
+ * bodies stay flat (one move per slot, one peek per gated candidate) and
+ * the verifier state small.
  *
  * The keep path runs first, before the slot loops. balance() runs before
  * put_prev_task() in the scheduling pass, and with SCX_OPS_ENQ_LAST set
  * the kernel does not keep prev automatically, so when prev is still
  * queued and all three of the CPU's queue DSQs are empty, the keep path
- * grants prev a fresh slice and inserts it into the local DSQ;
- * balance_one()'s post-dispatch keep (prev_on_rq && slice) then runs it
- * without a context switch. Before keeping, the three queue heads of one
- * remote CPU (the rotating scan candidate) are probed: a CPU whose own
- * queues are empty should still pull the most-owed remote task instead
- * of running the previous task for a full slice. Resolving the keep up
- * front reads the queue state once, before the slot loops churn it, and
- * keeps the loop bodies to a single job each.
+ * grants prev a fresh slice and returns, without inserting prev into the
+ * local DSQ; balance_one()'s post-dispatch keep (prev_on_rq && slice)
+ * then runs the task without a context switch. The grant alone is the
+ * whole keep: a resident local-DSQ entry would shadow the queue DSQs on
+ * every later dispatch cycle (ext.c takes the local DSQ before
+ * ops.dispatch()) because a kept prev is never popped
+ * (put_prev_set_next_task() early-returns on next == prev), refilling the
+ * task at the 20 ms SCX_SLICE_DFL granularity and freezing
+ * running()/stopping() accounting until the next real context switch.
+ * Before keeping, the three queue heads of one remote CPU (the rotating
+ * scan candidate) are probed: a CPU whose own queues are empty should
+ * still pull the most-owed remote task instead of running the previous
+ * task for a full slice. Resolving the keep up front reads the queue
+ * state once, before the slot loops churn it, and keeps the loop bodies
+ * to a single job each.
  */
 
 /*
@@ -45,8 +55,9 @@
  * @cand: Remote CPU to probe.
  * @cpu: Local CPU, the affinity target of the peeked tasks.
  *
- * Three lockless peeks, one per queue DSQ. A head that can run on @cpu
- * means the slot loops below have work to steal.
+ * Three lockless peeks, one per queue DSQ, each gated on nr_queued so an
+ * empty DSQ is skipped without a peek. A head that can run on @cpu means
+ * the slot loops below have work to steal.
  *
  * Return: true if any queue DSQ head can run on @cpu.
  */
@@ -54,15 +65,21 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
 {
 	struct task_struct *t;
 
-	t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(1, cand));
-	if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-		return true;
-	t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(2, cand));
-	if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-		return true;
-	t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(3, cand));
-	if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-		return true;
+	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cand))) {
+		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(1, cand));
+		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+			return true;
+	}
+	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cand))) {
+		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(2, cand));
+		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+			return true;
+	}
+	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cand))) {
+		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(3, cand));
+		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+			return true;
+	}
 	return false;
 }
 
@@ -74,16 +91,22 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * @cpu_state: Per-CPU state of @cpu, may be NULL.
  * @nr_cpus: Snapshot of nr_cpu_ids.
  *
- * Each slot peeks the queue's own head and the heads of the candidate
- * CPUs' same-queue DSQs, affinity-checks each (migration-disabled tasks
- * fail this automatically), and moves the earliest-deadline candidate to
- * the local DSQ. A remote candidate must beat the local head by at least
- * one of its own virtual slices, otherwise the local head is served and
- * the task keeps its cache warmth; with no local head the earliest
- * eligible remote head is taken freely. The candidates are a rotating
- * window of at most mlfq_steal_scan CPUs starting at the per-CPU offset,
+ * The queue's own DSQ is consumed first: the kernel keeps a vtime DSQ's
+ * list in deadline order (scx_dsq_priq_less), so a quota-bounded loop of
+ * scx_bpf_dsq_move_to_local() pops the min-deadline head directly, with
+ * no peek and no scan, and the kernel re-validates affinity on the move.
+ * Only when the own DSQ does not fill the quota do the remaining slots
+ * scan a rotating window of remote CPUs' same-queue DSQs: at most the
+ * init-clamped mlfq_steal_scan candidates starting at the per-CPU offset,
  * so the bounded window is fair across the system; on machines smaller
- * than the scan cap the window covers every CPU.
+ * than the scan cap the window covers every CPU. Each candidate is gated
+ * on nr_queued before its peek, and the earliest eligible deadline among
+ * the peeked heads is moved once per slot.
+ *
+ * No margin rule applies in the steal phase: the own-first consume has
+ * already drained every local head, so there is no local deadline to
+ * protect against and the earliest eligible remote head is taken freely.
+ * Every move in the steal phase therefore originates from a remote DSQ.
  *
  * Return: The number of tasks moved.
  */
@@ -94,72 +117,77 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 	u64 own_dsq = mlfq_dsq_id(qid, cpu);
 	u32 slot, moved = 0;
 
+	/*
+	 * Own-first consume: each move_to_local pops the min-deadline head
+	 * of the own DSQ (the kernel keeps the list in deadline order),
+	 * and returns false when the DSQ is empty or nothing can run on
+	 * this CPU, which ends the loop early.
+	 */
 	bpf_for(slot, 0, quota) {
-		struct task_struct *best = NULL;
-		u64 best_dsq = 0;
-		s32 best_cpu = cpu;
-		u32 cand;
+		if (!scx_bpf_dsq_move_to_local(own_dsq, 0))
+			break;
+		moved++;
+	}
+
+	/*
+	 * Steal phase, only when the own queue did not fill the quota.
+	 * Every local head was moved by the own-first consume above, so
+	 * the steal phase never weighs a remote head against a local one:
+	 * the earliest eligible remote deadline is taken freely.
+	 */
+	if (moved < quota) {
+		u32 remaining = quota - moved;
 		u32 off = cpu_state ? cpu_state->steal_scan_off % (u32)nr_cpus : 0;
 		u32 i;
 
-		/* the queue's own head, affinity-prechecked */
-		best = __COMPAT_scx_bpf_dsq_peek(own_dsq);
-		if (best && !bpf_cpumask_test_cpu((u32)cpu, best->cpus_ptr))
-			best = NULL;
-		best_dsq = own_dsq;
+		bpf_for(slot, 0, remaining) {
+			struct task_struct *best = NULL;
+			u64 best_dsq = 0;
+			u32 cand;
 
-		/*
-		 * Every queue scans the same bounded rotating window: at
-		 * most the init-clamped mlfq_steal_scan candidates starting
-		 * at the per-CPU offset. The offset drifts per dispatch
-		 * call, so the window is fair across the system.
-		 */
-		bpf_for(i, 0, mlfq_steal_scan) {
-			struct task_struct *t;
+			/*
+			 * Every queue scans the same bounded rotating
+			 * window: at most the init-clamped mlfq_steal_scan
+			 * candidates starting at the per-CPU offset. The
+			 * offset drifts per dispatch call, so the window is
+			 * fair across the system.
+			 */
+			bpf_for(i, 0, mlfq_steal_scan) {
+				struct task_struct *t;
 
-			cand = (off + i) % (u32)nr_cpus;
-			if (cand == (u32)cpu)
-				continue;
-			t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
-			if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-				continue;
-			/*
-			 * A remote candidate is taken only when it beats
-			 * the local head by at least one of its own
-			 * virtual slices; migrating a task for a smaller
-			 * deadline difference would trade its cache
-			 * warmth for nothing. Without a local head the
-			 * earliest eligible remote head is taken freely.
-			 */
-			if (best_cpu == cpu && best &&
-			    !mlfq_time_before(
-				    t->scx.dsq_vtime +
-					    calc_delta_fair_bpf(
-						    mlfq_queue_slice(qid),
-						    (u32)t->scx.weight),
-				    best->scx.dsq_vtime))
-				continue;
-			/*
-			 * Prefer the earlier deadline, the same
-			 * time_before64() order the kernel's priq
-			 * uses (scx_dsq_priq_less()).
-			 */
-			if (!best || mlfq_time_before(t->scx.dsq_vtime,
-						    best->scx.dsq_vtime)) {
-				best = t;
-				best_dsq = mlfq_dsq_id(qid, cand);
-				best_cpu = (s32)cand;
+				cand = (off + i) % (u32)nr_cpus;
+				if (cand == (u32)cpu)
+					continue;
+				/*
+				 * Gate on nr_queued first: a cheap
+				 * lockless read that skips the peek for
+				 * empty DSQs.
+				 */
+				if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
+					continue;
+				t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
+				if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+					continue;
+				/*
+				 * Prefer the earlier deadline, the same
+				 * time_before64() order the kernel's priq
+				 * uses (scx_dsq_priq_less()).
+				 */
+				if (!best || mlfq_time_before(t->scx.dsq_vtime,
+							    best->scx.dsq_vtime)) {
+					best = t;
+					best_dsq = mlfq_dsq_id(qid, cand);
+				}
 			}
-		}
 
-		/* nothing eligible anywhere: this queue has no work */
-		if (!best)
-			break;
+			/* nothing eligible anywhere: this queue has no work */
+			if (!best)
+				break;
 
-		scx_bpf_dsq_move_to_local(best_dsq, 0);
-		moved++;
-		if (best_cpu != cpu)
+			scx_bpf_dsq_move_to_local(best_dsq, 0);
+			moved++;
 			__sync_fetch_and_add(&mlfq_stats.steals, 1);
+		}
 	}
 
 	return moved;
@@ -193,20 +221,27 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * three of the CPU's queue DSQs are empty, @prev is the only
 	 * runnable work this CPU can take; the alternative is switching to
 	 * idle with runnable work, which leaves the CPU parked until an
-	 * external wakeup. Replenishing the queue slice makes balance_one()'s
-	 * post-dispatch keep (prev_on_rq && slice) run @prev again without
-	 * a context switch. The task stays queued in the local DSQ until
-	 * the next real context switch; running()/stopping() do not fire
-	 * while prev is simply kept (next == prev), so service accounting
-	 * resumes at the next actual switch. Spurious inserts are safe
-	 * because the kernel claims the task again in finish_dispatch()
-	 * (ext.c), dropping the insert if @prev was concurrently dequeued.
+	 * external wakeup. Replenishing the queue slice alone makes
+	 * balance_one()'s post-dispatch keep (prev_on_rq &&
+	 * prev->scx.slice) run @prev again without a context switch, so
+	 * the keep path grants the slice and returns without inserting
+	 * @prev into the local DSQ. A resident local-DSQ entry would shadow
+	 * the queue DSQs on every later dispatch cycle (ext.c takes the
+	 * local DSQ before ops.dispatch()), because a kept prev is never
+	 * popped (put_prev_set_next_task() early-returns on next == prev);
+	 * the task would instead be served off that entry, refilled at the
+	 * 20 ms SCX_SLICE_DFL granularity, with running()/stopping()
+	 * accounting frozen until the next real context switch. With no
+	 * DSQ entry, the next real context switch re-enqueues @prev
+	 * through put_prev_task_scx() (slice-exhausted: ops.enqueue() with
+	 * flags == 0; slice-left: SCX_ENQ_HEAD local insert), so queue
+	 * placement and accounting resume naturally.
 	 *
 	 * Before keeping, the three queue DSQ heads of one remote CPU (the
 	 * rotating scan candidate) are probed: a CPU whose own queues are
 	 * empty should still pull the most-owed remote task instead of
-	 * running the previous task for a full slice; the probe is three
-	 * lockless peeks.
+	 * running the previous task for a full slice; the probe is gated
+	 * on nr_queued and is three lockless peeks.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
 	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
@@ -238,22 +273,11 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 				}
 				if (!remote_work) {
 					scx_bpf_task_set_slice(prev, slice);
-					if (scx_bpf_dsq_insert(prev, SCX_DSQ_LOCAL,
-							       slice, 0)) {
-						__sync_fetch_and_add(
-							&mlfq_stats.keep_running, 1);
-						return;
-					}
-					/*
-					 * The outgoing task may have been
-					 * stolen by a remote CPU between its
-					 * re-enqueue and this dispatch; the
-					 * insert then fails and the slot
-					 * loops should run instead of
-					 * aborting the cycle.
-					 */
+					__sync_fetch_and_add(
+						&mlfq_stats.keep_running, 1);
+					return;
 				}
-				/* remote work or a failed keep insert: the slot loops steal */
+				/* remote work: the slot loops steal */
 			}
 		}
 	}

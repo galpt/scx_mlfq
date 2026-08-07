@@ -128,20 +128,19 @@ impl<'a> Scheduler<'a> {
          * Ops flags: honor exiting tasks, receive the SCX_ENQ_LAST enqueue
          * for the last runnable task on a CPU, never migrate
          * migration-disabled tasks, and allow queued-wakeup selection of
-         * idle CPUs (the idle-CPU fast path depends on the latter two). On
-         * multi-node systems the built-in idle tracking is extended to
-         * consider NUMA topology, so the idle fast path and the CPU scans
-         * prefer node-local idle CPUs.
+         * idle CPUs (the idle-CPU fast path depends on the latter two).
+         *
+         * The per-node built-in idle tracking flag is intentionally left
+         * off: with per-node built-in idle tracking enabled, the kernel's
+         * scx_bpf_get_idle_cpumask() and scx_bpf_pick_idle_cpu() error out
+         * of the scheduler (ext_idle.c), and select_cpu.bpf.c calls exactly
+         * those helpers; the per-node variants are never used. Leaving the
+         * flag off keeps the kernel's own NUMA idle optimization active.
          */
         skel.struct_ops.mlfq_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP
-            | if topology_plan.nr_numa_nodes > 1 {
-                *compat::SCX_OPS_BUILTIN_IDLE_PER_NODE
-            } else {
-                0
-            };
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
 
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 

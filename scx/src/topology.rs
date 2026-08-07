@@ -161,8 +161,6 @@ pub fn plan_llcs(cpu_to_llc: &[(u32, u32)], primary_cpus: &[u32], max_llcs: usiz
 pub struct TopologyPlan {
     pub capacity: CapacityPlan,
     pub llcs: LlcPlan,
-    /// Number of non-empty NUMA nodes (0 when discovery failed).
-    pub nr_numa_nodes: usize,
 }
 
 /// Phase 1 (pre-load): discover the topology and write the rodata globals.
@@ -185,17 +183,11 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
                     llc_cpus: Vec::new(),
                     cpu_llc: [0; MAX_CPUS],
                 },
-                nr_numa_nodes: 0,
             });
         }
     };
 
     let nr_online = topo.all_cpus.len();
-    let nr_numa_nodes = topo
-        .nodes
-        .values()
-        .filter(|node| !node.all_cpus.is_empty())
-        .count();
     let primaries: Vec<u32> = match get_primary_cpus(Powermode::Performance) {
         Ok(cpus) => cpus.into_iter().map(|cpu| cpu as u32).collect(),
         Err(e) => {
@@ -244,11 +236,7 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
         info!("Topology: {} LLC cache domains", llcs.nr_llcs);
     }
 
-    Ok(TopologyPlan {
-        capacity,
-        llcs,
-        nr_numa_nodes,
-    })
+    Ok(TopologyPlan { capacity, llcs })
 }
 
 /// Phase 2 (post-load): write the primary (big-core) membership bitmap.
