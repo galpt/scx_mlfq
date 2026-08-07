@@ -91,22 +91,26 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * @cpu_state: Per-CPU state of @cpu, may be NULL.
  * @nr_cpus: Snapshot of nr_cpu_ids.
  *
- * The queue's own DSQ is consumed first: the kernel keeps a vtime DSQ's
- * list in deadline order (scx_dsq_priq_less), so a quota-bounded loop of
- * scx_bpf_dsq_move_to_local() pops the min-deadline head directly, with
- * no peek and no scan, and the kernel re-validates affinity on the move.
- * Only when the own DSQ does not fill the quota do the remaining slots
- * scan a rotating window of remote CPUs' same-queue DSQs: at most the
- * init-clamped mlfq_steal_scan candidates starting at the per-CPU offset,
- * so the bounded window is fair across the system; on machines smaller
- * than the scan cap the window covers every CPU. Each candidate is gated
- * on nr_queued before its peek, and the earliest eligible deadline among
- * the peeked heads is moved once per slot.
+ * Each slot serves the queue's own head first: scx_bpf_dsq_move_to_local()
+ * pops the min-deadline head of the own DSQ (the kernel keeps a vtime
+ * DSQ's list in deadline order, scx_dsq_priq_less) and re-validates
+ * affinity on the move, so no peek or scan is needed for the local work.
+ * Only when the own head is gone does the slot scan a rotating window of
+ * remote CPUs' same-queue DSQs: at most the init-clamped mlfq_steal_scan
+ * candidates starting at the per-CPU offset, so the bounded window is
+ * fair across the system; on machines smaller than the scan cap the
+ * window covers every CPU. Each candidate is gated on nr_queued before
+ * its peek, and the earliest eligible deadline among the peeked heads is
+ * moved once per slot.
  *
- * No margin rule applies in the steal phase: the own-first consume has
- * already drained every local head, so there is no local deadline to
- * protect against and the earliest eligible remote head is taken freely.
- * Every move in the steal phase therefore originates from a remote DSQ.
+ * With the own head drained there is no local deadline to protect, so
+ * the steal takes the earliest eligible remote head freely; the own-first
+ * order still guarantees that every local head is served before any
+ * remote one within the quota.
+ *
+ * The single slot loop also keeps the verifier's exploration bounded: a
+ * second loop whose bound depends on how many moves the first one made
+ * cannot converge within the kernel's jump-sequence limit.
  *
  * Return: The number of tasks moved.
  */
@@ -117,77 +121,65 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 	u64 own_dsq = mlfq_dsq_id(qid, cpu);
 	u32 slot, moved = 0;
 
-	/*
-	 * Own-first consume: each move_to_local pops the min-deadline head
-	 * of the own DSQ (the kernel keeps the list in deadline order),
-	 * and returns false when the DSQ is empty or nothing can run on
-	 * this CPU, which ends the loop early.
-	 */
 	bpf_for(slot, 0, quota) {
-		if (!scx_bpf_dsq_move_to_local(own_dsq, 0))
-			break;
-		moved++;
-	}
-
-	/*
-	 * Steal phase, only when the own queue did not fill the quota.
-	 * Every local head was moved by the own-first consume above, so
-	 * the steal phase never weighs a remote head against a local one:
-	 * the earliest eligible remote deadline is taken freely.
-	 */
-	if (moved < quota) {
-		u32 remaining = quota - moved;
+		struct task_struct *best = NULL;
+		u64 best_dsq = 0;
+		s32 best_cpu = cpu;
+		u32 cand, i;
 		u32 off = cpu_state ? cpu_state->steal_scan_off % (u32)nr_cpus : 0;
-		u32 i;
 
-		bpf_for(slot, 0, remaining) {
-			struct task_struct *best = NULL;
-			u64 best_dsq = 0;
-			u32 cand;
-
-			/*
-			 * Every queue scans the same bounded rotating
-			 * window: at most the init-clamped mlfq_steal_scan
-			 * candidates starting at the per-CPU offset. The
-			 * offset drifts per dispatch call, so the window is
-			 * fair across the system.
-			 */
-			bpf_for(i, 0, mlfq_steal_scan) {
-				struct task_struct *t;
-
-				cand = (off + i) % (u32)nr_cpus;
-				if (cand == (u32)cpu)
-					continue;
-				/*
-				 * Gate on nr_queued first: a cheap
-				 * lockless read that skips the peek for
-				 * empty DSQs.
-				 */
-				if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
-					continue;
-				t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
-				if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-					continue;
-				/*
-				 * Prefer the earlier deadline, the same
-				 * time_before64() order the kernel's priq
-				 * uses (scx_dsq_priq_less()).
-				 */
-				if (!best || mlfq_time_before(t->scx.dsq_vtime,
-							    best->scx.dsq_vtime)) {
-					best = t;
-					best_dsq = mlfq_dsq_id(qid, cand);
-				}
-			}
-
-			/* nothing eligible anywhere: this queue has no work */
-			if (!best)
-				break;
-
-			scx_bpf_dsq_move_to_local(best_dsq, 0);
+		/*
+		 * Own head first: move_to_local pops the min-deadline head
+		 * of the own DSQ and returns false when the DSQ is empty
+		 * or nothing can run on this CPU, which then falls through
+		 * to the steal scan.
+		 */
+		if (scx_bpf_dsq_move_to_local(own_dsq, 0)) {
 			moved++;
-			__sync_fetch_and_add(&mlfq_stats.steals, 1);
+			continue;
 		}
+
+		/*
+		 * The own queue is drained: scan the bounded rotating
+		 * window of remote candidates, gated on nr_queued before
+		 * each peek.
+		 */
+		bpf_for(i, 0, mlfq_steal_scan) {
+			struct task_struct *t;
+
+			cand = (off + i) % (u32)nr_cpus;
+			if (cand == (u32)cpu)
+				continue;
+			/*
+			 * Gate on nr_queued first: a cheap lockless read
+			 * that skips the peek for empty DSQs.
+			 */
+			if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
+				continue;
+			t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
+			if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+				continue;
+			/*
+			 * Prefer the earlier deadline, the same
+			 * time_before64() order the kernel's priq
+			 * uses (scx_dsq_priq_less()).
+			 */
+			if (!best || mlfq_time_before(t->scx.dsq_vtime,
+						    best->scx.dsq_vtime)) {
+				best = t;
+				best_dsq = mlfq_dsq_id(qid, cand);
+				best_cpu = (s32)cand;
+			}
+		}
+
+		/* nothing eligible anywhere: this queue has no work */
+		if (!best)
+			break;
+
+		scx_bpf_dsq_move_to_local(best_dsq, 0);
+		moved++;
+		if (best_cpu != cpu)
+			__sync_fetch_and_add(&mlfq_stats.steals, 1);
 	}
 
 	return moved;

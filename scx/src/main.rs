@@ -75,6 +75,11 @@ struct Opts {
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
+    /// Size of the exit dump buffer in bytes; the kernel fills it with
+    /// per-CPU and per-task state when the scheduler exits on an error.
+    #[clap(long, default_value = "1048576")]
+    exit_dump_len: u32,
+
     /// Print scheduler version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
@@ -141,6 +146,14 @@ impl<'a> Scheduler<'a> {
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
+
+        /*
+         * Error exits capture the per-CPU and per-task state dump into
+         * the exit report; without a buffer the kernel skips the dump
+         * entirely, so a stall or a placement failure would leave no
+         * evidence of where the task was parked.
+         */
+        skel.struct_ops.mlfq_ops_mut().exit_dump_len = opts.exit_dump_len;
 
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 

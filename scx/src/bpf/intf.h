@@ -110,9 +110,12 @@ enum mlfq_consts {
 	 * permanently excluded. The runtime bound (mlfq_steal_scan) is
 	 * this value clamped to the CPU count in init(), so the window
 	 * never exceeds the machine size and a small machine does not
-	 * re-peek the same remote DSQs.
+	 * re-peek the same remote DSQs. The static bound also bounds the
+	 * verifier's exploration of the nested steal loops; it must stay
+	 * low enough that mlfq_dispatch() verifies within the kernel's
+	 * jump-sequence limit.
 	 */
-	MLFQ_STEAL_SCAN_MAX		= 256ULL,
+	MLFQ_STEAL_SCAN_MAX		= 64ULL,
 
 	/*
 	 * sched_ext cpuperf level (scx_bpf_cpuperf_set(), the schedutil
