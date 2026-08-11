@@ -192,6 +192,111 @@ static void test_place_charge_replacement(void)
 		"re-placement measures the lag from the advanced clock");
 }
 
+/*
+ * The read-only deadline form must agree with the committed placement on
+ * the same pre-placement state, and must not mutate the task state: the
+ * wakeup-preemption path compares the fresh deadline before any placement
+ * is committed.
+ */
+static void test_place_entity_deadline_pure(void)
+{
+	struct queue_ctx q;
+	struct task_ctx t, before;
+
+	q = make_q(1ULL << 40, 2000000);
+	memset(&t, 0, sizeof(t));
+	t.weight = 100;
+	t.vruntime = 0;
+
+	before = t;
+	mlfq_place_entity_deadline(&q, &t);
+	TEST_OK(t.vruntime == before.vruntime && t.vlag == before.vlag &&
+		t.deadline == before.deadline,
+		"pure deadline does not mutate the task state");
+	TEST_OK(mlfq_place_entity_deadline(&q, &t) ==
+		mlfq_place_entity(&q, &t),
+		"pure deadline equals the committed placement deadline");
+
+	/* FIRST_RUN halves the vslice in both forms. */
+	memset(&t, 0, sizeof(t));
+	t.weight = 100;
+	t.flags = MLFQ_TF_FIRST_RUN;
+	TEST_OK(mlfq_place_entity_deadline(&q, &t) ==
+		mlfq_place_entity(&q, &t),
+		"pure deadline matches the committed placement with FIRST_RUN");
+
+	/* The wrap-to-one deadline handling is shared. */
+	q = make_q(0ULL - 1000000ULL, 1000000);	/* clock one slice before wrap */
+	memset(&t, 0, sizeof(t));
+	t.weight = 100;
+	t.vruntime = q.clock;	/* task exactly at the clock, lag 0 */
+	TEST_OK(mlfq_place_entity_deadline(&q, &t) == 1 &&
+		mlfq_place_entity(&q, &t) == 1,
+		"pure deadline shares the wrap-to-one deadline handling");
+}
+
+static void test_sameq_preempt_owed(void)
+{
+	u64 now = 1000000000;
+
+	/*
+	 * Interactive (Q1 onto Q1): the residency guard alone decides, with
+	 * no deadline comparison.
+	 */
+	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 0, 0, now - 500000, now, 50000),
+		"Q1 wakeup preempts an interactive resident past the guard");
+	TEST_OK(!mlfq_sameq_preempt_owed(1, 1, 0, 0, now - 40000, now, 50000),
+		"Q1 wakeup below the guard does not preempt");
+	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 2000000, 1000000, now - 500000,
+				       now, 50000),
+		"Q1 preempts even with a later wakeup deadline (guard only)");
+	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 0, 0, now - 500000, now, 50000),
+		"Q1 preemption does not depend on the resident deadline");
+
+	/* Q1 with an unknown run start is conservative: blocked past zero. */
+	TEST_OK(!mlfq_sameq_preempt_owed(1, 1, 0, 0, 0, now, 50000),
+		"Q1 with unknown run start is blocked past a zero guard");
+	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 0, 0, 0, now, 0),
+		"Q1 with guard 0 preempts despite the unknown run start");
+
+	/*
+	 * Non-interactive (Q2/Q3) same-queue: the guard gates the deadline
+	 * rule, the conservative EEVDF test.
+	 */
+	TEST_OK(mlfq_sameq_preempt_owed(2, 2, 500000, 1000000, now - 5000000,
+				       now, 0),
+		"Q2 earlier wakeup deadline preempts (guard 0)");
+	TEST_OK(!mlfq_sameq_preempt_owed(2, 2, 1500000, 1000000, now - 5000000,
+					now, 0),
+		"Q2 later wakeup deadline does not preempt (guard 0)");
+	TEST_OK(!mlfq_sameq_preempt_owed(3, 3, 1000000, 1000000, now - 5000000,
+					now, 0),
+		"Q3 equal deadlines do not preempt");
+	TEST_OK(!mlfq_sameq_preempt_owed(2, 2, 500000, 1000000, now - 100000,
+					now, 200000),
+		"Q2 residency below the guard blocks an earlier deadline");
+	TEST_OK(mlfq_sameq_preempt_owed(2, 2, 500000, 1000000, now - 500000,
+				       now, 200000),
+		"Q2 residency above the guard allows an earlier deadline");
+	TEST_OK(!mlfq_sameq_preempt_owed(2, 2, 500000, 0, now - 5000000, now, 0),
+		"Q2 unknown resident deadline never owes");
+	TEST_OK(!mlfq_sameq_preempt_owed(2, 2, 0, 1000000, now - 5000000, now, 0),
+		"Q2 unknown wakeup deadline (failed placement) never owes");
+	TEST_OK(!mlfq_sameq_preempt_owed(3, 3, 500000, 1000000, 0, now, 200000),
+		"Q3 unknown run start cannot prove a non-zero guard");
+
+	/*
+	 * Wrapping: a wakeup deadline just before the u64 epoch boundary
+	 * is earlier than a resident deadline just after it.
+	 */
+	TEST_OK(mlfq_sameq_preempt_owed(2, 2, 0ULL - 100ULL, 1000,
+					now - 5000000, now, 0),
+		"wrapped wakeup deadline is earlier across the epoch");
+	TEST_OK(!mlfq_sameq_preempt_owed(2, 2, 1000, 0ULL - 100ULL,
+					 now - 5000000, now, 0),
+		"wrapped resident deadline is earlier (wakeup later)");
+}
+
 static void test_clock_advance(void)
 {
 	struct queue_ctx q = make_q(1000, 2000000);
@@ -460,6 +565,8 @@ int main(void)
 	test_place_entity();
 	test_place_entity_weight_edges();
 	test_place_charge_replacement();
+	test_place_entity_deadline_pure();
+	test_sameq_preempt_owed();
 	test_clock_advance();
 	test_ema_climb();
 	test_ema_decay();

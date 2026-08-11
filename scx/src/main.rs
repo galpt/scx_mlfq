@@ -39,6 +39,7 @@ use scx_stats::prelude::*;
 use scx_utils::build_id;
 use scx_utils::compat;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
+use scx_utils::pm;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -51,6 +52,16 @@ use config::Config;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mlfq";
+
+/*
+ * PM QoS idle-resume-latency cap in microseconds, applied to
+ * /dev/cpu_dma_latency for the duration of the run. 10 us bans the deep
+ * core and package C-states (18 us and 350 us exits on the target) while
+ * keeping C1 (1 us), so wakeup latency is not dominated by deep-state
+ * exits. An environmental power/latency tradeoff made automatically, not
+ * a user knob.
+ */
+const MLFQ_IDLE_RESUME_LATENCY_US: i32 = 10;
 
 fn full_version() -> String {
     build_id::full_version(env!("CARGO_PKG_VERSION"))
@@ -103,6 +114,14 @@ struct Scheduler<'a> {
     struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
     started_at: std::time::Instant,
+    /*
+     * PM QoS idle-latency constraint on /dev/cpu_dma_latency, held for
+     * the run; closing the file restores the previous constraint. The
+     * field is never read: the file is held for its Drop side effect,
+     * which releases the constraint on every exit path.
+     */
+    #[expect(dead_code)]
+    pm_qos_fd: Option<std::fs::File>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -135,17 +154,31 @@ impl<'a> Scheduler<'a> {
          * migration-disabled tasks, and allow queued-wakeup selection of
          * idle CPUs (the idle-CPU fast path depends on the latter two).
          *
-         * The per-node built-in idle tracking flag is intentionally left
-         * off: with per-node built-in idle tracking enabled, the kernel's
-         * scx_bpf_get_idle_cpumask() and scx_bpf_pick_idle_cpu() error out
-         * of the scheduler (ext_idle.c), and select_cpu.bpf.c calls exactly
-         * those helpers; the per-node variants are never used. Leaving the
-         * flag off keeps the kernel's own NUMA idle optimization active.
+         * The built-in idle tracking is kept (SCX_OPS_KEEP_BUILTIN_IDLE)
+         * and ops.update_idle is registered to maintain the scheduler's
+         * own idle-CPU count, which lets select_cpu() skip its idle scans
+         * when the system is saturated. The flag gates the callback: a
+         * registered update_idle without the flag would disable the
+         * kernel's built-in idle tracking that scx_bpf_pick_idle_cpu()
+         * and scx_bpf_test_and_clear_cpu_idle() rely on, so on kernels
+         * without the flag the callback is left unregistered and the
+         * lean path stays off (mlfq_idle_tracking remains 0).
          */
-        skel.struct_ops.mlfq_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
+        let mut flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
+        if *compat::SCX_OPS_KEEP_BUILTIN_IDLE != 0 {
+            flags |= *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+            skel.maps
+                .rodata_data
+                .as_mut()
+                .expect("rodata missing, the BPF object has no .rodata section")
+                .mlfq_idle_tracking = 1;
+        } else {
+            skel.struct_ops.mlfq_ops_mut().update_idle = std::ptr::null_mut();
+        }
+        skel.struct_ops.mlfq_ops_mut().flags = flags;
 
         /*
          * Error exits capture the per-CPU and per-task state dump into
@@ -173,6 +206,37 @@ impl<'a> Scheduler<'a> {
 
         let struct_ops = scx_ops_attach!(skel, mlfq_ops)?;
 
+        /*
+         * PM QoS: hold a global idle-resume-latency constraint on
+         * /dev/cpu_dma_latency for the duration of the run, so the
+         * cpuidle governor keeps the CPUs in the shallowest idle states
+         * that fit the cap and wakeup latency is not dominated by the
+         * deep C-state exits. Closing the file on exit restores the
+         * previous latency. The capability check and the write are
+         * best-effort: the scheduler must run regardless, and the BPF-side
+         * placement remains the fallback on a system without PM QoS.
+         */
+        let pm_qos_fd = if pm::cpu_idle_resume_latency_supported() {
+            match pm::update_global_idle_resume_latency(MLFQ_IDLE_RESUME_LATENCY_US) {
+                Ok(f) => {
+                    info!(
+                        "PM QoS idle resume latency held at {}us",
+                        MLFQ_IDLE_RESUME_LATENCY_US
+                    );
+                    Some(f)
+                }
+                Err(e) => {
+                    log::warn!("failed to set the PM QoS idle resume latency: {e:#}");
+                    None
+                }
+            }
+        } else {
+            log::warn!(
+                "PM QoS idle resume latency is not supported; the constraint is not applied"
+            );
+            None
+        };
+
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
         Ok(Self {
@@ -180,6 +244,7 @@ impl<'a> Scheduler<'a> {
             struct_ops: Some(struct_ops),
             stats_server,
             started_at: std::time::Instant::now(),
+            pm_qos_fd,
         })
     }
 
@@ -249,6 +314,12 @@ impl<'a> Scheduler<'a> {
 
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
+        /*
+         * Dropping pm_qos_fd closes the /dev/cpu_dma_latency fd, which
+         * makes the kernel drop the PM QoS request and restore the
+         * previous idle-latency constraint; the field drop below does
+         * this on every exit path.
+         */
         info!("Unregister {SCHEDULER_NAME} scheduler");
     }
 }

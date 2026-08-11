@@ -5,11 +5,14 @@
  * Task lifecycle, included by main.bpf.c via #include.
  *
  * init_task/enable initialize the task context; running() records the
- * running task's queue and pid, the wakeup-preemption inputs;
- * stopping() charges vruntime and the EMA gauge for the run segment and
+ * running task's queue, pid, deadline and run start, the
+ * wakeup-preemption inputs; stopping() charges vruntime and the EMA
+ * gauge for the run segment and
  * advances the owning queue's virtual clock with the virtual time just
- * charged; exit_task() deletes the task storage; cpu_release() re-enqueues
- * local-DSQ leftovers when a CPU leaves the scheduler.
+ * charged; update_idle() maintains the scheduler's idle-CPU count and
+ * per-CPU idle timestamps; exit_task() deletes the task storage;
+ * cpu_release() re-enqueues local-DSQ leftovers when a CPU leaves the
+ * scheduler.
  */
 
 static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
@@ -60,24 +63,33 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 	struct task_ctx *tctx;
 	struct mlfq_cpu_state *cpu;
 	s32 cpu_id = bpf_get_smp_processor_id();
+	u64 now;
 
 	tctx = mlfq_lookup_task_ctx(p);
 	if (!tctx)
 		return;
 
 	/*
-	 * Record the running task's queue and pid. The wakeup-preemption
-	 * decision in enqueue() compares a wakeup's queue against the
-	 * queue of the task running on the CPU it was last running on, so
-	 * the record is refreshed on every context switch.
+	 * Record the running task's queue, pid, deadline and run start.
+	 * The wakeup-preemption decision in enqueue() compares a wakeup's
+	 * queue against the queue of the task running on the CPU it was
+	 * last running on, and a same-queue wakeup against the resident's
+	 * deadline and residency, so the record is refreshed on every
+	 * context switch. The deadline is the task's last placement
+	 * deadline, zero for a task that started running without a
+	 * placement (the FIFO local-DSQ paths and the keep path defer
+	 * placement), which the enqueue path treats as unknown.
 	 */
+	now = scx_bpf_now();
 	cpu = mlfq_lookup_cpu_state(cpu_id);
 	if (cpu) {
 		cpu->running_queue = tctx->queue;
 		cpu->running_pid = p->pid;
+		cpu->running_deadline = tctx->deadline;
+		cpu->run_start_at = now;
 	}
 
-	tctx->last_run_at = scx_bpf_now();
+	tctx->last_run_at = now;
 	tctx->flags &= ~MLFQ_TF_FIRST_RUN;
 
 	__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
@@ -168,17 +180,46 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	 * Keep the running-task record while the task remains runnable
 	 * (preempted); clear it when the task goes to sleep so the
 	 * wakeup-preemption decision never compares against a stale
+	 * record. The deadline and run start clear with the rest of the
 	 * record.
 	 */
 	cpu = mlfq_lookup_cpu_state(bpf_get_smp_processor_id());
 	if (cpu && !runnable) {
 		cpu->running_queue = 0;
 		cpu->running_pid = 0;
+		cpu->running_deadline = 0;
+		cpu->run_start_at = 0;
 	}
 
 	/* Diagnostic runnable count; guard against wrap-around. */
 	if (__sync_fetch_and_sub(&mlfq_stats.on_cpu, 1) == 0)
 		__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
+}
+
+/*
+ * Idle-state tracking. The kernel invokes this on every idle transition
+ * of a CPU when the scheduler keeps the kernel's built-in idle tracking
+ * (the KEEP_BUILTIN_IDLE flag); the callback is left unregistered when
+ * the flag is unavailable, and mlfq_idle_tracking gates the consumer.
+ * The count mirrors the number of currently idle CPUs, so the CPU
+ * selection can skip its idle scans entirely when the system is
+ * saturated, which is the common case for a wake-all storm. idle_since
+ * records when the CPU went idle (0 = not idle, or never observed).
+ */
+void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
+{
+	struct mlfq_cpu_state *cpu_state = mlfq_lookup_cpu_state(cpu);
+
+	if (!cpu_state)
+		return;
+
+	if (idle) {
+		cpu_state->idle_since = scx_bpf_now();
+		__sync_fetch_and_add(&mlfq_idle_count, 1);
+	} else {
+		cpu_state->idle_since = 0;
+		__sync_fetch_and_sub(&mlfq_idle_count, 1);
+	}
 }
 
 void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,

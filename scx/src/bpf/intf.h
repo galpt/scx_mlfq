@@ -87,6 +87,30 @@ enum mlfq_consts {
 	MLFQ_AGING_PERIOD_NS		= (1ULL * NSEC_PER_SEC),
 
 	/*
+	 * Minimum residency before a same-queue wakeup may preempt the
+	 * running task, in nsecs. The interactive same-queue rule (Q1 onto
+	 * Q1) preempts on this guard alone; the non-interactive rule
+	 * additionally requires the wakeup's fresh deadline to precede the
+	 * resident's. Zero, the default, makes the interactive rule
+	 * unconditional: a wakeup that just became runnable is served
+	 * ahead of the resident at the next scheduling event. Internal
+	 * tuning constant, not a user-facing knob.
+	 */
+	MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS	= 0ULL,
+
+	/*
+	 * Slice cap for a preempting wakeup, in nsecs. The preempt path
+	 * displaces a running task, so the grant is a bounded burst: the
+	 * displaced task (typically the thread that woke this one, whose
+	 * early deadline puts it first in the virtual-time order) resumes
+	 * at the next scheduling event once the cap expires. The policy
+	 * slice still governs the regular path and the continuation after
+	 * the run-out re-enqueue. Internal tuning constant, not a
+	 * user-facing knob.
+	 */
+	MLFQ_PREEMPT_SLICE_NS		= (150ULL * NSEC_PER_USEC),
+
+	/*
 	 * A sleep longer than this collapses the gauge to (near) zero; the
 	 * wakeup then re-adopts the base mapping. Five EMA half-lives =
 	 * 120 ms.
@@ -221,13 +245,30 @@ struct queue_ctx {
 	u64 pad[6];			/* one queue_ctx per cacheline */
 };
 
-/* Per-CPU state, BPF_MAP_TYPE_ARRAY keyed by cpu. */
+/*
+ * Global idle tracking. mlfq_idle_count is the number of currently idle
+ * CPUs, maintained by ops.update_idle() with atomic RMWs (a single u32;
+ * the only consumer treats it as a zero/non-zero test). mlfq_idle_tracking
+ * is a rodata gate written by the Rust front-end: it is 1 only when the
+ * kernel keeps its built-in idle tracking alongside the callback (the
+ * KEEP_BUILTIN_IDLE flag), 0 otherwise. Declared here so the modules and
+ * the pure-math harness share the same contract.
+ */
+extern volatile u32 mlfq_idle_count;
+extern const volatile u32 mlfq_idle_tracking;
+
+/*
+ * Per-CPU state, BPF_MAP_TYPE_ARRAY keyed by cpu. 56 bytes, one cacheline.
+ */
 struct mlfq_cpu_state {
 	s32 running_queue;		/* queue of the running task, 0 none */
 	u32 running_pid;
 	u32 steal_scan_off;		/* rotating remote-scan start for Q2/Q3 */
 	u64 cpu_ema;			/* busy-ns EMA of this CPU's activity */
 	u64 cpu_ema_at;			/* scx_bpf_now() of the last update */
+	u64 running_deadline;		/* running task's deadline, 0 unknown */
+	u64 run_start_at;		/* scx_bpf_now() at ops.running() */
+	u64 idle_since;			/* scx_bpf_now() at update_idle(true), 0 busy */
 };
 
 /* System-level BPF counters, reported to userspace through the stats module. */
@@ -473,33 +514,23 @@ static __always_inline void mlfq_queue_advance_clock(struct queue_ctx *q,
 }
 
 /**
- * mlfq_place_entity - Place a task on the virtual-time timeline.
+ * mlfq_place_entity_deadline - Compute a placement deadline, read-only.
  * @q: The queue being placed into.
  * @tctx: The task being placed.
  *
- * EEVDF placement against the queue's virtual clock:
+ * The placement formula of mlfq_place_entity() without the commit: the
+ * deadline a placement against @q's virtual clock would produce, computed
+ * from the pre-placement task state. The wakeup-preemption decision uses
+ * it to compare a wakeup's fresh deadline against the resident's before
+ * deciding to preempt; the preempt path inserts into the local DSQ
+ * without placement (the deadline is re-anchored on the next real
+ * placement), so the comparison must not consume the placement.
  *
- *   limit        = calc_delta_fair(max_slice + TICK, weight)
- *   lag          = clamp(clock - vruntime, 0, limit)
- *   vruntime_new = clock - lag       (== clamp(vruntime, clock - limit, clock))
- *   vslice       = calc_delta_fair(slice_q, weight)
- *   if (FIRST_RUN) vslice /= 2
- *   deadline     = vruntime_new + vslice
- *
- * A task that has fallen behind the service point is re-anchored within
- * one lag limit of the clock, the bounded-lag property of fair.c
- * entity_lag(); a task that is ahead of the clock is placed at the
- * clock itself, the fair.c DELAY_ZERO semantics that do not carry
- * leading credit. The stored lag is therefore bounded in [0, limit], and
- * every queued task is eligible by construction, so min-deadline
- * selection over the queue DSQs is EEVDF selection over the queued set.
- *
- * Updates tctx->vruntime, tctx->vlag (>= 0) and tctx->deadline.
- *
- * Return: The placement deadline, also stored in tctx->deadline.
+ * Return: The deadline the placement would commit.
  */
-static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
-					     struct task_ctx *tctx)
+static __always_inline u64
+mlfq_place_entity_deadline(const struct queue_ctx *q,
+			   const struct task_ctx *tctx)
 {
 	u64 w = tctx->weight;
 	u64 limit = mlfq_lag_limit(q, (u32)w);
@@ -533,11 +564,117 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
 	 */
 	if (!deadline)
 		deadline = 1;
+	return deadline;
+}
+
+/**
+ * mlfq_place_entity - Place a task on the virtual-time timeline.
+ * @q: The queue being placed into.
+ * @tctx: The task being placed.
+ *
+ * EEVDF placement against the queue's virtual clock:
+ *
+ *   limit        = calc_delta_fair(max_slice + TICK, weight)
+ *   lag          = clamp(clock - vruntime, 0, limit)
+ *   vruntime_new = clock - lag       (== clamp(vruntime, clock - limit, clock))
+ *   vslice       = calc_delta_fair(slice_q, weight)
+ *   if (FIRST_RUN) vslice /= 2
+ *   deadline     = vruntime_new + vslice
+ *
+ * A task that has fallen behind the service point is re-anchored within
+ * one lag limit of the clock, the bounded-lag property of fair.c
+ * entity_lag(); a task that is ahead of the clock is placed at the
+ * clock itself, the fair.c DELAY_ZERO semantics that do not carry
+ * leading credit. The stored lag is therefore bounded in [0, limit], and
+ * every queued task is eligible by construction, so min-deadline
+ * selection over the queue DSQs is EEVDF selection over the queued set.
+ *
+ * Updates tctx->vruntime, tctx->vlag (>= 0) and tctx->deadline.
+ *
+ * Return: The placement deadline, also stored in tctx->deadline.
+ */
+static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
+					     struct task_ctx *tctx)
+{
+	u64 w = tctx->weight;
+	u64 limit = mlfq_lag_limit(q, (u32)w);
+	u64 clock = q->clock;
+	u64 lag, vruntime_new, deadline;
+
+	/*
+	 * The commit of the mlfq_place_entity_deadline() formula: the
+	 * deadline is computed first from the pre-placement state, then
+	 * the clamped lag and its vruntime are committed.
+	 */
+	deadline = mlfq_place_entity_deadline(q, tctx);
+
+	lag = mlfq_time_before(clock, tctx->vruntime) ? 0 : clock - tctx->vruntime;
+	if (lag > limit)
+		lag = limit;
+	vruntime_new = clock - lag;
+
 	tctx->vruntime = vruntime_new;
 	tctx->vlag = (s64)lag;
 	tctx->deadline = deadline;
 
 	return deadline;
+}
+
+/**
+ * mlfq_sameq_preempt_owed - Same-queue wakeup preemption test.
+ * @qid: Queue of the wakeup (equal to @running_queue at the call site).
+ * @running_queue: Queue of the task running on the wakeup's previous CPU.
+ * @wakee_deadline: Fresh placement deadline of the wakeup, 0 when no
+ *	placement was computed.
+ * @running_deadline: Deadline of the resident, or 0 when the resident has
+ *	no known deadline (started running without a placement).
+ * @run_start_at: scx_bpf_now() at the resident's ops.running(), 0 when
+ *	never recorded.
+ * @now: Current time.
+ * @min_run_ns: Minimum residency before the resident may be displaced.
+ *
+ * Two same-queue rules:
+ *
+ * - Interactive (Q1 onto Q1): the residency guard alone decides.
+ *   Interactive wakeups need immediate service; the virtual-time order
+ *   still governs the queue DSQ ordering, while the preemption is the
+ *   wakeup-latency mechanism. The guard protects the waker's own run
+ *   (the wake-all walk executes in the first tens of microseconds of the
+ *   waker's run) and prevents preemption thrash.
+ * - Non-interactive (Q2/Q3): the guard gates the deadline rule, where a
+ *   dispatch pass over the queue would already have picked the wakeup
+ *   first (an earlier fresh deadline than the resident's). The resident
+ *   must have a known deadline; an unknown wakeup deadline (failed
+ *   placement) never preempts.
+ *
+ * The residency is measured from the resident's ops.running(); an
+ * unknown or future run start cannot prove the guard window, so the
+ * elapsed time falls back to zero (which is conservative only when the
+ * guard is non-zero).
+ *
+ * Return: true when the resident owes the wakeup its CPU.
+ */
+static __always_inline bool mlfq_sameq_preempt_owed(u8 qid, u8 running_queue,
+						    u64 wakee_deadline,
+						    u64 running_deadline,
+						    u64 run_start_at, u64 now,
+						    u64 min_run_ns)
+{
+	u64 run_elapsed = 0;
+
+	if (run_start_at && !mlfq_time_before(now, run_start_at))
+		run_elapsed = now - run_start_at;
+
+	if (mlfq_time_before(run_elapsed, min_run_ns))
+		return false;
+
+	if (qid == 1 && running_queue == 1)
+		return true;
+
+	if (!running_deadline || !wakee_deadline)
+		return false;
+
+	return mlfq_time_before(wakee_deadline, running_deadline);
 }
 
 /**

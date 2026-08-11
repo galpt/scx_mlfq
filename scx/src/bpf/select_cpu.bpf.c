@@ -208,6 +208,23 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
+	 * Saturation fast path: when the scheduler's idle-CPU count is
+	 * zero, no CPU is idle, so the LLC and global idle scans below can
+	 * only fail; they would still cost an idle-scan kfunc each (and a
+	 * per-candidate test-and-clear on the bitmap walk) on the waker's
+	 * own CPU, which multiplies into the wake-all latency on a
+	 * saturated machine. Return prev_cpu directly, the same fallback
+	 * the scans end in; the wakeup then goes through the normal enqueue
+	 * path into prev_cpu's queue DSQ. The count is maintained by
+	 * ops.update_idle() and this path is gated on mlfq_idle_tracking,
+	 * which is set only when the kernel keeps its built-in idle
+	 * tracking alongside the callback; without it, the behavior is
+	 * unchanged.
+	 */
+	if (mlfq_idle_tracking && !mlfq_idle_count)
+		return prev_cpu;
+
+	/*
 	 * Step 2: LLC-aware placement, which keeps the wakeup in the waker's
 	 * cache domain. The waker is the current CPU. For Q1 an
 	 * all-efficiency LLC is skipped entirely so the wakeup can land on

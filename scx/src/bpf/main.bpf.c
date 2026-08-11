@@ -66,6 +66,7 @@ struct {
  */
 volatile u64 nr_cpu_ids;
 volatile u32 mlfq_steal_scan;
+volatile u32 mlfq_idle_count;
 volatile struct mlfq_stats mlfq_stats;
 
 /*
@@ -112,6 +113,8 @@ const volatile u64 mlfq_short_sleep_ns = MLFQ_SHORT_SLEEP_NS;
 const volatile u64 mlfq_short_sleep_rate_limit_ns = MLFQ_SHORT_SLEEP_RATE_LIMIT_NS;
 const volatile u64 mlfq_hysteresis_sleep_ns = MLFQ_HYSTERESIS_SLEEP_NS;
 const volatile u64 mlfq_long_sleep_ns = MLFQ_LONG_SLEEP_NS;
+const volatile u64 mlfq_sameq_preempt_min_run_ns = MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS;
+const volatile u64 mlfq_preempt_slice_ns = MLFQ_PREEMPT_SLICE_NS;
 const volatile u32 mlfq_q1_quota = MLFQ_Q1_QUOTA;
 const volatile u32 mlfq_q2_quota = MLFQ_Q2_QUOTA;
 const volatile u32 mlfq_dispatch_max_batch = MLFQ_DISPATCH_MAX_BATCH;
@@ -133,6 +136,15 @@ const volatile bool mlfq_primary_all = true;
 const volatile u32 mlfq_nr_llcs;
 const volatile u8 mlfq_llc_has_primary[MLFQ_MAX_LLCS];
 const volatile u32 mlfq_cpu_llc[MLFQ_MAX_CPUS];
+
+/*
+ * Gates the saturation fast path in select_cpu() on the idle-CPU count
+ * maintained by ops.update_idle(). Written by the Rust front-end before
+ * load: 1 only when the kernel keeps its built-in idle tracking alongside
+ * the callback (the KEEP_BUILTIN_IDLE flag); 0 on kernels without it, so
+ * the lean path is dead and the behavior is unchanged.
+ */
+const volatile u32 mlfq_idle_tracking = 0;
 
 static struct task_ctx *mlfq_lookup_task_ctx(const struct task_struct *p)
 {
@@ -263,6 +275,7 @@ SCX_OPS_DEFINE(mlfq_ops,
 	       .cpu_release		= (void *)mlfq_cpu_release,
 	       .running			= (void *)mlfq_running,
 	       .stopping		= (void *)mlfq_stopping,
+	       .update_idle		= (void *)mlfq_update_idle,
 	       .enable			= (void *)mlfq_enable,
 	       .init			= (void *)mlfq_init,
 	       .exit			= (void *)mlfq_exit,

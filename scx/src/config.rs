@@ -68,6 +68,15 @@ const HYSTERESIS_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_HYSTERESIS_SL
 /// A sleep longer than this collapses the gauge.
 const LONG_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_LONG_SLEEP_NS as u64;
 
+/// Minimum residency before a same-queue wakeup may preempt the running
+/// task; 0 makes the same-queue preemption a pure deadline comparison.
+const SAMEQ_PREEMPT_MIN_RUN_NS: u64 =
+    crate::bpf_intf::mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS as u64;
+
+/// Slice cap for a preempting wakeup, in nsecs; the displaced task
+/// resumes at the next scheduling event once the cap expires.
+const PREEMPT_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_PREEMPT_SLICE_NS as u64;
+
 /// Dispatch quotas.
 const Q1_QUOTA: u32 = crate::bpf_intf::mlfq_consts_MLFQ_Q1_QUOTA;
 const Q2_QUOTA: u32 = crate::bpf_intf::mlfq_consts_MLFQ_Q2_QUOTA;
@@ -106,6 +115,11 @@ pub struct Config {
     pub hysteresis_sleep_ns: u64,
     /// Sleep beyond which the gauge collapses, nsecs.
     pub long_sleep_ns: u64,
+    /// Minimum residency before a same-queue wakeup may preempt, nsecs.
+    /// Zero makes the same-queue preemption a pure deadline comparison.
+    pub sameq_preempt_min_run_ns: u64,
+    /// Slice cap for a preempting wakeup, nsecs.
+    pub preempt_slice_ns: u64,
     /// Q1 dispatch quota per dispatch() call.
     pub q1_quota: u32,
     /// Q2 dispatch quota per dispatch() call.
@@ -131,6 +145,8 @@ impl Default for Config {
             short_sleep_rate_limit_ns: SHORT_SLEEP_RATE_LIMIT_NS,
             hysteresis_sleep_ns: HYSTERESIS_SLEEP_NS,
             long_sleep_ns: LONG_SLEEP_NS,
+            sameq_preempt_min_run_ns: SAMEQ_PREEMPT_MIN_RUN_NS,
+            preempt_slice_ns: PREEMPT_SLICE_NS,
             q1_quota: Q1_QUOTA,
             q2_quota: Q2_QUOTA,
             dispatch_max_batch: DISPATCH_MAX_BATCH,
@@ -261,6 +277,8 @@ impl Config {
         rodata.mlfq_short_sleep_rate_limit_ns = self.short_sleep_rate_limit_ns;
         rodata.mlfq_hysteresis_sleep_ns = self.hysteresis_sleep_ns;
         rodata.mlfq_long_sleep_ns = self.long_sleep_ns;
+        rodata.mlfq_sameq_preempt_min_run_ns = self.sameq_preempt_min_run_ns;
+        rodata.mlfq_preempt_slice_ns = self.preempt_slice_ns;
         rodata.mlfq_q1_quota = self.q1_quota;
         rodata.mlfq_q2_quota = self.q2_quota;
         rodata.mlfq_dispatch_max_batch = self.dispatch_max_batch;
@@ -273,7 +291,7 @@ impl Config {
             "slices: Q1={}us Q2={}us Q3={}us, T_L={}us, T_H={}us, \
              budget_max={}us, alpha={}, ema_half_life={}us, aging_period={}s, \
              short_sleep={}us, ss_rate_limit={}us, hysteresis_sleep={}us, \
-             long_sleep={}ms, quotas: Q1={} Q2={} max_batch={}",
+             long_sleep={}ms, sameq_min_run={}us, preempt_slice={}us, quotas: Q1={} Q2={} max_batch={}",
             self.q1_slice_ns / NSEC_PER_USEC,
             self.q2_slice_ns / NSEC_PER_USEC,
             self.q3_slice_ns / NSEC_PER_USEC,
@@ -287,6 +305,8 @@ impl Config {
             self.short_sleep_rate_limit_ns / NSEC_PER_USEC,
             self.hysteresis_sleep_ns / NSEC_PER_USEC,
             self.long_sleep_ns / NSEC_PER_MSEC,
+            self.sameq_preempt_min_run_ns / NSEC_PER_USEC,
+            self.preempt_slice_ns / NSEC_PER_USEC,
             self.q1_quota,
             self.q2_quota,
             self.dispatch_max_batch,
@@ -320,6 +340,8 @@ pub struct ConfigBuilder {
     short_sleep_rate_limit_ns: Option<u64>,
     hysteresis_sleep_ns: Option<u64>,
     long_sleep_ns: Option<u64>,
+    sameq_preempt_min_run_ns: Option<u64>,
+    preempt_slice_ns: Option<u64>,
     q1_quota: Option<u32>,
     q2_quota: Option<u32>,
     dispatch_max_batch: Option<u32>,
@@ -410,6 +432,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the same-queue preemption minimum residency in nsecs.
+    pub fn sameq_preempt_min_run_ns(mut self, v: u64) -> Self {
+        self.sameq_preempt_min_run_ns = Some(v);
+        self
+    }
+
+    /// Set the preempting-wakeup slice cap in nsecs.
+    pub fn preempt_slice_ns(mut self, v: u64) -> Self {
+        self.preempt_slice_ns = Some(v);
+        self
+    }
+
     /// Set the Q1 dispatch quota.
     pub fn q1_quota(mut self, v: u32) -> Self {
         self.q1_quota = Some(v);
@@ -452,6 +486,10 @@ impl ConfigBuilder {
                 .hysteresis_sleep_ns
                 .unwrap_or(defaults.hysteresis_sleep_ns),
             long_sleep_ns: self.long_sleep_ns.unwrap_or(defaults.long_sleep_ns),
+            sameq_preempt_min_run_ns: self
+                .sameq_preempt_min_run_ns
+                .unwrap_or(defaults.sameq_preempt_min_run_ns),
+            preempt_slice_ns: self.preempt_slice_ns.unwrap_or(defaults.preempt_slice_ns),
             q1_quota: self.q1_quota.unwrap_or(defaults.q1_quota),
             q2_quota: self.q2_quota.unwrap_or(defaults.q2_quota),
             dispatch_max_batch: self
@@ -480,9 +518,10 @@ mod tests {
             mlfq_consts_MLFQ_AGING_PERIOD_NS, mlfq_consts_MLFQ_ALPHA,
             mlfq_consts_MLFQ_BUDGET_MAX_NS, mlfq_consts_MLFQ_DISPATCH_MAX_BATCH,
             mlfq_consts_MLFQ_EMA_HALF_LIFE_NS, mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS,
-            mlfq_consts_MLFQ_LONG_SLEEP_NS, mlfq_consts_MLFQ_Q1_QUOTA,
-            mlfq_consts_MLFQ_Q1_SLICE_NS, mlfq_consts_MLFQ_Q2_QUOTA, mlfq_consts_MLFQ_Q2_SLICE_NS,
-            mlfq_consts_MLFQ_Q3_SLICE_NS, mlfq_consts_MLFQ_SHORT_SLEEP_NS,
+            mlfq_consts_MLFQ_LONG_SLEEP_NS, mlfq_consts_MLFQ_PREEMPT_SLICE_NS,
+            mlfq_consts_MLFQ_Q1_QUOTA, mlfq_consts_MLFQ_Q1_SLICE_NS, mlfq_consts_MLFQ_Q2_QUOTA,
+            mlfq_consts_MLFQ_Q2_SLICE_NS, mlfq_consts_MLFQ_Q3_SLICE_NS,
+            mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS, mlfq_consts_MLFQ_SHORT_SLEEP_NS,
             mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS, mlfq_consts_MLFQ_T_H_NS,
             mlfq_consts_MLFQ_T_L_NS,
         };
@@ -511,6 +550,14 @@ mod tests {
             mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS as u64
         );
         assert_eq!(cfg.long_sleep_ns, mlfq_consts_MLFQ_LONG_SLEEP_NS as u64);
+        assert_eq!(
+            cfg.sameq_preempt_min_run_ns,
+            mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS as u64
+        );
+        assert_eq!(
+            cfg.preempt_slice_ns,
+            mlfq_consts_MLFQ_PREEMPT_SLICE_NS as u64
+        );
         assert_eq!(cfg.q1_quota, mlfq_consts_MLFQ_Q1_QUOTA);
         assert_eq!(cfg.q2_quota, mlfq_consts_MLFQ_Q2_QUOTA);
         assert_eq!(cfg.dispatch_max_batch, mlfq_consts_MLFQ_DISPATCH_MAX_BATCH);
@@ -530,6 +577,26 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.q1_slice_ns, 500_000);
         assert_eq!(cfg.q2_slice_ns, Config::default().q2_slice_ns);
+    }
+
+    #[test]
+    fn builder_overrides_sameq_min_run() {
+        let cfg = ConfigBuilder::default()
+            .sameq_preempt_min_run_ns(250_000)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.sameq_preempt_min_run_ns, 250_000);
+        assert_eq!(cfg.q1_slice_ns, Config::default().q1_slice_ns);
+    }
+
+    #[test]
+    fn builder_overrides_preempt_slice() {
+        let cfg = ConfigBuilder::default()
+            .preempt_slice_ns(100_000)
+            .build()
+            .unwrap();
+        assert_eq!(cfg.preempt_slice_ns, 100_000);
+        assert_eq!(cfg.q1_slice_ns, Config::default().q1_slice_ns);
     }
 
     #[test]

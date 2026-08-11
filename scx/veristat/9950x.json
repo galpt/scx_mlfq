@@ -27,6 +27,10 @@
                 },{
                     "mlfq_long_sleep_ns": 120000000
                 },{
+                    "mlfq_sameq_preempt_min_run_ns": 0
+                },{
+                    "mlfq_preempt_slice_ns": 150000
+                },{
                     "mlfq_q1_quota": 4
                 },{
                     "mlfq_q2_quota": 8
@@ -36,6 +40,8 @@
                     "mlfq_primary_all": true
                 },{
                     "mlfq_nr_llcs": 0
+                },{
+                    "mlfq_idle_tracking": 1
                 },{
                     "__SCX_ENQ_WAKEUP": 1
                 },{
