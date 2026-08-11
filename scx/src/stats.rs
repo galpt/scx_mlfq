@@ -74,6 +74,30 @@ pub struct Metrics {
     pub enq_pinned_busy: u64,
     #[stat(desc = "Pinned enqueues to the global DSQ")]
     pub enq_pinned_global: u64,
+    #[stat(desc = "MLFQ tree inference walks run")]
+    pub tree_inference: u64,
+    #[stat(desc = "Classifications served by the EMA fallback while untrained")]
+    pub tree_fallback: u64,
+    #[stat(desc = "Tree queue mappings that disagree with the base EMA mapping")]
+    pub tree_disagree: u64,
+    #[stat(desc = "Training samples emitted to the daemon")]
+    pub tree_samples_emitted: u64,
+    #[stat(desc = "Training samples dropped (ring buffer full)")]
+    pub tree_samples_dropped: u64,
+    #[stat(desc = "Training samples dropped by the per-pid window cap")]
+    pub tree_samples_cap_dropped: u64,
+    #[stat(desc = "Committed tree model generation, 0 while untrained")]
+    pub tree_model_generation: u64,
+    #[stat(desc = "Training samples behind the committed tree model")]
+    pub tree_model_samples: u64,
+    #[stat(desc = "Nodes of the committed tree model")]
+    pub tree_model_nodes: u64,
+    #[stat(
+        desc = "Committed tree MAE in microseconds on the held-out slice of its training window"
+    )]
+    pub tree_mae_tree_us: u64,
+    #[stat(desc = "Exact EMA-baseline MAE in microseconds on the same held-out slice")]
+    pub tree_mae_ema_us: u64,
 }
 
 impl Metrics {
@@ -98,11 +122,29 @@ impl Metrics {
             self.preemption_kicks,
             self.cpuperf_boosts,
         )?;
+        writeln!(
+            w,
+            "[{}] tree: gen={} nodes={} samples={} mae_tree={}us mae_ema={}us \
+             inf={} fallback={} disagree={} emitted={} dropped={} cap_dropped={}",
+            crate::SCHEDULER_NAME,
+            self.tree_model_generation,
+            self.tree_model_nodes,
+            self.tree_model_samples,
+            self.tree_mae_tree_us,
+            self.tree_mae_ema_us,
+            self.tree_inference,
+            self.tree_fallback,
+            self.tree_disagree,
+            self.tree_samples_emitted,
+            self.tree_samples_dropped,
+            self.tree_samples_cap_dropped,
+        )?;
         Ok(())
     }
 
     /// Interval delta: counters are wrapping deltas over the poll interval;
-    /// gauges (`on_cpu`, `uptime_ns`) pass through as instantaneous values.
+    /// gauges (`on_cpu`, `uptime_ns`, the tree model metadata) pass through
+    /// as instantaneous values.
     pub fn delta(&self, rhs: &Self) -> Self {
         Self {
             on_cpu: self.on_cpu,
@@ -127,6 +169,24 @@ impl Metrics {
             enq_pinned_idle: self.enq_pinned_idle.wrapping_sub(rhs.enq_pinned_idle),
             enq_pinned_busy: self.enq_pinned_busy.wrapping_sub(rhs.enq_pinned_busy),
             enq_pinned_global: self.enq_pinned_global.wrapping_sub(rhs.enq_pinned_global),
+            tree_inference: self.tree_inference.wrapping_sub(rhs.tree_inference),
+            tree_fallback: self.tree_fallback.wrapping_sub(rhs.tree_fallback),
+            tree_disagree: self.tree_disagree.wrapping_sub(rhs.tree_disagree),
+            tree_samples_emitted: self
+                .tree_samples_emitted
+                .wrapping_sub(rhs.tree_samples_emitted),
+            tree_samples_dropped: self
+                .tree_samples_dropped
+                .wrapping_sub(rhs.tree_samples_dropped),
+            tree_samples_cap_dropped: self
+                .tree_samples_cap_dropped
+                .wrapping_sub(rhs.tree_samples_cap_dropped),
+            /* Model metadata is a gauge: the currently committed model. */
+            tree_model_generation: self.tree_model_generation,
+            tree_model_samples: self.tree_model_samples,
+            tree_model_nodes: self.tree_model_nodes,
+            tree_mae_tree_us: self.tree_mae_tree_us,
+            tree_mae_ema_us: self.tree_mae_ema_us,
         }
     }
 }

@@ -70,6 +70,45 @@ volatile u32 mlfq_idle_count;
 volatile struct mlfq_stats mlfq_stats;
 
 /*
+ * Published MLFQ regression tree, double-buffered in a two-entry array
+ * map (the type is declared in intf.h). The daemon writes the inactive
+ * entry, then flips the meta (mlfq_tree_ctrl.meta) last; the BPF side
+ * looks up the active entry once per inference.
+ */
+struct mlfq_tree_map mlfq_tree_map SEC(".maps");
+
+/*
+ * Published-tree control state (meta + sample limiter), committed by the
+ * Rust front-end (the type is declared in intf.h). bss defaults zeroed,
+ * which is the untrained state (trained bit clear): the prediction path
+ * falls back to the EMA until the first tree is committed. The line is
+ * read by the inference and the emission hot paths but written only by
+ * the publish and the sample-window winner, so it must not share a line
+ * with the write-hammered mlfq_stats counters: the
+ * __attribute__((aligned(64))) on this instance pins it to a dedicated
+ * 64-byte cache line, and the declaration order (after mlfq_stats, which
+ * is padded to a 64-byte multiple) keeps the aligned placement adjacent
+ * to it.
+ */
+volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
+
+/*
+ * Training-sample ring buffer. The stopping path emits one completed
+ * sample per rate-limit window (mlfq_tree_ctrl.sample_last_at); the
+ * userspace daemon drains it every 100 ms for the regression-tree
+ * training. 1 MB holds a bit over 21k samples of 48 bytes, which covers
+ * more than ten seconds of emission at the global rate limit and absorbs
+ * a multi-second daemon stall; drop-on-full is the natural backpressure
+ * when the daemon cannot keep up, and the emission rate limits keep the
+ * steady-state rate at one sample per MLFQ_TREE_SAMPLE_RATE_LIMIT_NS
+ * globally and one per MLFQ_TREE_PER_TASK_LIMIT_NS per task.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 * 1024 * 1024);
+} mlfq_samples SEC(".maps");
+
+/*
  * Placement bitmaps (see select_cpu.bpf.c).
  *
  * mlfq_primary_bitmap[0] holds the primary (big-core) CPU set;

@@ -171,7 +171,78 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		if (q)
 			mlfq_queue_advance_clock(q, tctx->vruntime);
 		__sync_fetch_and_add(&mlfq_stats.total_runtime, delta);
+
+		tctx->prev_burst_ns = delta;
+
+		/*
+		 * Emit the pending training sample: the features and the
+		 * queue were captured at the classification enqueue and
+		 * the label is this run segment, so the tuple is
+		 * consistent by construction (the queue is emitted from
+		 * the capture snapshot, pending_queue, not from the
+		 * current queue, which later placement decisions such as
+		 * aging may have changed). The label is clamped to
+		 * MLFQ_TREE_LABEL_MAX_NS: the prediction only needs the
+		 * queue band, and the clamp bounds the exact-integer
+		 * range the daemon's f64 SSE sees. The emission is rate
+		 * limited by the compare-and-swap single-winner pattern
+		 * (as in mlfq_queue_advance_clock) against the global
+		 * limiter, and gated per task by the last_sample_at
+		 * spacing: only the winner of the swap emits, and a lost
+		 * swap or a closed rate-limit window simply skips the
+		 * sample, which is a sampling throttle rather than a
+		 * correctness constraint. The sample is emitted only on
+		 * this blocking path, never on the wakeup path.
+		 */
+		if (tctx->pending_valid) {
+			struct mlfq_tree_sample *m;
+			u64 last = mlfq_tree_ctrl.sample_last_at;
+
+			if ((!last ||
+			     mlfq_time_before(last + MLFQ_TREE_SAMPLE_RATE_LIMIT_NS, now)) &&
+			    (!tctx->last_sample_at ||
+			     mlfq_time_before(tctx->last_sample_at +
+					      MLFQ_TREE_PER_TASK_LIMIT_NS, now)) &&
+			    __sync_val_compare_and_swap(&mlfq_tree_ctrl.sample_last_at,
+							last, now) == last) {
+				m = bpf_ringbuf_reserve(&mlfq_samples,
+							sizeof(*m), 0);
+				if (!m) {
+					__sync_fetch_and_add(&mlfq_stats.tree_samples_dropped,
+							     1);
+				} else {
+					m->pid = p->pid;
+					m->queue = tctx->pending_queue;
+					m->feats = tctx->pending_feats;
+					m->label_ns = delta < MLFQ_TREE_LABEL_MAX_NS ?
+						       delta : MLFQ_TREE_LABEL_MAX_NS;
+					bpf_ringbuf_submit(m, 0);
+					__sync_fetch_and_add(&mlfq_stats.tree_samples_emitted,
+							     1);
+					/*
+					 * The per-task budget is consumed
+					 * only by a successful emission: a
+					 * dropped sample (ring buffer full)
+					 * must not hold the task out of
+					 * the next window, so the spacing
+					 * tracks admitted samples, not
+					 * attempts. The global CAS window
+					 * is consumed by the winner
+					 * regardless.
+					 */
+					tctx->last_sample_at = now;
+				}
+			}
+		}
 	}
+
+	/*
+	 * A pending sample without a run segment can never be completed:
+	 * a zero-length run carries no label. Drop the capture so a later
+	 * classification re-arms the pending block instead of emitting a
+	 * stale feature vector with a mismatched label.
+	 */
+	tctx->pending_valid = 0;
 
 	if (!runnable)
 		tctx->last_sleep_at = now;

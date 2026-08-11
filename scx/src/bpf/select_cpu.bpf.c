@@ -120,7 +120,10 @@ mlfq_pick_idle_primary(const struct task_struct *p,
  * selection. The CPU selection must treat a wakeup that is about to be
  * promoted as interactive already, so the primary-core preference
  * applies to it from the start. SCHED_IDLE tasks are excluded, the
- * classification pins them to Q3.
+ * classification pins them to Q3. The MLFQ tree is not walked here --
+ * its classification also runs in ops.enqueue(), after the CPU
+ * selection -- so the boost mirror above is the only pre-classification
+ * interactivity signal.
  *
  * Return: true if the wakeup is or will become interactive.
  */

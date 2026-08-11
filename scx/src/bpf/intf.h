@@ -188,6 +188,46 @@ enum mlfq_consts {
 	 * Number of 64-bit words needed to hold one CPU bit per CPU.
 	 */
 	MLFQ_BITMAP_WORDS		= (MLFQ_MAX_CPUS + 63) / 64,
+
+	/*
+	 * MLFQ regression-tree constants. The tree predicts the next CPU
+	 * burst from per-task features and maps the prediction to a queue
+	 * band (pred < T_INT -> Q1, pred < T_BOUND -> Q2, else Q3); the
+	 * EMA gauge stays on as a tree feature and as the untrained
+	 * fallback. Internal tuning constants, not user-facing knobs.
+	 */
+	MLFQ_TREE_MAX_NODES		= 2048,		/* node budget, power of two */
+	MLFQ_TREE_MAX_DEPTH		= 12,		/* walk depth bound */
+	MLFQ_TREE_T_INT_NS		= (1ULL * NSEC_PER_MSEC), /* Q1/Q2 split */
+	MLFQ_TREE_T_BOUND_NS		= (3ULL * NSEC_PER_MSEC), /* Q2/Q3 split */
+
+	/*
+	 * Global training-sample emission limiter: at most one sample per
+	 * 500 us across the whole system (the compare-and-swap single-winner
+	 * pattern in the stopping path). The per-task spacing is the
+	 * separate MLFQ_TREE_PER_TASK_LIMIT_NS gate on the same emission.
+	 */
+	MLFQ_TREE_SAMPLE_RATE_LIMIT_NS	= (500ULL * NSEC_PER_USEC),
+
+	/*
+	 * Per-task training-sample spacing: a task can emit at most one
+	 * sample per 10 ms, so no single pid can dominate the training
+	 * window. At the global 2k/s rate one task's share of the window is
+	 * bounded to ~5%, which stops a chatty task from over-fitting the
+	 * tree to its own behavior.
+	 */
+	MLFQ_TREE_PER_TASK_LIMIT_NS	= (10ULL * NSEC_PER_MSEC),
+
+	/*
+	 * Emitted label clamp. The prediction only needs the queue band
+	 * (the walk maps the predicted burst to Q1/Q2/Q3), so labels beyond
+	 * 64x the Q2/Q3 split bound carry no scheduling information; the
+	 * clamp bounds the exact-integer range the f64 SSE in the fitter
+	 * sees, so the training math never sums near-u64 values.
+	 */
+	MLFQ_TREE_LABEL_MAX_NS		= (MLFQ_TREE_T_BOUND_NS * 64),
+
+	MLFQ_TREE_MIN_SAMPLES		= 2048,		/* training set size */
 };
 
 /* task_ctx flags */
@@ -196,10 +236,121 @@ enum mlfq_task_flags {
 };
 
 /*
+ * MLFQ regression tree. The tree predicts the next CPU burst in nsecs
+ * from the per-task feature vector. The userspace daemon trains a CART
+ * model on emitted samples and publishes it through the double-buffered
+ * two-entry map below; the classification path walks the active entry.
+ * The node format and the walk are shared with the Rust front-end and
+ * the native unit-test harness, so field order and sizes below are part
+ * of the scheduler's ABI.
+ */
+
+/*
+ * Feature vector of the prediction tree, one value per split feature.
+ * 32 bytes. Field order is part of the shared ABI: emitted samples
+ * (mlfq_tree_sample) and the Rust-side TreeFeats use the same layout.
+ */
+struct mlfq_tree_feats {
+	u64 prev_burst_ns;		/* last completed run segment */
+	u64 sleep_ns;			/* sleep before the current wakeup */
+	u64 ema;			/* EMA interactivity gauge */
+	u32 io_wait;			/* 1 if the wakeup is an I/O completion */
+	u32 wake_cnt;			/* consecutive short-sleep wakeups */
+};
+
+/*
+ * One node of the serialized tree. threshold is the split point in
+ * nsecs; left is the left child index, or the leaf prediction in nsecs
+ * when right == 0; right is the right child index, 0 marking a leaf;
+ * feature is the split feature id (0..4, indexing the walk's feat[]
+ * slots). 24 bytes.
+ */
+struct mlfq_tree_node {
+	u64 threshold;
+	u32 left;
+	u32 right;
+	u8  feature;
+	u8  pad[7];
+};
+
+/*
+ * One buffer of the double-buffered published tree, and the value type
+ * of the two-entry mlfq_tree_map: entry 0 and entry 1 form the double
+ * buffer. The daemon fills the inactive entry and flips to it with a
+ * single meta write (mlfq_tree_ctrl.meta), so a reader that has loaded
+ * the meta once walks a consistent tree and never observes a torn
+ * publish: the meta commit is the last write of a publish, and the tree
+ * contents it points at were fully written before it.
+ *
+ * The protocol is sound at the 60 s publish cadence: a reader could
+ * only observe a torn tree if two publishes completed within one tree
+ * walk, and each walk is a few dozen memory reads while a publish moves
+ * up to 2048 nodes, so two consecutive publishes cannot complete inside
+ * one walk. The consequence of the theoretical race (a reader that
+ * loaded the meta between two back-to-back publishes and walks the
+ * freshly overwritten buffer) is one mispredicted burst, which the
+ * queue-band nets absorb -- it is not a memory-safety issue because the
+ * walk masks every index to the buffer bound. 49152 bytes.
+ */
+struct mlfq_tree_store {
+	struct mlfq_tree_node nodes[MLFQ_TREE_MAX_NODES];
+};
+
+#define MLFQ_TREE_META_TRAINED			(1ULL << 0)
+#define MLFQ_TREE_META_ACTIVE			(1ULL << 1)
+#define MLFQ_TREE_META_NR_NODES_SHIFT		8
+#define MLFQ_TREE_META_NR_NODES_MASK		0xFFFFFF00ULL
+#define MLFQ_TREE_META_GENERATION_SHIFT		32
+#define MLFQ_TREE_META_GENERATION_MASK		0xFFFFFFFF00000000ULL
+
+/*
+ * Published-tree control state, one dedicated cache line (64 bytes, the
+ * instance in main.bpf.c is aligned to 64).
+ *
+ * The tree meta is read by every inference and the sample limiter by
+ * every pending-sample emission check, but the pair is written only by
+ * the publish (once per 60 s cadence) and the single compare-and-swap
+ * winner of each sample window, so the line must not share a cache line
+ * with the write-hammered mlfq_stats counters. Keeping the pair alone on
+ * a line prevents every counter update from dirtying the line the
+ * classification hot path reads.
+ *
+ * bss defaults zeroed, which is exactly the untrained state (trained bit
+ * clear). The meta bit layout is the same as the former combined store:
+ *   bit 0   trained (set once a tree has been published)
+ *   bit 1   active buffer index (0 or 1)
+ *   bits 8..31  number of nodes in the active tree
+ *   bits 32..63 generation counter, bumped on every publish
+ *   bits 2..7 reserved, zero
+ */
+struct mlfq_tree_ctrl {
+	u64 meta;		/* committed-tree meta, see MLFQ_TREE_META_* */
+	u64 sample_last_at;	/* scx_bpf_now() of the last sample emission */
+	u64 pad[6];		/* one dedicated cache line */
+};
+
+extern volatile struct mlfq_tree_ctrl mlfq_tree_ctrl;
+
+/*
+ * One training sample emitted by the scheduler and consumed by the
+ * daemon. pid and queue identify the emitter, feats is the feature
+ * vector at classification time and label_ns the run segment that
+ * followed. 48 bytes; field order is shared with the Rust front-end.
+ */
+struct mlfq_tree_sample {
+	u32 pid;
+	u32 queue;
+	struct mlfq_tree_feats feats;
+	u64 label_ns;
+};
+
+/*
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the owning queue's virtual-time clock and is
  * re-anchored to the queue's clock at every placement. The struct is
- * 80 bytes.
+ * 144 bytes: the 96-byte classification/vtime block below plus the
+ * 48-byte MLFQ tree sample block (pending_feats + pending_queue rounded
+ * to a u64 for pending_valid).
  */
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
@@ -217,6 +368,21 @@ struct task_ctx {
 	u8  flags;			/* MLFQ_TF_* */
 	u8  wake_cpu_state;		/* bit0 idle, bit1 valid */
 	u8  pad[4];
+	u64 prev_burst_ns;		/* last completed run segment, tree feature */
+	u64 last_sample_at;		/* scx_bpf_now() of the last emitted
+					 * training sample, per-task rate limit */
+	/*
+	 * Pending MLFQ tree sample: the feature vector and the queue are
+	 * captured at the classification enqueue, and the sample is
+	 * completed with the run segment (the label) and emitted at the
+	 * segment end in ops.stopping(). pending_queue is the queue at the
+	 * capture, so the emitted sample is not mislabeled by later
+	 * placement decisions (aging, a subsequent classification).
+	 * pending_valid is 1 between capture and emission.
+	 */
+	struct mlfq_tree_feats pending_feats;
+	u32 pending_queue;		/* queue at the capture */
+	u64 pending_valid;
 };
 
 /* wake_cpu_state bits */
@@ -296,6 +462,24 @@ struct mlfq_stats {
 	u64 enq_pinned_idle;
 	u64 enq_pinned_busy;
 	u64 enq_pinned_global;
+	/* MLFQ tree diagnostics: prediction and sample bookkeeping. */
+	u64 tree_inference;		/* prediction walks run */
+	u64 tree_fallback;		/* predictions served by the EMA fallback */
+	u64 tree_disagree;		/* tree and EMA queue mappings disagreed */
+	u64 tree_samples_emitted;	/* completed samples emitted to the daemon */
+	u64 tree_samples_dropped;	/* samples dropped (ring buffer full) */
+	/*
+	 * Pad the counter struct to a 64-byte multiple: the tail counters
+	 * are write-hammered by every classification, and the published
+	 * tree meta line (mlfq_tree_ctrl) must not share a line with
+	 * them. The isolation itself comes from the
+	 * __attribute__((aligned(64))) on the mlfq_tree_ctrl instance in
+	 * main.bpf.c, which pins that line to a dedicated cache line; the
+	 * padding here is the size hygiene that lets the aligned instance
+	 * sit on the following boundary by the plain declaration order,
+	 * so the two never land on the same line by layout accident.
+	 */
+	u64 pad[6];
 };
 
 /*
@@ -810,31 +994,41 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * mlfq_demote_on_reenq - Slice-exhaustion demotion state machine.
  * @tctx: The task.
  * @t_h: CPU-bound threshold.
+ * @pred: The tree's predicted next burst (0 while untrained).
  *
  * Called on run-out re-enqueues (ops.enqueue() with flags == 0, the
  * do_enqueue_task(rq, p, 0, -1) slice-exhaustion path). Consecutive
  * slice exhaustions accumulate in reenq_cnt, which gates the band
  * crossings.
  *
+ * The CPU-bound test switches on the predictor: with a trained tree the
+ * predicted burst itself gates the demotion (a prediction at or above
+ * the Q2/Q3 band bound is CPU-bound), and the EMA gauge test is the
+ * untrained fallback. The gate is the plain EMA-gauge test while
+ * untrained.
+ *
  * Demotion requires a sustained run without sleeping: eight consecutive
  * exhaustions (about 8 ms at the interactive slice) must accumulate
- * while the gauge is above the CPU-bound threshold. A task that sleeps
- * between bursts is re-boosted at its wakeup, which resets reenq_cnt,
- * so a bursty consumer of CPU such as a video decoder keeps its queue
- * for the whole burst. An impostor that never sleeps accumulates the
- * counter and is demoted after the same sustained window.
+ * while the task is CPU-bound. A task that sleeps between bursts is
+ * re-boosted at its wakeup, which resets reenq_cnt, so a bursty
+ * consumer of CPU such as a video decoder keeps its queue for the whole
+ * burst. An impostor that never sleeps accumulates the counter and is
+ * demoted after the same sustained window.
  *
  * Return: true if the task was demoted.
  */
 static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
-						 u64 t_h)
+						 u64 t_h, u64 pred)
 {
 	bool demoted = false;
+	bool cpu_bound;
 
 	tctx->reenq_cnt++;
 
+	cpu_bound = pred ? pred >= MLFQ_TREE_T_BOUND_NS : tctx->ema > t_h;
+
 	if ((tctx->queue == 1 || tctx->queue == 2) &&
-	    tctx->ema > t_h && tctx->reenq_cnt >= 8) {
+	    cpu_bound && tctx->reenq_cnt >= 8) {
 		tctx->queue++;
 		demoted = true;
 	}
@@ -884,6 +1078,156 @@ static __always_inline bool mlfq_check_queued_vlag(s64 vlag)
 {
 	return vlag >= 0;
 }
+
+static __always_inline bool mlfq_check_tree_node_index(u32 idx)
+{
+	return idx < MLFQ_TREE_MAX_NODES;
+}
+
+static __always_inline bool mlfq_check_tree_feature(u8 feature)
+{
+	/* Only the five populated feat[] slots may be split on. */
+	return (feature & 0x7) < 5;
+}
 #endif /* MLFQ_CHECK */
+
+/**
+ * mlfq_tree_walk - Walk a tree buffer and predict the next CPU burst.
+ * @store: The tree buffer (one entry of mlfq_tree_map).
+ * @f: The feature vector.
+ *
+ * The descent is a compile-time bound of MLFQ_TREE_MAX_DEPTH steps.
+ * Every index is masked to the node budget (MLFQ_TREE_MAX_NODES - 1),
+ * so a corrupted tree can never address outside the buffer: an
+ * out-of-range feature id reads a zeroed feat[] slot, and a walk past
+ * the tree tail lands on a zeroed node, which is a leaf predicting 0.
+ * A leaf is a node with right == 0 and carries its prediction in left.
+ * A tree deeper than the bound is cut: the walk returns the last
+ * reachable node's left, and only when that node is a leaf -- a
+ * deeper-than-the-bound internal node returns 0 instead of leaking a
+ * child index as a prediction.
+ *
+ * The feat[] array lays out the five feature slots in order followed by
+ * three zero slots, so a split feature id above 4 reads zero and routes
+ * to the left of any non-zero threshold.
+ *
+ * Return: The predicted burst in nsecs.
+ */
+static __always_inline u64
+mlfq_tree_walk(const struct mlfq_tree_store *store,
+	       const struct mlfq_tree_feats *f)
+{
+	u64 feat[8] = { f->prev_burst_ns, f->sleep_ns, f->ema,
+			f->io_wait, f->wake_cnt, 0, 0, 0 };
+	u32 idx = 0, nidx;
+	const struct mlfq_tree_node *n;
+	u8 feature;
+	int i;
+
+	for (i = 0; i < MLFQ_TREE_MAX_DEPTH; i++) {
+		nidx = idx & (MLFQ_TREE_MAX_NODES - 1);
+		n = &store->nodes[nidx];
+#if MLFQ_CHECK
+		if (!mlfq_check_tree_node_index(nidx))
+			return 0;
+#endif
+		if (n->right == 0)
+			return n->left;
+
+		feature = n->feature & 0x7;
+#if MLFQ_CHECK
+		if (!mlfq_check_tree_feature(feature))
+			return 0;
+#endif
+		idx = feat[feature] <= n->threshold ? n->left : n->right;
+	}
+
+	/*
+	 * Depth exhausted: the last reachable node is returned as a leaf
+	 * only when it really is one. An internal node here means the
+	 * tree is deeper than the walk bound; returning its left would
+	 * leak a child index as a prediction, so a non-leaf yields 0.
+	 */
+	nidx = idx & (MLFQ_TREE_MAX_NODES - 1);
+	n = &store->nodes[nidx];
+#if MLFQ_CHECK
+	if (!mlfq_check_tree_node_index(nidx))
+		return 0;
+#endif
+	return n->right == 0 ? n->left : 0;
+}
+
+/**
+ * mlfq_tree_map_queue - Promotion-only queue mapping of a prediction.
+ * @pred: The predicted next burst, 0 while untrained.
+ * @cur: The task's current queue (1..3).
+ *
+ * The wakeup path is promotion-only: a Q1-band prediction raises the
+ * queue to 1, a Q2-band prediction raises a Q3 task to 2, and a
+ * Q3-band or untrained prediction leaves the queue unchanged. Demotions
+ * are the run-out gate's job (mlfq_demote_on_reenq), so a single wakeup
+ * prediction can never demote a task and bypass the exhaustion
+ * hysteresis -- the classic MLFQ asymmetry where the wakeup only
+ * promotes and the run-out only demotes.
+ *
+ * Return: The new queue.
+ */
+static __always_inline u8 mlfq_tree_map_queue(u64 pred, u8 cur)
+{
+	/* 0 is the untrained sentinel: it never moves the queue. */
+	if (pred && pred < MLFQ_TREE_T_INT_NS)
+		return 1;
+	if (pred && pred < MLFQ_TREE_T_BOUND_NS && cur > 2)
+		return 2;
+	return cur;
+}
+
+#ifdef __VMLINUX_H__
+/*
+ * The published tree as a two-entry array map, defined in main.bpf.c.
+ * The type and the extern are declared here so the BPF wrapper can look
+ * up the active entry; both are skipped outside the BPF build, where
+ * the native harness has no map machinery.
+ */
+struct mlfq_tree_map {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, u32);
+	__type(value, struct mlfq_tree_store);
+};
+
+extern struct mlfq_tree_map mlfq_tree_map;
+
+/**
+ * mlfq_tree_predict - Predict the next CPU burst from a feature vector.
+ * @f: The feature vector.
+ *
+ * The BPF entry point. Reads mlfq_tree_ctrl.meta exactly once: the
+ * trained bit gates the inference and the active bit selects the buffer
+ * entry of mlfq_tree_map, so a reader sees either the tree before a
+ * publish or the fully committed tree after it, never a partially
+ * written one (the daemon writes the inactive entry first and commits
+ * the meta last).
+ *
+ * Return: The predicted burst in nsecs; 0 while untrained or on a
+ * failed map lookup.
+ */
+static __always_inline u64 mlfq_tree_predict(const struct mlfq_tree_feats *f)
+{
+	u64 meta = mlfq_tree_ctrl.meta;
+	struct mlfq_tree_store *store;
+	u32 key;
+
+	if (!(meta & MLFQ_TREE_META_TRAINED))
+		return 0;
+
+	key = (meta & MLFQ_TREE_META_ACTIVE) ? 1 : 0;
+	store = bpf_map_lookup_elem(&mlfq_tree_map, &key);
+	if (!store)
+		return 0;
+
+	return mlfq_tree_walk(store, f);
+}
+#endif /* __VMLINUX_H__ */
 
 #endif /* __SCX_MLFQ_INTF_H */

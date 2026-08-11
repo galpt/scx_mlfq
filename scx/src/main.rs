@@ -19,9 +19,14 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod config;
+mod mlfq_tree;
 mod stats;
 mod topology;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::mem::size_of;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -34,6 +39,7 @@ use clap::Parser;
 use clap_complete::generate;
 use clap_complete::Shell;
 use crossbeam::channel::RecvTimeoutError;
+use libbpf_rs::MapCore;
 use log::info;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
@@ -49,9 +55,48 @@ use scx_utils::uei_report;
 use scx_utils::UserExitInfo;
 
 use config::Config;
+use mlfq_tree::TreeSample;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mlfq";
+
+/* MLFQ tree daemon tuning, from src/bpf/intf.h. */
+const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NODES as usize;
+const MLFQ_TREE_MAX_DEPTH: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_DEPTH as usize;
+const MLFQ_TREE_MIN_SAMPLES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MIN_SAMPLES as usize;
+
+/*
+ * Training-window cap, in samples. Eight retrain generations at the
+ * 2048-sample minimum; a sliding window keeps the model pinned to the
+ * recent workload instead of a lifetime aggregate. Daemon-side tuning
+ * constant, not a user knob.
+ */
+const MLFQ_TREE_WINDOW_MAX: usize = 16384;
+
+/*
+ * Per-pid share cap of the training window. The BPF-side emission budget
+ * is per task (MLFQ_TREE_PER_TASK_LIMIT_NS), so a process with enough
+ * threads can still fill the whole window with its own samples and
+ * over-fit the tree to its own behavior; the daemon therefore caps each
+ * pid at ~5% of the window (MLFQ_TREE_WINDOW_MAX / 20), drops the excess
+ * at ingest and counts the drops separately. Daemon-side security
+ * constant, not a user knob.
+ */
+const MLFQ_TREE_PER_PID_CAP: u32 = (MLFQ_TREE_WINDOW_MAX / 20) as u32;
+
+/*
+ * Minimum number of distinct pids the fit slice must contain before a
+ * model may be published: a tree fit on samples from a handful of pids
+ * would over-fit those tasks' behavior. A rejected model keeps the
+ * previous one committed, and the retrain cadence already prevents a
+ * rejection from turning into a per-sample retrain storm. Daemon-side
+ * constant, not a user knob.
+ */
+const MLFQ_TREE_MIN_PIDS: usize = 8;
+
+/* CART growth caps for the daemon's training runs. */
+const MLFQ_TREE_MIN_LEAF: usize = 32;
+const MLFQ_TREE_RETRAIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /*
  * PM QoS idle-resume-latency cap in microseconds, applied to
@@ -107,8 +152,30 @@ struct Opts {
     libbpf: LibbpfOpts,
 }
 
-/// Scheduler facade: owns the loaded skeleton, the struct_ops link and the
-/// stats server; drives the run loop until shutdown or UEI exit.
+/// Metadata of the committed MLFQ tree model, reported to the stats
+/// server and the exit log. Defaults describe the untrained state.
+#[derive(Clone, Copy, Debug, Default)]
+struct ModelMeta {
+    /// Monotonic publish generation; 0 while untrained.
+    generation: u64,
+    /// Training samples behind the committed model (the fit slice).
+    nr_samples: usize,
+    /// Nodes of the committed tree.
+    nr_nodes: usize,
+    /// MAE of the tree on the held-out slice of its training window, in
+    /// microseconds.
+    mae_tree_us: u64,
+    /// MAE of the per-sample EMA baseline on the same held-out slice, in
+    /// microseconds.
+    mae_ema_us: u64,
+    /// Pearson correlation of the tree predictions and the labels on the
+    /// held-out slice.
+    corr: f64,
+}
+
+/// Scheduler facade: owns the loaded skeleton, the struct_ops link, the
+/// stats server and the MLFQ tree daemon state; drives the run loop
+/// until shutdown or UEI exit.
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -122,6 +189,28 @@ struct Scheduler<'a> {
      */
     #[expect(dead_code)]
     pm_qos_fd: Option<std::fs::File>,
+    /*
+     * MLFQ tree daemon state: the sample ring buffer, the parsed-sample
+     * channel the ring-buffer callback fills, the sliding training
+     * window, the retrain cadence, the committed-model metadata and the
+     * training worker channels (the fit runs off the main loop; the
+     * publish stays on it).
+     */
+    rb_mgr: libbpf_rs::RingBuffer<'static>,
+    sample_rx: crossbeam::channel::Receiver<TreeSample>,
+    window: VecDeque<TreeSample>,
+    /*
+     * Per-pid accounting of the training window: the counts track the
+     * admitted samples of each pid so no single task can own more than
+     * MLFQ_TREE_PER_PID_CAP of the window, and the drop counter records
+     * the samples the cap rejected at ingest.
+     */
+    pid_counts: HashMap<u32, u32>,
+    tree_samples_cap_dropped: u64,
+    last_train_at: Option<std::time::Instant>,
+    train_tx: crossbeam::channel::Sender<Vec<TreeSample>>,
+    train_rx: crossbeam::channel::Receiver<Result<TrainResult, anyhow::Error>>,
+    model: ModelMeta,
 }
 
 impl<'a> Scheduler<'a> {
@@ -239,12 +328,58 @@ impl<'a> Scheduler<'a> {
 
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
+        /*
+         * The training-sample ring buffer: the callback parses each
+         * record as the mlfq_tree_sample mirror and forwards it into a
+         * bounded channel the run loop drains. try_send drops the sample
+         * when the channel is full, which the ring-buffer backpressure
+         * absorbs first. TreeSample is a repr(C) POD mirroring the
+         * 48-byte BPF record, so the parse is a plain byte
+         * reinterpretation.
+         */
+        let (sample_tx, sample_rx) = crossbeam::channel::bounded(4096);
+        let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
+        rb_builder.add(&skel.maps.mlfq_samples, move |data| {
+            if data.len() < size_of::<TreeSample>() {
+                return 0;
+            }
+            // SAFETY: TreeSample is a repr(C) mirror of the 48-byte
+            // mlfq_tree_sample the stopping path submits; reading the
+            // record as the struct is a plain byte reinterpretation of
+            // integer fields.
+            let s = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<TreeSample>()) };
+            let _ = sample_tx.try_send(s);
+            0
+        })?;
+        let rb_mgr = rb_builder.build()?;
+
+        /*
+         * The training worker: the fit and the metrics computation run on
+         * a dedicated thread so a retrain never stalls the main loop's
+         * stats and drain cadence. The main loop hands over a snapshot
+         * of the window (the window is only mutated by the ingest on the
+         * main thread, so a snapshot is race-free by construction) and
+         * the worker sends the result back over a channel. try_send drops
+         * a kick when the previous fit is still in flight, which the 60 s
+         * cadence makes rare.
+         */
+        let (train_tx, train_rx) = spawn_train_worker();
+
         Ok(Self {
             skel,
             struct_ops: Some(struct_ops),
             stats_server,
             started_at: std::time::Instant::now(),
             pm_qos_fd,
+            rb_mgr,
+            sample_rx,
+            window: VecDeque::new(),
+            pid_counts: HashMap::new(),
+            tree_samples_cap_dropped: 0,
+            last_train_at: None,
+            train_tx,
+            train_rx,
+            model: ModelMeta::default(),
         })
     }
 
@@ -279,6 +414,17 @@ impl<'a> Scheduler<'a> {
             enq_pinned_idle: s.enq_pinned_idle,
             enq_pinned_busy: s.enq_pinned_busy,
             enq_pinned_global: s.enq_pinned_global,
+            tree_inference: s.tree_inference,
+            tree_fallback: s.tree_fallback,
+            tree_disagree: s.tree_disagree,
+            tree_samples_emitted: s.tree_samples_emitted,
+            tree_samples_dropped: s.tree_samples_dropped,
+            tree_samples_cap_dropped: self.tree_samples_cap_dropped,
+            tree_model_generation: self.model.generation,
+            tree_model_nodes: self.model.nr_nodes as u64,
+            tree_model_samples: self.model.nr_samples as u64,
+            tree_mae_tree_us: self.model.mae_tree_us,
+            tree_mae_ema_us: self.model.mae_ema_us,
         }
     }
 
@@ -290,25 +436,233 @@ impl<'a> Scheduler<'a> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            match req_ch.recv_timeout(Duration::from_millis(250)) {
+            /*
+             * Drain the training-sample ring buffer (the callback
+             * forwards the parsed records into the sample channel) and
+             * fold them into the training window before serving the
+             * next stats request.
+             */
+            self.rb_mgr.consume()?;
+            while let Ok(s) = self.sample_rx.try_recv() {
+                self.ingest_sample(s);
+            }
+            self.poll_train_results();
+
+            match req_ch.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(e) => Err(e)?,
             }
         }
 
+        /* One final drain so the exit report sees the latest samples. */
+        self.rb_mgr.consume()?;
+        while let Ok(s) = self.sample_rx.try_recv() {
+            self.ingest_sample(s);
+        }
+        self.poll_train_results();
+
         let m = self.get_metrics();
         log::info!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={}",
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
             m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
             m.enq_no_deadline, m.promotions, m.demotions, m.aging_boosts,
             m.short_sleep_boosts, m.cpuperf_boosts, m.preemption_kicks,
-            m.total_runtime, m.on_cpu, m.steals, m.keep_running
+            m.total_runtime, m.on_cpu, m.steals, m.keep_running,
+            m.tree_model_generation, m.tree_model_nodes, m.tree_model_samples,
+            m.tree_mae_tree_us, m.tree_mae_ema_us, self.model.corr,
+            m.tree_inference, m.tree_fallback, m.tree_disagree,
+            m.tree_samples_emitted, m.tree_samples_dropped,
+            m.tree_samples_cap_dropped
         );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
+    }
+
+    /// Fold one emitted sample into the sliding training window and
+    /// kick a retrain on the cadence: on the first window that reaches
+    /// the minimum training size, then every MLFQ_TREE_RETRAIN_INTERVAL.
+    ///
+    /// The window admits at most MLFQ_TREE_PER_PID_CAP samples per pid
+    /// (SEC-F1): a pid that already holds its share is dropped here and
+    /// counted in tree_samples_cap_dropped. The cap check runs before
+    /// the window accounting, so a rejected sample never disturbs the
+    /// per-pid counts, and the eviction bookkeeping below decrements the
+    /// pid of the sample the window actually pops.
+    fn ingest_sample(&mut self, s: TreeSample) {
+        if !tree_admit_pid(&mut self.pid_counts, s.pid) {
+            self.tree_samples_cap_dropped += 1;
+            return;
+        }
+        if self.window.len() == MLFQ_TREE_WINDOW_MAX {
+            let evicted = self
+                .window
+                .pop_front()
+                .expect("a full window pops the oldest sample");
+            tree_evict_pid(&mut self.pid_counts, evicted.pid);
+        }
+        self.window.push_back(s);
+
+        let due = match self.last_train_at {
+            None => self.window.len() >= MLFQ_TREE_MIN_SAMPLES,
+            Some(t) => {
+                t.elapsed() >= MLFQ_TREE_RETRAIN_INTERVAL
+                    && self.window.len() >= MLFQ_TREE_MIN_SAMPLES
+            }
+        };
+        if due {
+            self.kick_training();
+        }
+    }
+
+    /// Hand a snapshot of the window to the training worker.
+    ///
+    /// The retrain cadence counts every kick, so a rejected model cannot
+    /// turn into a per-sample retrain storm. try_send drops the kick when
+    /// the worker is still busy with the previous fit, which the 60 s
+    /// cadence makes rare.
+    fn kick_training(&mut self) {
+        self.last_train_at = Some(std::time::Instant::now());
+        let snapshot: Vec<TreeSample> = self.window.iter().copied().collect();
+        if self.train_tx.try_send(snapshot).is_err() {
+            log::warn!("MLFQ tree training already in flight, skipping this retrain");
+        }
+    }
+
+    /// Collect the finished fits from the training worker and apply the
+    /// publish quality gate to each.
+    fn poll_train_results(&mut self) {
+        while let Ok(res) = self.train_rx.try_recv() {
+            match res {
+                Ok(r) => self.apply_train_result(r),
+                Err(e) => {
+                    log::warn!("MLFQ tree training failed, keeping the previous model: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// Commit a finished fit when it passes validation and the publish
+    /// quality gate; otherwise keep the previous model.
+    ///
+    /// The gate and the meta computation are pure functions in
+    /// mlfq_tree (mlfq_tree::should_publish, mlfq_tree::tree_meta), which
+    /// the unit tests cover.
+    fn apply_train_result(&mut self, res: TrainResult) {
+        if let Err(e) = mlfq_tree::serialize_validate(&res.tree) {
+            log::warn!("MLFQ tree training failed validation, keeping the previous model: {e}");
+            return;
+        }
+
+        let gen = self.model.generation + 1;
+        /*
+         * A tree fit on the behavior of a handful of tasks would
+         * over-fit them, so the publish requires at least
+         * MLFQ_TREE_MIN_PIDS distinct pids in the fit slice; a rejected
+         * model keeps the previous one committed, and the retrain
+         * cadence prevents a rejection from becoming a retrain storm.
+         */
+        if res.nr_pids_train < MLFQ_TREE_MIN_PIDS {
+            log::info!(
+                "MLFQ tree gen {} rejected: fit slice has only {} distinct pids (< {} required), keeping the previous model",
+                gen, res.nr_pids_train, MLFQ_TREE_MIN_PIDS
+            );
+            return;
+        }
+        if !mlfq_tree::should_publish(res.mae_tree, res.mae_ema) {
+            log::info!(
+                "MLFQ tree gen {} rejected: holdout MAE_tree={:.1}us > MAE_ema={:.1}us, keeping the previous model",
+                gen, res.mae_tree / 1e3, res.mae_ema / 1e3
+            );
+            return;
+        }
+
+        if let Err(e) = self.publish_tree(&res.tree, gen) {
+            log::warn!("MLFQ tree publish failed, keeping the previous model: {e:#}");
+            return;
+        }
+
+        self.model = ModelMeta {
+            generation: gen,
+            nr_samples: res.nr_train,
+            nr_nodes: res.tree.nodes.len(),
+            mae_tree_us: (res.mae_tree / 1e3).round() as u64,
+            mae_ema_us: (res.mae_ema / 1e3).round() as u64,
+            corr: res.corr,
+        };
+        info!(
+            "MLFQ tree model gen {}, nodes {}, fit {} samples (holdout {}), MAE_tree={}us MAE_ema={}us corr={:.3}",
+            gen,
+            res.tree.nodes.len(),
+            res.nr_train,
+            res.holdout_len,
+            self.model.mae_tree_us,
+            self.model.mae_ema_us,
+            self.model.corr
+        );
+    }
+
+    /// Publish a validated tree into the inactive map entry and commit
+    /// the meta last.
+    ///
+    /// The full map value is written (live nodes at the front, zeroed
+    /// tail), so a shrinking tree never leaves stale nodes behind the
+    /// new node count. A release fence orders the map-value write before
+    /// the meta write, which flips the active entry, bumps the
+    /// generation and sets the trained bit: a BPF reader that loaded the
+    /// meta once sees either the old tree or the fully committed new
+    /// one, never a partially written one.
+    ///
+    /// The protocol is sound at the 60 s publish cadence: a reader could
+    /// only observe a torn tree if two publishes completed within one
+    /// tree walk, and each walk is a few dozen memory reads while a
+    /// publish moves up to 2048 nodes, so two consecutive publishes
+    /// cannot complete inside one walk. The consequence of the
+    /// theoretical race is one mispredicted burst, which the queue-band
+    /// nets absorb; the walk masks every index to the buffer bound, so
+    /// it is never a memory-safety issue.
+    fn publish_tree(&mut self, tree: &mlfq_tree::SerializedTree, gen: u64) -> Result<()> {
+        let old_meta = {
+            let bss = self
+                .skel
+                .maps
+                .bss_data
+                .as_ref()
+                .expect("bss_data missing, the BPF object has no .bss section");
+            bss.mlfq_tree_ctrl.meta
+        };
+        let old_active = (old_meta >> 1) & 1;
+        let new_active = 1 - old_active;
+        let key = (new_active as u32).to_ne_bytes();
+
+        let node_bytes = unsafe {
+            std::slice::from_raw_parts(
+                tree.nodes.as_ptr().cast::<u8>(),
+                tree.nodes.len() * size_of::<mlfq_tree::TreeNode>(),
+            )
+        };
+        let mut buf = vec![0u8; size_of::<mlfq_tree_store>()];
+        buf[..node_bytes.len()].copy_from_slice(node_bytes);
+        self.skel
+            .maps
+            .mlfq_tree_map
+            .update(&key, &buf, libbpf_rs::MapFlags::ANY)?;
+
+        // Order the map-value write before the meta commit.
+        std::sync::atomic::fence(Ordering::Release);
+
+        {
+            let bss = self
+                .skel
+                .maps
+                .bss_data
+                .as_mut()
+                .expect("bss_data missing, the BPF object has no .bss section");
+            bss.mlfq_tree_ctrl.meta = mlfq_tree::tree_meta(gen, tree.nodes.len(), new_active);
+        }
+        Ok(())
     }
 }
 
@@ -322,6 +676,155 @@ impl Drop for Scheduler<'_> {
          */
         info!("Unregister {SCHEDULER_NAME} scheduler");
     }
+}
+
+/// Result of one training run, handed back from the worker thread. The
+/// metrics are computed on the held-out slice so the publish gate and
+/// the reported numbers describe out-of-sample error.
+struct TrainResult {
+    tree: mlfq_tree::SerializedTree,
+    /// Samples the tree was fit on.
+    nr_train: usize,
+    /// Distinct pids in the fit slice, the SEC-F2 concentration input.
+    nr_pids_train: usize,
+    /// Samples of the held-out evaluation slice.
+    holdout_len: usize,
+    /// Tree MAE on the holdout, in nsecs.
+    mae_tree: f64,
+    /// Exact per-sample EMA-baseline MAE on the holdout, in nsecs.
+    mae_ema: f64,
+    /// Pearson correlation of tree predictions and labels on the holdout.
+    corr: f64,
+}
+
+/// Split the window into the fit slice (first 90%) and the held-out
+/// evaluation slice (last 10%). The daemon only trains once the window
+/// holds MLFQ_TREE_MIN_SAMPLES samples, so the holdout is never empty in
+/// production; a window too small for a meaningful 90/10 split (< 20
+/// samples) is an error, which the caller treats as a skipped training
+/// round (log + keep the previous model) instead of silently training
+/// and evaluating on the same slice.
+fn split_holdout(samples: &[TreeSample]) -> Result<(&[TreeSample], &[TreeSample]), String> {
+    if samples.len() >= 20 {
+        let cut = samples.len() - samples.len() / 10;
+        Ok(samples.split_at(cut))
+    } else {
+        Err(format!(
+            "training window holds only {} samples; {} are needed for a 90/10 holdout split",
+            samples.len(),
+            20
+        ))
+    }
+}
+
+/// Admit one sample of `pid` into the window under the per-pid cap
+/// (SEC-F1). Returns true when the sample is admitted and the pid's
+/// count is incremented, false when the pid already holds its
+/// MLFQ_TREE_PER_PID_CAP share and the caller must drop the sample.
+/// Entries are pruned on eviction, not here: a pid at the cap keeps its
+/// entry until the window ages its samples out.
+fn tree_admit_pid(counts: &mut HashMap<u32, u32>, pid: u32) -> bool {
+    let c = counts.entry(pid).or_insert(0);
+    if *c >= MLFQ_TREE_PER_PID_CAP {
+        return false;
+    }
+    *c += 1;
+    true
+}
+
+/// Remove one sample of `pid` from the per-pid accounting when the
+/// window evicts its oldest sample, pruning the entry when the count
+/// reaches zero so the map cannot grow with retired pids.
+fn tree_evict_pid(counts: &mut HashMap<u32, u32>, pid: u32) {
+    if let Some(c) = counts.get_mut(&pid) {
+        *c -= 1;
+        if *c == 0 {
+            counts.remove(&pid);
+        }
+    }
+}
+
+/// Number of distinct pids in a slice, the SEC-F2 concentration input.
+fn tree_distinct_pids(samples: &[TreeSample]) -> usize {
+    let mut seen = HashSet::new();
+    for s in samples {
+        seen.insert(s.pid);
+    }
+    seen.len()
+}
+
+/// Fit a tree and compute the holdout metrics, on the training worker.
+///
+/// The tree is fit on the first 90% of the window and evaluated on the
+/// last 10%, so the reported MAE and the publish gate describe
+/// out-of-sample error. The EMA baseline is exact: each sample's
+/// prediction is the captured gauge `feats.ema` (the post-decay gauge at
+/// the capture, as emitted by the BPF side), so
+/// `mae_ema = mean(|feats.ema - label|)` on the same holdout slice and
+/// the tree comparison is honest.
+fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
+    let (train, holdout) = split_holdout(samples)?;
+
+    let tree = mlfq_tree::fit(
+        train,
+        MLFQ_TREE_MAX_DEPTH,
+        MLFQ_TREE_MIN_LEAF,
+        MLFQ_TREE_MAX_NODES,
+        mlfq_tree::DEFAULT_MIN_REL_VAR_REDUCTION,
+    );
+    mlfq_tree::serialize_validate(&tree).map_err(|e| {
+        // A tree that fails the walk invariants must never be
+        // published; the previous model stays committed.
+        format!("tree failed validation: {e}")
+    })?;
+
+    let actuals: Vec<u64> = holdout.iter().map(|s| s.label_ns).collect();
+    let preds: Vec<u64> = holdout
+        .iter()
+        .map(|s| mlfq_tree::predict(&tree, &s.feats))
+        .collect();
+    let mae_tree = mlfq_tree::mae(&preds, &actuals);
+    let mae_ema = holdout
+        .iter()
+        .map(|s| s.feats.ema.abs_diff(s.label_ns) as u128)
+        .sum::<u128>() as f64
+        / holdout.len() as f64;
+    let corr = mlfq_tree::pearson(&preds, &actuals);
+
+    Ok(TrainResult {
+        tree,
+        nr_train: train.len(),
+        nr_pids_train: tree_distinct_pids(train),
+        holdout_len: holdout.len(),
+        mae_tree,
+        mae_ema,
+        corr,
+    })
+}
+
+/// Spawn the training worker and return its job and result channels.
+///
+/// The worker owns no scheduler state: it receives a snapshot of the
+/// window (the window is only mutated by the ingest on the main thread,
+/// so handing a snapshot is race-free by construction), fits the tree
+/// and computes the holdout metrics, and sends the result back. The
+/// publish stays on the main thread. Dropping the job sender closes the
+/// channel and the worker exits on its next `recv()`.
+fn spawn_train_worker() -> (
+    crossbeam::channel::Sender<Vec<TreeSample>>,
+    crossbeam::channel::Receiver<Result<TrainResult, anyhow::Error>>,
+) {
+    let (job_tx, job_rx) = crossbeam::channel::bounded::<Vec<TreeSample>>(1);
+    let (res_tx, res_rx) = crossbeam::channel::bounded::<Result<TrainResult, anyhow::Error>>(1);
+    std::thread::spawn(move || {
+        while let Ok(samples) = job_rx.recv() {
+            let res = train_model(&samples).map_err(anyhow::Error::msg);
+            if res_tx.send(res).is_err() {
+                break;
+            }
+        }
+    });
+    (job_tx, res_rx)
 }
 
 fn main() -> Result<()> {
@@ -466,5 +969,84 @@ mod math_test {
             stdout.contains("All tests passed"),
             "native harness did not report success"
         );
+    }
+
+    /// Minimal test sample; pid and label are the only fields the
+    /// daemon-side pure helpers inspect.
+    fn mk_sample(pid: u32, label_ns: u64) -> crate::mlfq_tree::TreeSample {
+        crate::mlfq_tree::TreeSample {
+            pid,
+            queue: 1,
+            feats: crate::mlfq_tree::TreeFeats::default(),
+            label_ns,
+        }
+    }
+
+    #[test]
+    fn split_holdout_cut_and_rejection() {
+        let samples: Vec<_> = (0..100).map(|i| mk_sample(i as u32, i as u64)).collect();
+
+        // The 90/10 cut: 100 samples split into 90 + 10.
+        let (train, holdout) = crate::split_holdout(&samples).unwrap();
+        assert_eq!(train.len(), 90);
+        assert_eq!(holdout.len(), 10);
+        assert_eq!(train[0].label_ns, 0);
+        assert_eq!(holdout[0].label_ns, 90);
+
+        // The 20-sample minimum splits 18 + 2.
+        let (train, holdout) = crate::split_holdout(&samples[..20]).unwrap();
+        assert_eq!(train.len(), 18);
+        assert_eq!(holdout.len(), 2);
+
+        // A window below the minimum is an error (a skipped training
+        // round), not a degenerate same-slice train/holdout fallback.
+        assert!(crate::split_holdout(&samples[..19]).is_err());
+        assert!(crate::split_holdout(&[]).is_err());
+    }
+
+    #[test]
+    fn pid_count_cap_evict_and_prune() {
+        let mut counts = std::collections::HashMap::new();
+
+        // The cap admits MLFQ_TREE_PER_PID_CAP samples of one pid...
+        for _ in 0..crate::MLFQ_TREE_PER_PID_CAP {
+            assert!(crate::tree_admit_pid(&mut counts, 7));
+        }
+        // ...and rejects the next one, which the caller counts separately.
+        assert!(!crate::tree_admit_pid(&mut counts, 7));
+        // Other pids are unaffected by pid 7's cap.
+        assert!(crate::tree_admit_pid(&mut counts, 8));
+
+        // Evicting one pid 7 sample opens the slot again.
+        crate::tree_evict_pid(&mut counts, 7);
+        assert!(crate::tree_admit_pid(&mut counts, 7));
+
+        // Evicting the remaining pid 7 samples prunes the entry, so the
+        // map cannot grow with retired pids.
+        for _ in 0..crate::MLFQ_TREE_PER_PID_CAP {
+            crate::tree_evict_pid(&mut counts, 7);
+        }
+        assert!(!counts.contains_key(&7));
+        assert_eq!(counts.get(&8), Some(&1));
+    }
+
+    #[test]
+    fn distinct_pids_concentration_gate() {
+        assert_eq!(crate::tree_distinct_pids(&[]), 0);
+        assert_eq!(
+            crate::tree_distinct_pids(&[mk_sample(1, 0), mk_sample(1, 1), mk_sample(2, 2)]),
+            2
+        );
+
+        // The publish gate requires MLFQ_TREE_MIN_PIDS distinct pids in
+        // the fit slice; one fewer is rejected, the minimum passes.
+        let few: Vec<_> = (0..crate::MLFQ_TREE_MIN_PIDS - 1)
+            .map(|i| mk_sample(i as u32, i as u64))
+            .collect();
+        assert!(crate::tree_distinct_pids(&few) < crate::MLFQ_TREE_MIN_PIDS);
+        let enough: Vec<_> = (0..crate::MLFQ_TREE_MIN_PIDS)
+            .map(|i| mk_sample(i as u32, i as u64))
+            .collect();
+        assert!(crate::tree_distinct_pids(&enough) >= crate::MLFQ_TREE_MIN_PIDS);
     }
 }

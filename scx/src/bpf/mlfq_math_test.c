@@ -12,6 +12,7 @@
 #define MLFQ_CHECK 1
 #include "intf.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -394,38 +395,77 @@ static void test_promote_hysteresis(void)
 		"ema above T_H/2 blocks Q3->Q2 despite two short sleeps");
 }
 
+/*
+ * The demotion gate switches on the predictor: pred == 0 is the
+ * untrained fallback (the plain EMA-gauge test), and a
+ * trained prediction gates the CPU-bound test on the band bound
+ * instead, with the consecutive-exhaustion and queue <= 2 gates shared.
+ */
 static void test_demote_hysteresis(void)
 {
 	struct task_ctx t = { .queue = 1, .ema = 500000 };
 
-	mlfq_demote_on_reenq(&t, 2000000);
+	mlfq_demote_on_reenq(&t, 2000000, 0);
 	TEST_OK(t.reenq_cnt == 1 && t.queue == 1,
-		"single run-out with ema > T_L does not demote Q1->Q2");
-	mlfq_demote_on_reenq(&t, 2000000);
+		"untrained: single run-out with ema > T_L does not demote Q1->Q2");
+	mlfq_demote_on_reenq(&t, 2000000, 0);
 	TEST_OK(t.reenq_cnt == 2 && t.queue == 1,
-		"two run-outs with ema below T_H do not demote Q1->Q2");
+		"untrained: two run-outs with ema below T_H do not demote Q1->Q2");
 
 	t.queue = 1;
 	t.ema = 3000000;	/* > T_H */
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000);
+		mlfq_demote_on_reenq(&t, 2000000, 0);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
-		"seven run-outs with ema > T_H do not demote Q1->Q2");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000) &&
+		"untrained: seven run-outs with ema > T_H do not demote Q1->Q2");
+	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, 0) &&
 		t.queue == 2 && t.reenq_cnt == 0,
-		"eight run-outs demote Q1->Q2 and reset reenq_cnt");
+		"untrained: eight run-outs demote Q1->Q2 and reset reenq_cnt");
 
 	t.queue = 2;
 	t.ema = 3000000;	/* > T_H */
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000);
+		mlfq_demote_on_reenq(&t, 2000000, 0);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 2,
-		"seven run-outs with ema > T_H do not demote Q2->Q3");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000) &&
+		"untrained: seven run-outs with ema > T_H do not demote Q2->Q3");
+	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, 0) &&
 		t.queue == 3 && t.reenq_cnt == 0,
-		"eight run-outs demote Q2->Q3 and reset reenq_cnt");
+		"untrained: eight run-outs demote Q2->Q3 and reset reenq_cnt");
+
+	/*
+	 * Trained path: the prediction gates the CPU-bound test, so a
+	 * low prediction never demotes regardless of the gauge, and a
+	 * Q3-bound prediction demotes on the same exhaustion count.
+	 */
+	t.queue = 1;
+	t.ema = 3000000;	/* > T_H, but pred is the gate now */
+	t.reenq_cnt = 0;
+	for (int i = 0; i < 8; i++)
+		mlfq_demote_on_reenq(&t, 2000000, 1000000);	/* < T_BOUND */
+	TEST_OK(t.queue == 1 && t.reenq_cnt == 8,
+		"trained: a sub-band prediction never demotes, even with ema > T_H");
+
+	t.queue = 1;
+	t.ema = 0;		/* gauge idle, pred is the gate now */
+	t.reenq_cnt = 0;
+	for (int i = 0; i < 7; i++)
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS);
+	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
+		"trained: seven Q3-bound predictions do not demote Q1->Q2");
+	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS) &&
+		t.queue == 2 && t.reenq_cnt == 0,
+		"trained: eight Q3-bound predictions demote Q1->Q2");
+
+	/* Q3 (queue 3) is never demoted by the exhaustion gate. */
+	t.queue = 3;
+	t.ema = 3000000;
+	t.reenq_cnt = 0;
+	for (int i = 0; i < 8; i++)
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS);
+	TEST_OK(t.queue == 3,
+		"trained: Q3 is never demoted by the exhaustion gate");
 }
 
 static void test_mlfq_check_predicates(void)
@@ -559,6 +599,284 @@ static void test_boost_eligible(void)
 		"sleep exactly at the window is eligible");
 }
 
+/* --- MLFQ regression tree -------------------------------------------- */
+
+static void tree_store_reset(struct mlfq_tree_store *store)
+{
+	memset(store, 0, sizeof(*store));
+}
+
+static void tree_node(struct mlfq_tree_store *store, u32 idx, u8 feature,
+		      u64 threshold, u32 left, u32 right)
+{
+	struct mlfq_tree_node n = {
+		.threshold = threshold,
+		.left = left,
+		.right = right,
+		.feature = feature,
+	};
+
+	store->nodes[idx] = n;
+}
+
+static void test_mlfq_tree_layout(void)
+{
+	TEST_OK(sizeof(struct mlfq_tree_feats) == 32,
+		"tree feats is 32 bytes");
+	TEST_OK(sizeof(struct mlfq_tree_node) == 24,
+		"tree node is 24 bytes");
+	TEST_OK(sizeof(struct mlfq_tree_sample) == 48,
+		"tree sample is 48 bytes");
+	TEST_OK(offsetof(struct mlfq_tree_sample, pid) == 0 &&
+		offsetof(struct mlfq_tree_sample, queue) == 4 &&
+		offsetof(struct mlfq_tree_sample, feats) == 8 &&
+		offsetof(struct mlfq_tree_sample, label_ns) == 40,
+		"tree sample offsets match the shared ABI");
+	TEST_OK(offsetof(struct mlfq_tree_node, threshold) == 0 &&
+		offsetof(struct mlfq_tree_node, left) == 8 &&
+		offsetof(struct mlfq_tree_node, right) == 12 &&
+		offsetof(struct mlfq_tree_node, feature) == 16 &&
+		offsetof(struct mlfq_tree_node, pad) == 17,
+		"tree node offsets match the shared ABI, pad at 17");
+	TEST_OK(sizeof(struct mlfq_tree_store) ==
+		MLFQ_TREE_MAX_NODES * sizeof(struct mlfq_tree_node),
+		"tree store is one 2048-node buffer (the map value type)");
+	TEST_OK(sizeof(struct task_ctx) == 144,
+		"task_ctx grows to 144 bytes with the per-task limiter and the pending queue snapshot");
+	TEST_OK(sizeof(struct mlfq_tree_ctrl) == 64 &&
+		offsetof(struct mlfq_tree_ctrl, meta) == 0 &&
+		offsetof(struct mlfq_tree_ctrl, sample_last_at) == 8,
+		"tree ctrl state is one dedicated 64-byte cache line");
+	TEST_OK(sizeof(struct mlfq_stats) % 64 == 0 &&
+		sizeof(struct mlfq_stats) == 256,
+		"mlfq_stats is padded to a 64-byte multiple (256 bytes)");
+	TEST_OK(MLFQ_TREE_PER_TASK_LIMIT_NS == 10ULL * NSEC_PER_MSEC,
+		"per-task sample limit is 10ms");
+	TEST_OK(MLFQ_TREE_LABEL_MAX_NS == MLFQ_TREE_T_BOUND_NS * 64,
+		"label clamp is 64x the Q2/Q3 split bound (192ms)");
+}
+
+static void test_tree_meta_layout(void)
+{
+	u64 meta = MLFQ_TREE_META_TRAINED | MLFQ_TREE_META_ACTIVE |
+		   ((u64)MLFQ_TREE_MAX_NODES << MLFQ_TREE_META_NR_NODES_SHIFT) |
+		   (3ULL << MLFQ_TREE_META_GENERATION_SHIFT);
+
+	TEST_OK(MLFQ_TREE_META_TRAINED == 1 && MLFQ_TREE_META_ACTIVE == 2,
+		"trained and active are meta bits 0 and 1");
+	TEST_OK((meta & MLFQ_TREE_META_TRAINED) &&
+		(meta & MLFQ_TREE_META_ACTIVE),
+		"trained and active bits are set");
+	TEST_OK(((meta & MLFQ_TREE_META_NR_NODES_MASK) >>
+		 MLFQ_TREE_META_NR_NODES_SHIFT) == MLFQ_TREE_MAX_NODES,
+		"nr_nodes decodes from meta bits 8..31");
+	TEST_OK((meta >> MLFQ_TREE_META_GENERATION_SHIFT) == 3,
+		"generation decodes from meta bits 32..63");
+	TEST_OK(!(MLFQ_TREE_META_NR_NODES_MASK & MLFQ_TREE_META_GENERATION_MASK) &&
+		!(MLFQ_TREE_META_NR_NODES_MASK &
+		  (MLFQ_TREE_META_TRAINED | MLFQ_TREE_META_ACTIVE)),
+		"meta bit fields do not overlap");
+}
+
+/*
+ * The walk is exercised directly on a local store, the buffer the BPF
+ * wrapper would look up. The wrapper itself (mlfq_tree_predict) needs
+ * the BPF map machinery and is not available here: its untrained gate
+ * is a pure meta check (trained bit clear -> 0, verified above at the
+ * bit level) and its NULL-store path guards a failed map lookup, both
+ * exercised at the BPF side.
+ */
+static void test_tree_predict_walk(void)
+{
+	struct mlfq_tree_store store;
+	struct mlfq_tree_feats f = { .prev_burst_ns = 0, .sleep_ns = 0,
+				     .ema = 0, .io_wait = 0, .wake_cnt = 0 };
+
+	/* Leaf at the root: the stored prediction is returned directly. */
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0, 0, 123456, 0);
+	TEST_OK(mlfq_tree_walk(&store, &f) == 123456,
+		"leaf at the root returns the stored prediction");
+
+	/* Single split on prev_burst_ns at the 1ms threshold. */
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0, 1000000, 1, 2);
+	tree_node(&store, 1, 0, 0, 50000, 0);
+	tree_node(&store, 2, 0, 0, 3000000, 0);
+	f.prev_burst_ns = 900000;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 50000,
+		"below-threshold burst routes to the left leaf");
+	f.prev_burst_ns = 1000000;	/* <= threshold: left */
+	TEST_OK(mlfq_tree_walk(&store, &f) == 50000,
+		"burst equal to the threshold routes left");
+	f.prev_burst_ns = 1000001;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 3000000,
+		"above-threshold burst routes to the right leaf");
+
+	/*
+	 * A chain of MLFQ_TREE_MAX_DEPTH internal nodes followed by one
+	 * leaf: the constant-depth loop runs to its bound and the depth-12
+	 * leaf is reached as "the last node", whose left is the prediction.
+	 */
+	tree_store_reset(&store);
+	for (int i = 0; i < MLFQ_TREE_MAX_DEPTH; i++)
+		tree_node(&store, i, 0, 0, i + 1, i + 1);
+	tree_node(&store, MLFQ_TREE_MAX_DEPTH, 0, 0, 777777, 0);
+	f.prev_burst_ns = 0;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 777777,
+		"depth-12 chain exhausts the walk and returns the leaf");
+
+	/*
+	 * Deeper than the bound: the walk is cut and the last reachable
+	 * node is returned as a leaf only when it really is one. The node
+	 * at depth 12 here is internal, so the prediction is 0 -- a child
+	 * index must never leak out as a burst.
+	 */
+	tree_store_reset(&store);
+	for (int i = 0; i <= MLFQ_TREE_MAX_DEPTH; i++)
+		tree_node(&store, i, 0, 0, i + 1, i + 1);
+	TEST_OK(mlfq_tree_walk(&store, &f) == 0,
+		"a deeper-than-12 chain is cut at the depth bound and yields 0, not a child index");
+
+	/*
+	 * Out-of-range feature id: 0x87 masks to 7, the first zeroed
+	 * feat[] slot. Under MLFQ_CHECK the invariant predicate bails to
+	 * the untrained result; without the check the walk would route on
+	 * feat[7] == 0 and still stay in bounds.
+	 */
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0x87, 0, 1, 2);
+	tree_node(&store, 1, 0, 0, 50000, 0);
+	tree_node(&store, 2, 0, 0, 3000000, 0);
+	TEST_OK(mlfq_tree_walk(&store, &f) == 0,
+		"out-of-range feature id bails under MLFQ_CHECK, no OOB");
+
+	/*
+	 * Masked index: a child index of 0xFFFFFFFF must land on node
+	 * 2047 (the mask is MLFQ_TREE_MAX_NODES - 1), never outside the
+	 * buffer. The zeroed node at 2047 is a leaf predicting 0; a
+	 * planted leaf there proves the landing index exactly.
+	 */
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0, 0, 0xFFFFFFFF, 0xFFFFFFFF);
+	tree_node(&store, MLFQ_TREE_MAX_NODES - 1, 0, 0, 424242, 0);
+	TEST_OK(mlfq_tree_walk(&store, &f) == 424242,
+		"0xFFFFFFFF child index is masked into [0, 2047]");
+
+	/*
+	 * Double buffer: the two map entries hold the two generations and
+	 * the wrapper picks the active entry from the meta bit; each entry
+	 * is walked independently here.
+	 */
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0, 0, 111111, 0);
+	TEST_OK(mlfq_tree_walk(&store, &f) == 111111,
+		"entry 0 walks its own tree");
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0, 0, 222222, 0);
+	TEST_OK(mlfq_tree_walk(&store, &f) == 222222,
+		"entry 1 walks its own tree");
+}
+
+/*
+ * The shared crafted tree also walked by the Rust side
+ * (golden_tree_predict_matches_shared_spec in mlfq_tree.rs): a chain on
+ * prev_burst_ns, mixed leaves, and a node whose raw feature id is out of
+ * the populated range but masks in-bounds (0x84 -> 4 = wake_cnt). Both
+ * sides must produce identical outputs.
+ */
+static void test_tree_golden_shared(void)
+{
+	struct mlfq_tree_store store;
+	struct mlfq_tree_feats f;
+
+	tree_store_reset(&store);
+	tree_node(&store, 0, 0, 1000000, 1, 8);
+	tree_node(&store, 1, 0, 1000000, 2, 8);
+	tree_node(&store, 2, 0, 1000000, 3, 8);
+	tree_node(&store, 3, 1, 500000, 4, 5);
+	tree_node(&store, 4, 0, 0, 1111111, 0);
+	tree_node(&store, 5, 0x84, 1, 6, 7);
+	tree_node(&store, 6, 0, 0, 2222222, 0);
+	tree_node(&store, 7, 0, 0, 3333333, 0);
+	tree_node(&store, 8, 0, 0, 8888888, 0);
+
+	f = (struct mlfq_tree_feats){ .prev_burst_ns = 0, .sleep_ns = 400000,
+				      .ema = 0, .io_wait = 0, .wake_cnt = 0 };
+	TEST_OK(mlfq_tree_walk(&store, &f) == 1111111,
+		"golden: chain left, sleep <= 500us -> 1111111");
+	f.sleep_ns = 600000;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 2222222,
+		"golden: wake_cnt 0 <= 1 -> 2222222");
+	f.wake_cnt = 5;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 3333333,
+		"golden: wake_cnt 5 > 1 -> 3333333");
+	f.prev_burst_ns = 2000000;
+	f.sleep_ns = 0;
+	f.wake_cnt = 0;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 8888888,
+		"golden: prev_burst above 1ms -> 8888888");
+	f.prev_burst_ns = 0;
+	f.sleep_ns = 400000;
+	f.wake_cnt = 9;
+	TEST_OK(mlfq_tree_walk(&store, &f) == 1111111,
+		"golden: wake_cnt is irrelevant on the sleep-split left");
+}
+
+/*
+ * The promotion-only wakeup mapping (mlfq_tree_map_queue): the tree can
+ * only raise the queue at the wakeup; demotions are the run-out gate's
+ * job, so a single prediction can never demote a task.
+ */
+static void test_tree_map_queue(void)
+{
+	u8 q;
+
+	/* pred < T_INT raises to Q1 regardless of the current queue. */
+	for (q = 1; q <= MLFQ_NR_QUEUES; q++)
+		TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS - 1, q) == 1,
+			"Q1-band prediction raises queue %u to 1", q);
+
+	/* pred in [T_INT, T_BOUND): Q3 -> Q2, Q1/Q2 stay. */
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 1) == 1 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 1) == 1,
+		"Q2-band prediction leaves Q1 alone");
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 2) == 2 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 2) == 2,
+		"Q2-band prediction leaves Q2 alone");
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 3) == 2 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 3) == 2,
+		"Q2-band prediction raises Q3 to Q2");
+
+	/* pred >= T_BOUND leaves the queue unchanged: no wakeup demotion. */
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 1) == 1 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 2) == 2 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 3) == 3,
+		"Q3-band prediction never changes the queue");
+
+	/* Untrained (pred 0) leaves the queue unchanged. */
+	TEST_OK(mlfq_tree_map_queue(0, 1) == 1 &&
+		mlfq_tree_map_queue(0, 2) == 2 &&
+		mlfq_tree_map_queue(0, 3) == 3,
+		"untrained prediction never changes the queue");
+}
+
+static void test_mlfq_check_tree_predicates(void)
+{
+	TEST_OK(mlfq_check_tree_node_index(0) &&
+		mlfq_check_tree_node_index(MLFQ_TREE_MAX_NODES - 1),
+		"node indices 0 and 2047 are in bounds");
+	TEST_OK(!mlfq_check_tree_node_index(MLFQ_TREE_MAX_NODES),
+		"node index 2048 is out of bounds");
+	TEST_OK(mlfq_check_tree_feature(0) && mlfq_check_tree_feature(4),
+		"feature ids 0 and 4 are in bounds");
+	TEST_OK(!mlfq_check_tree_feature(5) && !mlfq_check_tree_feature(7),
+		"feature ids 5 and 7 are out of bounds");
+	TEST_OK(mlfq_check_tree_feature(0x80) &&
+		!mlfq_check_tree_feature(0x85),
+		"the feature id masks to 0..7 before the bound check");
+}
+
 int main(void)
 {
 	test_calc_delta_fair();
@@ -579,6 +897,12 @@ int main(void)
 	test_boost_eligible();
 	test_mlfq_check_predicates();
 	test_bitmap();
+	test_mlfq_tree_layout();
+	test_tree_meta_layout();
+	test_tree_predict_walk();
+	test_tree_golden_shared();
+	test_tree_map_queue();
+	test_mlfq_check_tree_predicates();
 
 	if (nr_failed) {
 		printf("%d test(s) FAILED\n", nr_failed);
