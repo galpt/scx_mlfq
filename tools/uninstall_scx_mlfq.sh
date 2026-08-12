@@ -11,8 +11,11 @@
 # package-owned binary from the recorded backup when the installed beta
 # binary is still in place, and otherwise leaves the binary alone. It
 # removes only the installer's own drop-in, backup, and manifest, then
-# reloads systemd. scx_loader.service, /etc/default/scx and scx.service
-# itself are never modified, disabled, or removed.
+# reloads systemd. The timestamped /etc/scx_loader.toml.bak.* files that
+# the Kernel Manager leaves behind on every config rewrite are pruned
+# down to the newest one, so repeated installs do not accumulate junk.
+# scx_loader.service, /etc/default/scx and scx.service itself are never
+# modified, disabled, or removed.
 #
 # The manifest is parsed strictly: duplicate keys, unknown keys, and values
 # containing control characters abort the run. Every path read from the
@@ -55,6 +58,7 @@ DROPIN_STATE=""
 BACKUP_STATE=""
 DROPIN_BACKUP_STATE=""
 QKK_RESULT=""
+LOADER_BAK_STATE=""
 
 info()  { printf '[INFO]  %s\n' "$1"; }
 ok()    { printf '[ OK ]  %s\n' "$1"; }
@@ -423,6 +427,43 @@ remove_mlfq_default() {
     LOADER_DEFAULT_STATE="removed"
 }
 
+# prune_loader_config_backups: the Kernel Manager rewrites
+# /etc/scx_loader.toml with a timestamped backup on every apply and
+# never prunes them.  Keep the newest file so the previous config can
+# still be restored by hand, and remove the rest.
+prune_loader_config_backups() {
+    local bak keep="" removed=0
+
+    for bak in /etc/scx_loader.toml.bak.*; do
+        [ -f "$bak" ] && [ ! -L "$bak" ] || continue
+        if [ -z "$keep" ] || [[ "$bak" > "$keep" ]]; then
+            keep="$bak"
+        fi
+    done
+
+    if [ -z "$keep" ]; then
+        info 'no scx_loader config backups to prune'
+        LOADER_BAK_STATE="none"
+        return 0
+    fi
+
+    for bak in /etc/scx_loader.toml.bak.*; do
+        [ -f "$bak" ] && [ ! -L "$bak" ] || continue
+        if [ "$bak" != "$keep" ]; then
+            run rm -f -- "$bak"
+            removed=$((removed + 1))
+        fi
+    done
+
+    if [ "$removed" -eq 0 ]; then
+        info "the newest scx_loader config backup is already the only one: $keep"
+        LOADER_BAK_STATE="newest only"
+    else
+        ok "pruned $removed stale scx_loader config backup(s), kept $keep"
+        LOADER_BAK_STATE="pruned $removed, kept newest"
+    fi
+}
+
 # our_loader_dropin: the exact bytes the loader installer owns for the
 # scx_loader.service override.
 our_loader_dropin() {
@@ -696,6 +737,7 @@ summary() {
     printf '  %-24s %s\n' 'Drop-in:' "$DROPIN_STATE"
     printf '  %-24s %s\n' 'scx_loader entry:' "$LOADER_ENTRY_STATE"
     printf '  %-24s %s\n' 'mlfq default:' "$LOADER_DEFAULT_STATE"
+    printf '  %-24s %s\n' 'Loader config backups:' "$LOADER_BAK_STATE"
     printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
     printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
     printf '  %-24s %s\n' 'GUI library:' "$GUI_LIB_STATE"
@@ -854,6 +896,9 @@ main() {
     step 'Removing our scx_loader entry'
     remove_loader_entry
     remove_mlfq_default
+
+    step 'Pruning stale scx_loader config backups'
+    prune_loader_config_backups
 
     step 'Removing the patched scx_loader'
     remove_loader_patch
