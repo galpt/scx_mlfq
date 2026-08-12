@@ -165,7 +165,7 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 * Rate-limited drain gate: at most one pass per CPU per
 	 * mlfq_rtdl_drain_interval_ns, so a takeover storm cannot burn
 	 * the CPU in the hook. The first pass is ungated (last_drain_at
-	 * == 0). On kernels without the reenqueue kfuncs the gate never
+	 * == 0). On kernels without the reenqueue kfuncs, the gate never
 	 * closes -- the pass is a no-op and last_drain_at does not
 	 * advance -- so every realtime-class switch pays the nonempty
 	 * gate below; that is the documented 6.18 degradation.

@@ -110,7 +110,7 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * its peek, and the earliest eligible deadline among the peeked heads is
  * moved once per slot.
  *
- * With the own head drained there is no local deadline to protect, so
+ * With the own head drained, there is no local deadline to protect, so
  * the steal takes the earliest eligible remote head freely; the own-first
  * order still guarantees that every local head is served before any
  * remote one within the quota.

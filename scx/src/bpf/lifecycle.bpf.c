@@ -328,7 +328,7 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
  * scx_bpf_reenqueue_local() is restricted to this callback (ext.c).
  *
  * On kernels with the call-from-anywhere reenqueue
- * (scx_bpf_reenqueue_local___v2, v6.19+) the sched_switch hook in
+ * (scx_bpf_reenqueue_local___v2, v6.19+), the sched_switch hook in
  * rtdl.bpf.c evacuates the local DSQ on a higher-priority-class
  * takeover, so this callback has nothing left to drain there and stays
  * out of the way; on 6.18 it is the only local-DSQ evacuation path and

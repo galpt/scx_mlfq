@@ -238,7 +238,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * all-efficiency LLC is skipped entirely so the wakeup can land on
 	 * an idle primary of a faster LLC via the global fallbacks below.
 	 *
-	 * On a machine with a single LLC the cache domain is the whole
+	 * On a machine with a single LLC, the cache domain is the whole
 	 * machine, so the kernel's idle scan serves the placement directly
 	 * instead of walking the LLC bitmap with a test-and-clear per
 	 * candidate: the kernel's scan is affinity- and SMT-aware and
