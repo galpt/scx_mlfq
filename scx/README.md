@@ -40,7 +40,19 @@ While the scheduler runs it holds a PM QoS constraint on `/dev/cpu_dma_latency` 
 
 - The EEVDF substrate is approximated where BPF cannot express the kernel's exact machinery. Eligibility is enforced at placement with DELAY_ZERO semantics instead of an augmented-tree walk, and the weighted-average virtual time is replaced by a per-queue virtual clock: placement clamps each task's lag to within one lag bound of the clock, which preserves the bounded-lag safety property without a shared, lock-protected aggregate. Each approximation is documented in the code.
 - The queues are per-CPU user dispatch queues. A CPU serves its own queues first, each head in virtual-time order, and steals the earliest-eligible remote same-queue head when its own queue is drained, so NUMA locality comes from wakeup placement while idle CPUs pull owed tasks from wherever they sit.
-- sched_ext cannot schedule RT and DL tasks: the kernel resolves them to the rt and dl classes before sched_ext, so this scheduler handles SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks only.
+- sched_ext cannot schedule RT and DL tasks: the kernel resolves them to the rt and dl classes before sched_ext, so this scheduler handles SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks only. The coexistence of those classes with the scheduler is described in the following section.
+
+## Real-time core avoidance
+
+sched_ext cannot run RT, DL and stop tasks either: the kernel resolves them to their own classes before sched_ext, so a realtime task that becomes runnable on a CPU running an SCX task takes the CPU over, and the scheduler only gets the CPU back when the higher-priority queue empties. The scheduler detects every such takeover on the context switch itself and keeps a per-CPU occupancy flag, so it always knows which cores are running realtime tasks. On a takeover it drains the DSQs of the CPU that was taken over through the kernel's reenqueue paths, rate-limited to at most one pass per millisecond so a takeover storm cannot burn the CPU in the hook, and wakeups whose target core is occupied are redirected to a core that is not.
+
+The coexistence guarantees are structural. The kernel's class-pick loop reaches sched_ext only when no higher-priority class has a runnable task, so dispatch never runs on an occupied core. The built-in idle masks update only on idle-thread transitions, so an occupied CPU never appears idle to the idle scans. Wakeups are additionally redirected off occupied cores at enqueue time, and the queue DSQs of different CPUs share the per-queue virtual clock, so a redirected placement is identical to the original one — only the owning CPU changes.
+
+The honest limits: if every core is saturated by realtime tasks for longer than the 30-second watchdog, the scheduler exits and the kernel reverts to the CFS scheduler. A task pinned to an occupied core waits on its allowed CPU until the realtime load there clears; a kernel-bound per-CPU worker on a core a realtime task monopolizes is starved the same way under CFS, and since no scheduler can relocate it, the watchdog exits after the 30-second window. The takeover drain re-anchors the stranded tasks and the placement redirect relocates them to a non-occupied core; on kernels before 6.20, where the generic reenqueue is unavailable, the queue DSQs are served by the cross-CPU steal scans. The kernel-side mitigation for runaway realtime load is sched_rt_runtime_us; on kernels that have the deadline server, sched_ext is protected against deadline tasks, while realtime tasks have no server.
+
+## Measuring wakeup latency
+
+To measure the wakeup latency the scheduler delivers with cyclictest, pin the measurement threads to the measured CPUs with `-a`, move the device IRQs off those CPUs, use the `-c` monotonic clock option, and run the performance governor so frequency ramps do not gate the wakeup path. Note that the kernel defers timers within a task's timer slack, so cyclictest reports bound the scheduler's contribution to the wakeup latency rather than a hardware-accurate measurement.
 
 ## Status
 
