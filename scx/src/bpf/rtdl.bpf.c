@@ -198,13 +198,16 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 * likewise relocates, and the queue DSQs are served by the steal
 	 * scans on every kernel. On 6.19 the local reenqueue runs and
 	 * can consume the gate while the queue DSQs wait for the steal
-	 * scans -- the intermediate kernel degradation. The compat
-	 * wrapper below returns 0 when the call-from-anywhere kfunc
-	 * exists and ran, and -ENOTSUP where it does not, so the
-	 * negation reads "the local reenqueue ran".
+	 * scans -- the intermediate kernel degradation. The probe is
+	 * the compat layer's stable surface, and the call goes straight
+	 * to the v2 kfunc, which is what the from-anywhere wrapper does
+	 * internally; spelling it out keeps the drain buildable against
+	 * compat headers that predate the wrapper.
 	 */
-	if (!scx_bpf_reenqueue_local_from_anywhere())
+	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
+		scx_bpf_reenqueue_local___v2___compat();
 		evacuated = true;
+	}
 	if (__COMPAT_has_generic_reenq()) {
 		scx_bpf_dsq_reenq(mlfq_dsq_id(1, cpu), 0);
 		scx_bpf_dsq_reenq(mlfq_dsq_id(2, cpu), 0);
