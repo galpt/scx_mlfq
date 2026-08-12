@@ -122,10 +122,13 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	struct mlfq_cpu_state *cpu;
 	struct queue_ctx *q;
 	u64 now, delta = 0;
+	u64 op_lat_start = scx_bpf_now();
 
 	tctx = mlfq_lookup_task_ctx(p);
-	if (!tctx)
+	if (!tctx) {
+		mlfq_op_lat_charge(MLFQ_OP_LAT_STOPPING, op_lat_start);
 		return;
+	}
 
 	now = scx_bpf_now();
 	if (tctx->last_run_at && mlfq_time_before(tctx->last_run_at, now))
@@ -178,23 +181,29 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		 * Emit the pending training sample: the features and the
 		 * queue were captured at the classification enqueue and
 		 * the label is this run segment, so the tuple is
-		 * consistent by construction (the queue is emitted from
+		 * internally consistent (the queue is emitted from
 		 * the capture snapshot, pending_queue, not from the
 		 * current queue, which later placement decisions such as
-		 * aging may have changed). The label is clamped to
-		 * MLFQ_TREE_LABEL_MAX_NS: the prediction only needs the
-		 * queue band, and the clamp bounds the exact-integer
-		 * range the daemon's f64 SSE sees. The emission is rate
-		 * limited by the compare-and-swap single-winner pattern
-		 * (as in mlfq_queue_advance_clock) against the global
-		 * limiter, and gated per task by the last_sample_at
-		 * spacing: only the winner of the swap emits, and a lost
-		 * swap or a closed rate-limit window simply skips the
-		 * sample, which is a sampling throttle rather than a
-		 * correctness constraint. The sample is emitted only on
-		 * this blocking path, never on the wakeup path.
+		 * aging may have changed). Only a complete run segment
+		 * becomes a sample: a preempted segment is truncated at
+		 * the takeover and would label the predictor with a
+		 * partial burst, so the emission is gated on !runnable.
+		 * This also keeps the preemption path minimal -- vruntime
+		 * charge, clock advance, EMA and stats only. The label is
+		 * clamped to MLFQ_TREE_LABEL_MAX_NS: the prediction only
+		 * needs the queue band, and the clamp bounds the
+		 * exact-integer range the daemon's f64 SSE sees. The
+		 * emission is rate limited by the compare-and-swap
+		 * single-winner pattern (as in mlfq_queue_advance_clock)
+		 * against the global limiter, and gated per task by the
+		 * last_sample_at spacing: only the winner of the swap
+		 * emits, and a lost swap or a closed rate-limit window
+		 * simply skips the sample, which is a sampling throttle
+		 * rather than a correctness constraint. The sample is
+		 * emitted only on this blocking path, never on the wakeup
+		 * path.
 		 */
-		if (tctx->pending_valid) {
+		if (!runnable && tctx->pending_valid) {
 			struct mlfq_tree_sample *m;
 			u64 last = mlfq_tree_ctrl.sample_last_at;
 
@@ -265,6 +274,8 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	/* Diagnostic runnable count; guard against wrap-around. */
 	if (__sync_fetch_and_sub(&mlfq_stats.on_cpu, 1) == 0)
 		__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
+
+	mlfq_op_lat_charge(MLFQ_OP_LAT_STOPPING, op_lat_start);
 }
 
 /*
@@ -329,7 +340,12 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
  */
 void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
-	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
+	u64 op_lat_start = scx_bpf_now();
+
+	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
+		mlfq_op_lat_charge(MLFQ_OP_LAT_CPU_RELEASE, op_lat_start);
 		return;
+	}
 	scx_bpf_reenqueue_local();
+	mlfq_op_lat_charge(MLFQ_OP_LAT_CPU_RELEASE, op_lat_start);
 }

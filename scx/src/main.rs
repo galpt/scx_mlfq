@@ -444,6 +444,7 @@ impl<'a> Scheduler<'a> {
             rt_evacuations: s.rt_evacuations,
             rt_redirects: s.rt_redirects,
             rt_reenqs: s.rt_reenqs,
+            op_lat: self.read_op_lat(),
             tree_samples_cap_dropped: self.tree_samples_cap_dropped,
             tree_model_generation: self.model.generation,
             tree_model_nodes: self.model.nr_nodes as u64,
@@ -455,6 +456,35 @@ impl<'a> Scheduler<'a> {
 
     fn exited(&self) -> bool {
         uei_exited!(&self.skel, uei)
+    }
+
+    /// Sum the per-CPU op-latency histogram into a flat per-op vector
+    /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major). The
+    /// map is per-CPU so the BPF charges never contend; a failed lookup
+    /// or an unexpected value size yields zeros for that entry.
+    fn read_op_lat(&self) -> Vec<u64> {
+        let nr_ops = crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize;
+        let buckets = crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_BUCKETS as usize;
+        let mut out = vec![0u64; nr_ops * buckets];
+
+        for op in 0..nr_ops {
+            let cpu_values = self
+                .skel
+                .maps
+                .mlfq_op_lat
+                .lookup_percpu(&(op as u32).to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            for chunk in cpu_values {
+                for (b, slot) in chunk.chunks_exact(8).take(buckets).enumerate() {
+                    out[op * buckets + b] = out[op * buckets + b].wrapping_add(u64::from_ne_bytes(
+                        slot.try_into().expect("an 8-byte histogram slot"),
+                    ));
+                }
+            }
+        }
+        out
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {

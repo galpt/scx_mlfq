@@ -466,6 +466,39 @@ struct mlfq_rtdl_state {
 	u64 last_drain_at;		/* scx_bpf_now() of the last drain */
 };
 
+/*
+ * Op-latency histogram. Each slot (MLFQ_OP_LAT_* below) charges the
+ * wall time its callback spends running into one of eight buckets that
+ * delimit the elapsed microseconds: [0, 2) [2, 5) [5, 10) [10, 20)
+ * [20, 50) [50, 100) [100, 250) [250, inf). The preemption path is
+ * healthy when its charges stay in the first few buckets; a regression
+ * shows up as a visible shift toward the tail.
+ */
+enum mlfq_op_lat_slots {
+	MLFQ_OP_LAT_STOPPING		= 0,
+	MLFQ_OP_LAT_DISPATCH		= 1,
+	MLFQ_OP_LAT_ENQUEUE		= 2,
+	MLFQ_OP_LAT_CPU_RELEASE		= 3,
+	MLFQ_OP_LAT_OPS			= 4,
+};
+
+/* Histogram bucket count and the bucket edges, in microseconds. */
+enum mlfq_op_lat_consts {
+	MLFQ_OP_LAT_BUCKETS		= 8,
+	MLFQ_OP_LAT_EDGE_2		= 2,
+	MLFQ_OP_LAT_EDGE_5		= 5,
+	MLFQ_OP_LAT_EDGE_10		= 10,
+	MLFQ_OP_LAT_EDGE_20		= 20,
+	MLFQ_OP_LAT_EDGE_50		= 50,
+	MLFQ_OP_LAT_EDGE_100		= 100,
+	MLFQ_OP_LAT_EDGE_250		= 250,
+};
+
+/* One op's latency histogram, a BPF_MAP_TYPE_PERCPU_ARRAY value. */
+struct mlfq_op_lat {
+	u64 buckets[MLFQ_OP_LAT_BUCKETS];
+};
+
 /* System-level BPF counters, reported to userspace through the stats module. */
 struct mlfq_stats {
 	u64 total_runtime;
@@ -1246,6 +1279,75 @@ struct mlfq_rtdl_state_map {
 };
 
 extern struct mlfq_rtdl_state_map rtdl_state_stor;
+
+/*
+ * The op-latency histogram as a per-CPU array map, defined in
+ * main.bpf.c. The type, the extern and the charge helper are declared
+ * here so the modules can charge their callbacks; all of it is skipped
+ * outside the BPF build, where the native harness has no map machinery.
+ */
+struct mlfq_op_lat_map {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, MLFQ_OP_LAT_OPS);
+	__type(key, u32);
+	__type(value, struct mlfq_op_lat);
+};
+
+extern struct mlfq_op_lat_map mlfq_op_lat;
+
+/**
+ * mlfq_op_lat_bucket - Histogram bucket covering an elapsed time.
+ * @delta_us: Elapsed microseconds.
+ *
+ * The eight buckets delimit [0, 2) [2, 5) [5, 10) [10, 20) [20, 50)
+ * [50, 100) [100, 250) [250, inf) microseconds.
+ *
+ * Return: The bucket index in [0, MLFQ_OP_LAT_BUCKETS).
+ */
+static __always_inline u32 mlfq_op_lat_bucket(u64 delta_us)
+{
+	if (delta_us < MLFQ_OP_LAT_EDGE_2)
+		return 0;
+	if (delta_us < MLFQ_OP_LAT_EDGE_5)
+		return 1;
+	if (delta_us < MLFQ_OP_LAT_EDGE_10)
+		return 2;
+	if (delta_us < MLFQ_OP_LAT_EDGE_20)
+		return 3;
+	if (delta_us < MLFQ_OP_LAT_EDGE_50)
+		return 4;
+	if (delta_us < MLFQ_OP_LAT_EDGE_100)
+		return 5;
+	if (delta_us < MLFQ_OP_LAT_EDGE_250)
+		return 6;
+	return 7;
+}
+
+/**
+ * mlfq_op_lat_charge - Charge one op into its latency histogram.
+ * @op: The MLFQ_OP_LAT_* slot.
+ * @start_ns: scx_bpf_now() captured at the op entry.
+ *
+ * Computes the elapsed time and increments the covering bucket of the
+ * per-CPU histogram; a failed map lookup is a no-op. The per-CPU
+ * counters never contend, and the Rust front-end sums the CPUs for the
+ * stats output.
+ */
+static __always_inline void mlfq_op_lat_charge(u32 op, u64 start_ns)
+{
+	struct mlfq_op_lat *lat;
+	u64 now, delta_us;
+	u32 key = op;
+
+	now = scx_bpf_now();
+	if (mlfq_time_before(now, start_ns))
+		return;
+	lat = bpf_map_lookup_elem(&mlfq_op_lat, &key);
+	if (!lat)
+		return;
+	delta_us = (now - start_ns) / NSEC_PER_USEC;
+	lat->buckets[mlfq_op_lat_bucket(delta_us)]++;
+}
 
 /**
  * mlfq_tree_predict - Predict the next CPU burst from a feature vector.

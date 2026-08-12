@@ -91,6 +91,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
 	u64 now, deadline, slice;
+	u64 op_lat_start = scx_bpf_now();
 	u32 weight, qid;
 	u8 old_queue;
 	bool wakeup, runout, local_fast_path, migration_disabled;
@@ -117,6 +118,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			__sync_fetch_and_add(&mlfq_stats.enq_no_tctx, 1);
 			scx_bpf_error("pid %d task state allocation failed in enqueue",
 				      p->pid);
+			mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
 			return;
 		}
 		mlfq_reset_task_ctx(tctx, p, scx_bpf_now());
@@ -127,6 +129,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	if (weight < 1) {
 		__sync_fetch_and_add(&mlfq_stats.enq_bad_weight, 1);
 		scx_bpf_error("pid %d has invalid weight %u", p->pid, weight);
+		mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
 		return;
 	}
 	tctx->weight = weight;
@@ -209,6 +212,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	if (migration_disabled) {
 		if (prev_cpu < 0) {
 			scx_bpf_error("pid %d pinned task without a CPU", p->pid);
+			mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
 			return;
 		}
 
@@ -262,6 +266,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 			scx_bpf_error("pid %d pinned-busy placement failed",
 				      p->pid);
+			mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
 			return;
 		}
 		__sync_fetch_and_add(&mlfq_stats.enq_pinned_busy, 1);
@@ -448,6 +453,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 		scx_bpf_error("pid %d regular placement failed",
 			      p->pid);
+		mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
 		return;
 	}
 
@@ -462,5 +468,6 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	mlfq_idle_kick(target_cpu);
 
 done:
+	mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
 	;
 }

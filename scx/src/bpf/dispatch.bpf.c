@@ -197,9 +197,12 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	struct mlfq_cpu_state *cpu_state = mlfq_lookup_cpu_state(cpu);
 	u64 nr_cpus = nr_cpu_ids;
 	u32 remaining = mlfq_dispatch_max_batch;
+	u64 op_lat_start = scx_bpf_now();
 
-	if (nr_cpus == 0)
+	if (nr_cpus == 0) {
+		mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH, op_lat_start);
 		return;
+	}
 
 	/*
 	 * Advance the rotating scan start once per dispatch call. All
@@ -274,6 +277,8 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 					scx_bpf_task_set_slice(prev, slice);
 					__sync_fetch_and_add(
 						&mlfq_stats.keep_running, 1);
+					mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH,
+							  op_lat_start);
 					return;
 				}
 				/* remote work: the slot loops steal */
@@ -294,4 +299,6 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 					 cpu_state, nr_cpus);
 	remaining -= mlfq_dispatch_queue(cpu, 3, remaining,
 					 cpu_state, nr_cpus);
+
+	mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH, op_lat_start);
 }

@@ -67,6 +67,13 @@ struct {
 struct mlfq_rtdl_state_map rtdl_state_stor SEC(".maps");
 
 /*
+ * Op-latency histogram, keyed by op id (MLFQ_OP_LAT_* in intf.h). A
+ * per-CPU array so the counters never contend; the Rust front-end sums
+ * the CPUs for the stats output.
+ */
+struct mlfq_op_lat_map mlfq_op_lat SEC(".maps");
+
+/*
  * Scheduler-wide state in .bss. The stats counters are shared across
  * CPUs and updated with atomic RMWs; volatile stops the compiler from
  * caching a value in a register across the atomic operations.

@@ -92,6 +92,10 @@ pub struct Metrics {
     pub rt_redirects: u64,
     #[stat(desc = "SCX_ENQ_REENQ re-enqueues counted at enqueue")]
     pub rt_reenqs: u64,
+    #[stat(
+        desc = "Per-op callback latency histogram, 4 ops x 8 buckets in microseconds (stopping, dispatch, enqueue, cpu_release)"
+    )]
+    pub op_lat: Vec<u64>,
     #[stat(desc = "Training samples dropped by the per-pid window cap")]
     pub tree_samples_cap_dropped: u64,
     #[stat(desc = "Committed tree model generation, 0 while untrained")]
@@ -106,6 +110,34 @@ pub struct Metrics {
     pub tree_mae_tree_us: u64,
     #[stat(desc = "Exact EMA-baseline MAE in microseconds on the same held-out slice")]
     pub tree_mae_ema_us: u64,
+}
+
+/// Bucket edges of the op-latency histogram, matching `enum
+/// mlfq_op_lat_consts` in `src/bpf/intf.h`, in microseconds.
+const OP_LAT_EDGES_US: [u64; 7] = [
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_2 as u64,
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_5 as u64,
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_10 as u64,
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_20 as u64,
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_50 as u64,
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_100 as u64,
+    crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_250 as u64,
+];
+
+/// Format one op's eight bucket counts with their microsecond edges as
+/// "low-high=count" pairs; a histogram shorter than eight buckets (the
+/// untracked default) formats as "n/a".
+fn fmt_op_lat(op: &[u64]) -> String {
+    if op.len() < 8 {
+        return "n/a".to_string();
+    }
+    let mut parts = Vec::new();
+    parts.push(format!("0-{}={}", OP_LAT_EDGES_US[0], op[0]));
+    for (i, edge) in OP_LAT_EDGES_US.iter().enumerate().skip(1) {
+        parts.push(format!("{}-{}={}", OP_LAT_EDGES_US[i - 1], edge, op[i]));
+    }
+    parts.push(format!("{}+={}", OP_LAT_EDGES_US[6], op[7]));
+    parts.join(" ")
 }
 
 impl Metrics {
@@ -146,6 +178,20 @@ impl Metrics {
             self.tree_samples_emitted,
             self.tree_samples_dropped,
             self.tree_samples_cap_dropped,
+        )?;
+        writeln!(
+            w,
+            "[{}] op_lat_us: stopping[{}] dispatch[{}]",
+            crate::SCHEDULER_NAME,
+            fmt_op_lat(self.op_lat.get(0..8).unwrap_or(&[])),
+            fmt_op_lat(self.op_lat.get(8..16).unwrap_or(&[])),
+        )?;
+        writeln!(
+            w,
+            "[{}] op_lat_us: enqueue[{}] cpu_release[{}]",
+            crate::SCHEDULER_NAME,
+            fmt_op_lat(self.op_lat.get(16..24).unwrap_or(&[])),
+            fmt_op_lat(self.op_lat.get(24..32).unwrap_or(&[])),
         )?;
         Ok(())
     }
@@ -190,6 +236,13 @@ impl Metrics {
             rt_evacuations: self.rt_evacuations.wrapping_sub(rhs.rt_evacuations),
             rt_redirects: self.rt_redirects.wrapping_sub(rhs.rt_redirects),
             rt_reenqs: self.rt_reenqs.wrapping_sub(rhs.rt_reenqs),
+            /* The histogram is a per-interval delta like the counters. */
+            op_lat: self
+                .op_lat
+                .iter()
+                .zip(rhs.op_lat.iter())
+                .map(|(lhs, rhs)| lhs.wrapping_sub(*rhs))
+                .collect(),
             tree_samples_cap_dropped: self
                 .tree_samples_cap_dropped
                 .wrapping_sub(rhs.tree_samples_cap_dropped),
