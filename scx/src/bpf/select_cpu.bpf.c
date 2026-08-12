@@ -97,9 +97,9 @@ static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 }
 
 /*
- * Global primary-core scan: pick an idle primary CPU, or -ENOENT. Every
- * member of the primary bitmap is primary by construction, so the
- * require_primary restriction is unnecessary here.
+ * Global primary-core scan: pick an idle primary CPU, or -ENOENT. The
+ * primary bitmap holds only primary cores, so the require_primary
+ * restriction is unnecessary here.
  */
 static __always_inline s32
 mlfq_pick_idle_primary(const struct task_struct *p,

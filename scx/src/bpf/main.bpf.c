@@ -62,7 +62,8 @@ struct {
 /*
  * Per-CPU realtime-occupancy state, keyed by cpu id. The flags reflect
  * the class of the last task that ran on the CPU (see rtdl.bpf.c); the
- * state is read by the sched_switch hook and the enqueue redirect.
+ * state is written by the sched_switch hook and read by the enqueue
+ * redirect and the CPU selection.
  */
 struct mlfq_rtdl_state_map rtdl_state_stor SEC(".maps");
 

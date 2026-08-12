@@ -814,7 +814,7 @@ main() {
     [ -n "$BACKUP" ] || BACKUP="$BACKUP_PATH"
     [ -n "$DROPINS" ] || DROPINS="$DROPIN"
 
-    # HIGH-1: confine and canonicalize every path read from the manifest.
+    # Confine and canonicalize every path read from the manifest.
     # The lexical prefix check alone is bypassable with '..' components, so
     # the string guard plus realpath plus a re-check confine it for real.
     case "$BACKUP" in

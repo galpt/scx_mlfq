@@ -447,7 +447,6 @@ struct mlfq_cpu_state {
 	u64 cpu_ema_at;			/* scx_bpf_now() of the last update */
 	u64 running_deadline;		/* running task's deadline, 0 unknown */
 	u64 run_start_at;		/* scx_bpf_now() at ops.running() */
-	u64 idle_since;			/* scx_bpf_now() at update_idle(true), 0 busy */
 };
 
 /* Per-CPU realtime-occupancy flags. */
@@ -836,8 +835,8 @@ mlfq_place_entity_deadline(const struct queue_ctx *q,
  * one lag limit of the clock, the bounded-lag property of fair.c
  * entity_lag(); a task that is ahead of the clock is placed at the
  * clock itself, the fair.c DELAY_ZERO semantics that do not carry
- * leading credit. The stored lag is therefore bounded in [0, limit], and
- * every queued task is eligible by construction, so min-deadline
+ * leading credit. The stored lag is therefore bounded in [0, limit],
+ * and every queued task is eligible, so min-deadline
  * selection over the queue DSQs is EEVDF selection over the queued set.
  *
  * Updates tctx->vruntime, tctx->vlag (>= 0) and tctx->deadline.

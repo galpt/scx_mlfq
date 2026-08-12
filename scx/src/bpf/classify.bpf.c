@@ -145,7 +145,7 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * run the tree inference on that same vector: the captured
 	 * features feed both the pending sample (completed with the run
 	 * segment in ops.stopping()) and the live queue mapping, so the
-	 * sample and the classification are consistent by construction.
+	 * sample and the classification are consistent with each other.
 	 * The queue is snapshotted at the same instant, so the emitted
 	 * sample's queue field is the capture-time queue, not the queue
 	 * later placement decisions (aging, a subsequent classification)

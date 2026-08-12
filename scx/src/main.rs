@@ -379,7 +379,7 @@ impl<'a> Scheduler<'a> {
          * a dedicated thread so a retrain never stalls the main loop's
          * stats and drain cadence. The main loop hands over a snapshot
          * of the window (the window is only mutated by the ingest on the
-         * main thread, so a snapshot is race-free by construction) and
+         * main thread, so taking a snapshot cannot race with the ingest) and
          * the worker sends the result back over a channel. try_send drops
          * a kick when the previous fit is still in flight, which the 60 s
          * cadence makes rare.
@@ -541,8 +541,7 @@ impl<'a> Scheduler<'a> {
     /// kick a retrain on the cadence: on the first window that reaches
     /// the minimum training size, then every MLFQ_TREE_RETRAIN_INTERVAL.
     ///
-    /// The window admits at most MLFQ_TREE_PER_PID_CAP samples per pid
-    /// (SEC-F1): a pid that already holds its share is dropped here and
+    /// The window admits at most MLFQ_TREE_PER_PID_CAP samples per pid. A pid that already holds its share is dropped here and
     /// counted in tree_samples_cap_dropped. The cap check runs before
     /// the window accounting, so a rejected sample never disturbs the
     /// per-pid counts, and the eviction bookkeeping below decrements the
@@ -741,7 +740,7 @@ struct TrainResult {
     tree: mlfq_tree::SerializedTree,
     /// Samples the tree was fit on.
     nr_train: usize,
-    /// Distinct pids in the fit slice, the SEC-F2 concentration input.
+    /// Distinct pids in the fit slice, the concentration input for the per-pid cap.
     nr_pids_train: usize,
     /// Samples of the held-out evaluation slice.
     holdout_len: usize,
@@ -773,8 +772,7 @@ fn split_holdout(samples: &[TreeSample]) -> Result<(&[TreeSample], &[TreeSample]
     }
 }
 
-/// Admit one sample of `pid` into the window under the per-pid cap
-/// (SEC-F1). Returns true when the sample is admitted and the pid's
+/// Admit one sample of `pid` into the window under the per-pid cap. Returns true when the sample is admitted and the pid's
 /// count is incremented, false when the pid already holds its
 /// MLFQ_TREE_PER_PID_CAP share and the caller must drop the sample.
 /// Entries are pruned on eviction, not here: a pid at the cap keeps its
@@ -800,7 +798,7 @@ fn tree_evict_pid(counts: &mut HashMap<u32, u32>, pid: u32) {
     }
 }
 
-/// Number of distinct pids in a slice, the SEC-F2 concentration input.
+/// Number of distinct pids in a slice, the concentration input for the per-pid cap.
 fn tree_distinct_pids(samples: &[TreeSample]) -> usize {
     let mut seen = HashSet::new();
     for s in samples {
@@ -862,7 +860,7 @@ fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
 ///
 /// The worker owns no scheduler state: it receives a snapshot of the
 /// window (the window is only mutated by the ingest on the main thread,
-/// so handing a snapshot is race-free by construction), fits the tree
+/// so handing over a snapshot cannot race with the ingest), fits the tree
 /// and computes the holdout metrics, and sends the result back. The
 /// publish stays on the main thread. Dropping the job sender closes the
 /// channel and the worker exits on its next `recv()`.
