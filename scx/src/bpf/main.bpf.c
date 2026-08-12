@@ -10,7 +10,7 @@
  * The scheduling logic is organized into separate modules included below,
  * in dependency order:
  *   vtime.bpf.c      - EEVDF virtual-time substrate (virtual clock, placement)
- *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
+ *   classify.bpf.c   - tree inference, EMA gauge, queue mapping, hysteresis
  *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/cpu_release
  *   rtdl.bpf.c       - realtime/DL takeover tracking, sched_switch hook, evacuation
  *   select_cpu.bpf.c - CPU selection

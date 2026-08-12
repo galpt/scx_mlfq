@@ -8,9 +8,12 @@
 //! scx_mlfq, a Multilevel Feedback Queue scheduler for sched_ext.
 //!
 //! Per-CPU, virtual-time-ordered user DSQs (Q1/Q2/Q3 per CPU) over an EEVDF
-//! virtual-time substrate. Tasks are classified into queues by an EMA
-//! interactivity gauge with band hysteresis, promoted by short-sleep and
-//! aging, demoted by slice exhaustion. See README.md for the design
+//! virtual-time substrate. Tasks are classified into queues by a regression
+//! tree that predicts the next CPU burst from per-task features (see
+//! mlfq_tree.rs), with the EMA interactivity gauge as a tree feature and the
+//! fallback before the first model. The wakeup path is promotion-only,
+//! through the tree, the short-sleep and I/O boost and the band hysteresis;
+//! demotion flows through the run-out gate. See README.md for the design
 //! overview.
 
 mod bpf_skel;
