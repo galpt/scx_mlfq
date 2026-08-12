@@ -78,6 +78,9 @@ enum mlfq_consts {
 	 * CPU are recognized as interactive even when their runtime
 	 * consumption would otherwise classify them as CPU-bound; the
 	 * per-task boost rate limit keeps the churn bounded.
+	 * The value is set against the slowest common cadence: faster refresh
+	 * rates sleep for a shorter interval per frame and fall inside the
+	 * window as well.
 	 */
 	MLFQ_SHORT_SLEEP_NS		= (32ULL * NSEC_PER_MSEC),
 	MLFQ_SHORT_SLEEP_RATE_LIMIT_NS	= (2ULL * NSEC_PER_MSEC),

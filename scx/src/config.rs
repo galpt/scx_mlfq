@@ -59,7 +59,9 @@ const AGING_PERIOD_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_AGING_PERIOD_NS a
 
 /// Short-sleep boost window: periodic wakeup cadences such as the 60 Hz
 /// frame interval stay interactive; the per-task boost rate limit bounds
-/// the churn.
+/// the churn.  The value is set against the slowest common cadence, so
+/// faster refresh rates, which sleep less per frame, fall inside the
+/// window as well.
 const SHORT_SLEEP_NS: u64 = 32 * NSEC_PER_MSEC;
 const SHORT_SLEEP_RATE_LIMIT_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS as u64;
