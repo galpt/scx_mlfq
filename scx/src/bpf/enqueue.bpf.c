@@ -32,9 +32,12 @@
  * the running task's slice, so both produce the same flag-less re-enqueue.
  * SCX_ENQ_LAST is passed when the task is about to enter a lower sched
  * class and remains the only runnable ext task on the CPU. SCX_ENQ_REENQ
- * arrives only from scx_bpf_reenqueue_local(), which ops.cpu_release()
- * calls to fold the local DSQ back into the queue DSQs. Preemptions by a
- * higher sched class keep the task at the local-DSQ head without calling
+ * arrives from the kernel's reenqueue paths (do_enqueue_task() with
+ * SCX_ENQ_REENQ in ext.c): ops.cpu_release() folds the local DSQ back
+ * into the queue DSQs through scx_bpf_reenqueue_local(), and the
+ * realtime-takeover drain in rtdl.bpf.c re-enqueues the local DSQ and
+ * the queue DSQs through the same flag. Preemptions by a higher sched
+ * class keep the task at the local-DSQ head without calling
  * ops.enqueue() at all.
  *
  * Every placement calls mlfq_place_task(), which can only fail when the
@@ -146,6 +149,14 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		/* fork, SCX_ENQ_LAST or class switch: reset the counters. */
 		tctx->wake_cnt = 0;
 		tctx->reenq_cnt = 0;
+		/*
+		 * The SCX_ENQ_REENQ evacuation re-enqueues land here (the
+		 * neutral else branch): count them as the realtime-takeover
+		 * reenqueue traffic diagnostic. A reenqueue is never a
+		 * wakeup, so the flag is exclusive with WAKEUP.
+		 */
+		if (enq_flags & SCX_ENQ_REENQ)
+			__sync_fetch_and_add(&mlfq_stats.rt_reenqs, 1);
 	}
 
 	/*

@@ -315,8 +315,21 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
  * DSQs and are served by other CPUs' steal scans; the kernel's reenqueue
  * guard and the stall watchdog cap the pathological loop.
  * scx_bpf_reenqueue_local() is restricted to this callback (ext.c).
+ *
+ * On kernels with the call-from-anywhere reenqueue
+ * (scx_bpf_reenqueue_local___v2, v6.19+) the sched_switch hook in
+ * rtdl.bpf.c evacuates the local DSQ on a higher-priority-class
+ * takeover, so this callback has nothing left to drain there and stays
+ * out of the way; on 6.18 it is the only local-DSQ evacuation path and
+ * does the drain. The gate is the compat layer's ksym probe on the v2
+ * kfunc, dead-folded to the drain on 6.18. The ops slot is registered on
+ * every kernel (the ops initializer cannot fold the probe), so on newer
+ * kernels the callback still engages the cpu_acquire/cpu_release
+ * takeover path but does no work.
  */
 void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
+	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
+		return;
 	scx_bpf_reenqueue_local();
 }
