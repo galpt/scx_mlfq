@@ -231,6 +231,16 @@ enum mlfq_consts {
 	MLFQ_TREE_LABEL_MAX_NS		= (MLFQ_TREE_T_BOUND_NS * 64),
 
 	MLFQ_TREE_MIN_SAMPLES		= 2048,		/* training set size */
+
+	/*
+	 * Drain interval of the realtime-takeover evacuation: at most one
+	 * pass per CPU per millisecond. The rate limit bounds the churn a
+	 * takeover can stir up, which otherwise has no kernel-side repeat
+	 * guard: the stop-class blips that punctuate a takeover, RT tasks
+	 * that ping-pong between runnable states, and the pinned-task
+	 * reenqueue loop are all absorbed by the window.
+	 */
+	MLFQ_RTDL_DRAIN_INTERVAL_NS	= (1ULL * NSEC_PER_MSEC),
 };
 
 /* task_ctx flags */
@@ -440,6 +450,22 @@ struct mlfq_cpu_state {
 	u64 idle_since;			/* scx_bpf_now() at update_idle(true), 0 busy */
 };
 
+/* Per-CPU realtime-occupancy flags. */
+#define MLFQ_RTDL_OCCUPIED			(1U << 0)
+
+/*
+ * Per-CPU realtime-occupancy state, keyed by cpu id in the
+ * rtdl_state_stor array map. flags reflects the class of the last task
+ * that ran on the CPU (see the sched_switch hook in rtdl.bpf.c), which
+ * decides whether the CPU is treated as unavailable to the SCX classes;
+ * last_drain_at rate-limits the evacuation pass of the takeover path.
+ */
+struct mlfq_rtdl_state {
+	u32 flags;			/* MLFQ_RTDL_* bits */
+	u32 pad;
+	u64 last_drain_at;		/* scx_bpf_now() of the last drain */
+};
+
 /* System-level BPF counters, reported to userspace through the stats module. */
 struct mlfq_stats {
 	u64 total_runtime;
@@ -471,18 +497,23 @@ struct mlfq_stats {
 	u64 tree_disagree;		/* tree and EMA queue mappings disagreed */
 	u64 tree_samples_emitted;	/* completed samples emitted to the daemon */
 	u64 tree_samples_dropped;	/* samples dropped (ring buffer full) */
+	/* Realtime-takeover diagnostics (rtdl.bpf.c, enqueue.bpf.c). */
+	u64 rt_takeovers;		/* 0->1 occupied transitions observed */
+	u64 rt_evacuations;		/* DSQ evacuation passes that ran */
+	u64 rt_redirects;		/* wakeups redirected off occupied CPUs */
+	u64 rt_reenqs;			/* SCX_ENQ_REENQ re-enqueues counted */
 	/*
-	 * Pad the counter struct to a 64-byte multiple: the tail counters
-	 * are write-hammered by every classification, and the published
-	 * tree meta line (mlfq_tree_ctrl) must not share a line with
-	 * them. The isolation itself comes from the
+	 * Pad the counter struct to a 64-byte multiple: the counters
+	 * before the pad are write-hammered by the hot paths, and the
+	 * published tree meta line (mlfq_tree_ctrl) must not share a line
+	 * with them. The isolation itself comes from the
 	 * __attribute__((aligned(64))) on the mlfq_tree_ctrl instance in
 	 * main.bpf.c, which pins that line to a dedicated cache line; the
 	 * padding here is the size hygiene that lets the aligned instance
 	 * sit on the following boundary by the plain declaration order,
 	 * so the two never land on the same line by layout accident.
 	 */
-	u64 pad[6];
+	u64 pad[2];
 };
 
 /*
@@ -1200,6 +1231,21 @@ struct mlfq_tree_map {
 };
 
 extern struct mlfq_tree_map mlfq_tree_map;
+
+/*
+ * The per-CPU realtime-occupancy state as a BPF array map, defined in
+ * main.bpf.c. The type and the extern are declared here so the BPF
+ * modules can look up the state; both are skipped outside the BPF
+ * build, where the native harness has no map machinery.
+ */
+struct mlfq_rtdl_state_map {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MLFQ_MAX_CPUS);
+	__type(key, u32);
+	__type(value, struct mlfq_rtdl_state);
+};
+
+extern struct mlfq_rtdl_state_map rtdl_state_stor;
 
 /**
  * mlfq_tree_predict - Predict the next CPU burst from a feature vector.

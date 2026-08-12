@@ -37,6 +37,8 @@
                 },{
                     "mlfq_dispatch_max_batch": 32
                 },{
+                    "mlfq_rtdl_drain_interval_ns": 1000000
+                },{
                     "mlfq_primary_all": false
                 },{
                     "mlfq_nr_llcs": 8
@@ -44,6 +46,8 @@
                     "mlfq_idle_tracking": 1
                 },{
                     "__SCX_ENQ_WAKEUP": 1
+                },{
+                    "__SCX_ENQ_REENQ": 1099511627776
                 },{
                     "__SCX_KICK_PREEMPT": 2
                 },{

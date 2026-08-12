@@ -12,6 +12,7 @@
  *   vtime.bpf.c      - EEVDF virtual-time substrate (virtual clock, placement)
  *   classify.bpf.c   - EMA gauge, queue mapping, hysteresis
  *   lifecycle.bpf.c  - task state, init_task/enable/running/stopping/exit_task/cpu_release
+ *   rtdl.bpf.c       - realtime/DL takeover tracking, sched_switch hook, evacuation
  *   select_cpu.bpf.c - CPU selection
  *   enqueue.bpf.c    - enqueue routing, aging, wakeup preemption
  *   dispatch.bpf.c   - queue service with quotas, cross-CPU stealing, keep path
@@ -57,6 +58,13 @@ struct {
 	__type(key, u32);
 	__type(value, struct mlfq_cpu_state);
 } cpu_state_stor SEC(".maps");
+
+/*
+ * Per-CPU realtime-occupancy state, keyed by cpu id. The flags reflect
+ * the class of the last task that ran on the CPU (see rtdl.bpf.c); the
+ * state is read by the sched_switch hook and the enqueue redirect.
+ */
+struct mlfq_rtdl_state_map rtdl_state_stor SEC(".maps");
 
 /*
  * Scheduler-wide state in .bss. The stats counters are shared across
@@ -157,6 +165,7 @@ const volatile u64 mlfq_preempt_slice_ns = MLFQ_PREEMPT_SLICE_NS;
 const volatile u32 mlfq_q1_quota = MLFQ_Q1_QUOTA;
 const volatile u32 mlfq_q2_quota = MLFQ_Q2_QUOTA;
 const volatile u32 mlfq_dispatch_max_batch = MLFQ_DISPATCH_MAX_BATCH;
+const volatile u64 mlfq_rtdl_drain_interval_ns = MLFQ_RTDL_DRAIN_INTERVAL_NS;
 
 /*
  * True when every CPU has the same capacity (uniform-capacity system): the
@@ -209,6 +218,7 @@ static __always_inline struct mlfq_cpu_state *mlfq_lookup_cpu_state(s32 cpu)
 #include "vtime.bpf.c"
 #include "classify.bpf.c"
 #include "lifecycle.bpf.c"
+#include "rtdl.bpf.c"
 #include "select_cpu.bpf.c"
 #include "enqueue.bpf.c"
 #include "dispatch.bpf.c"

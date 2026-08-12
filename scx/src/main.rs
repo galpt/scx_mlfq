@@ -39,6 +39,7 @@ use clap::Parser;
 use clap_complete::generate;
 use clap_complete::Shell;
 use crossbeam::channel::RecvTimeoutError;
+use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::MapCore;
 use log::info;
 use scx_stats::prelude::*;
@@ -277,6 +278,26 @@ impl<'a> Scheduler<'a> {
          */
         skel.struct_ops.mlfq_ops_mut().exit_dump_len = opts.exit_dump_len;
 
+        /*
+         * The sched_switch hook tracks realtime-class occupancy and
+         * attempts the takeover drain. It is needed on every kernel --
+         * the occupancy flag drives placement even where the drain
+         * cannot run -- so the optional tracepoint program is
+         * force-enabled here; the evacuation branches inside are
+         * ksym-gated and self-prune on kernels without the reenqueue
+         * kfuncs. The flip side of forcing it is that a kernel which
+         * rejects the hook at verification fails the whole load
+         * instead of degrading gracefully: the kfunc calls it makes
+         * have been in the tracing kfunc set since 6.18, but any new
+         * kernel that drops one of them must be tested before release.
+         */
+        unsafe {
+            libbpf_rs::libbpf_sys::bpf_program__set_autoload(
+                skel.progs.mlfq_sched_switch.as_libbpf_object().as_ptr(),
+                true,
+            );
+        }
+
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 
         // The membership bitmaps are written after load (the maps are only
@@ -419,6 +440,10 @@ impl<'a> Scheduler<'a> {
             tree_disagree: s.tree_disagree,
             tree_samples_emitted: s.tree_samples_emitted,
             tree_samples_dropped: s.tree_samples_dropped,
+            rt_takeovers: s.rt_takeovers,
+            rt_evacuations: s.rt_evacuations,
+            rt_redirects: s.rt_redirects,
+            rt_reenqs: s.rt_reenqs,
             tree_samples_cap_dropped: self.tree_samples_cap_dropped,
             tree_model_generation: self.model.generation,
             tree_model_nodes: self.model.nr_nodes as u64,
@@ -464,13 +489,14 @@ impl<'a> Scheduler<'a> {
 
         let m = self.get_metrics();
         log::info!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={}",
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
             m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
             m.enq_no_deadline, m.promotions, m.demotions, m.aging_boosts,
             m.short_sleep_boosts, m.cpuperf_boosts, m.preemption_kicks,
             m.total_runtime, m.on_cpu, m.steals, m.keep_running,
+            m.rt_takeovers, m.rt_evacuations, m.rt_redirects, m.rt_reenqs,
             m.tree_model_generation, m.tree_model_nodes, m.tree_model_samples,
             m.tree_mae_tree_us, m.tree_mae_ema_us, self.model.corr,
             m.tree_inference, m.tree_fallback, m.tree_disagree,

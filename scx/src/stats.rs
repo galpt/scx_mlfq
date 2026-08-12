@@ -84,6 +84,14 @@ pub struct Metrics {
     pub tree_samples_emitted: u64,
     #[stat(desc = "Training samples dropped (ring buffer full)")]
     pub tree_samples_dropped: u64,
+    #[stat(desc = "Realtime/DL/stop takeovers of SCX CPUs observed by the sched_switch hook")]
+    pub rt_takeovers: u64,
+    #[stat(desc = "DSQ evacuation passes that ran on realtime takeovers")]
+    pub rt_evacuations: u64,
+    #[stat(desc = "Placements redirected off realtime-occupied CPUs")]
+    pub rt_redirects: u64,
+    #[stat(desc = "SCX_ENQ_REENQ re-enqueues counted at enqueue")]
+    pub rt_reenqs: u64,
     #[stat(desc = "Training samples dropped by the per-pid window cap")]
     pub tree_samples_cap_dropped: u64,
     #[stat(desc = "Committed tree model generation, 0 while untrained")]
@@ -178,6 +186,10 @@ impl Metrics {
             tree_samples_dropped: self
                 .tree_samples_dropped
                 .wrapping_sub(rhs.tree_samples_dropped),
+            rt_takeovers: self.rt_takeovers.wrapping_sub(rhs.rt_takeovers),
+            rt_evacuations: self.rt_evacuations.wrapping_sub(rhs.rt_evacuations),
+            rt_redirects: self.rt_redirects.wrapping_sub(rhs.rt_redirects),
+            rt_reenqs: self.rt_reenqs.wrapping_sub(rhs.rt_reenqs),
             tree_samples_cap_dropped: self
                 .tree_samples_cap_dropped
                 .wrapping_sub(rhs.tree_samples_cap_dropped),

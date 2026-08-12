@@ -84,6 +84,9 @@ const Q1_QUOTA: u32 = crate::bpf_intf::mlfq_consts_MLFQ_Q1_QUOTA;
 const Q2_QUOTA: u32 = crate::bpf_intf::mlfq_consts_MLFQ_Q2_QUOTA;
 const DISPATCH_MAX_BATCH: u32 = crate::bpf_intf::mlfq_consts_MLFQ_DISPATCH_MAX_BATCH;
 
+/// Drain interval of the realtime-takeover evacuation, nsecs.
+const RTDL_DRAIN_INTERVAL_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS as u64;
+
 /// Validated scheduling constants.
 ///
 /// Every field maps to a `const volatile` rodata global in
@@ -128,6 +131,8 @@ pub struct Config {
     pub q2_quota: u32,
     /// Dispatch-loop bound.
     pub dispatch_max_batch: u32,
+    /// Drain interval of the realtime-takeover evacuation, nsecs.
+    pub rtdl_drain_interval_ns: u64,
 }
 
 impl Default for Config {
@@ -152,6 +157,7 @@ impl Default for Config {
             q1_quota: Q1_QUOTA,
             q2_quota: Q2_QUOTA,
             dispatch_max_batch: DISPATCH_MAX_BATCH,
+            rtdl_drain_interval_ns: RTDL_DRAIN_INTERVAL_NS,
         }
     }
 }
@@ -284,6 +290,7 @@ impl Config {
         rodata.mlfq_q1_quota = self.q1_quota;
         rodata.mlfq_q2_quota = self.q2_quota;
         rodata.mlfq_dispatch_max_batch = self.dispatch_max_batch;
+        rodata.mlfq_rtdl_drain_interval_ns = self.rtdl_drain_interval_ns;
         Ok(())
     }
 
@@ -293,7 +300,8 @@ impl Config {
             "slices: Q1={}us Q2={}us Q3={}us, T_L={}us, T_H={}us, \
              budget_max={}us, alpha={}, ema_half_life={}us, aging_period={}s, \
              short_sleep={}us, ss_rate_limit={}us, hysteresis_sleep={}us, \
-             long_sleep={}ms, sameq_min_run={}us, preempt_slice={}us, quotas: Q1={} Q2={} max_batch={}",
+             long_sleep={}ms, sameq_min_run={}us, preempt_slice={}us, \
+             rtdl_drain_interval={}us, quotas: Q1={} Q2={} max_batch={}",
             self.q1_slice_ns / NSEC_PER_USEC,
             self.q2_slice_ns / NSEC_PER_USEC,
             self.q3_slice_ns / NSEC_PER_USEC,
@@ -309,6 +317,7 @@ impl Config {
             self.long_sleep_ns / NSEC_PER_MSEC,
             self.sameq_preempt_min_run_ns / NSEC_PER_USEC,
             self.preempt_slice_ns / NSEC_PER_USEC,
+            self.rtdl_drain_interval_ns / NSEC_PER_USEC,
             self.q1_quota,
             self.q2_quota,
             self.dispatch_max_batch,
@@ -347,6 +356,7 @@ pub struct ConfigBuilder {
     q1_quota: Option<u32>,
     q2_quota: Option<u32>,
     dispatch_max_batch: Option<u32>,
+    rtdl_drain_interval_ns: Option<u64>,
 }
 
 /*
@@ -464,6 +474,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the realtime-takeover drain interval in nsecs.
+    pub fn rtdl_drain_interval_ns(mut self, v: u64) -> Self {
+        self.rtdl_drain_interval_ns = Some(v);
+        self
+    }
+
     /// Assemble and validate the configuration.
     ///
     /// Returns an error if any invariant is violated; the resulting
@@ -497,6 +513,9 @@ impl ConfigBuilder {
             dispatch_max_batch: self
                 .dispatch_max_batch
                 .unwrap_or(defaults.dispatch_max_batch),
+            rtdl_drain_interval_ns: self
+                .rtdl_drain_interval_ns
+                .unwrap_or(defaults.rtdl_drain_interval_ns),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -523,9 +542,9 @@ mod tests {
             mlfq_consts_MLFQ_LONG_SLEEP_NS, mlfq_consts_MLFQ_PREEMPT_SLICE_NS,
             mlfq_consts_MLFQ_Q1_QUOTA, mlfq_consts_MLFQ_Q1_SLICE_NS, mlfq_consts_MLFQ_Q2_QUOTA,
             mlfq_consts_MLFQ_Q2_SLICE_NS, mlfq_consts_MLFQ_Q3_SLICE_NS,
-            mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS, mlfq_consts_MLFQ_SHORT_SLEEP_NS,
-            mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS, mlfq_consts_MLFQ_T_H_NS,
-            mlfq_consts_MLFQ_T_L_NS,
+            mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS, mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS,
+            mlfq_consts_MLFQ_SHORT_SLEEP_NS, mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS,
+            mlfq_consts_MLFQ_T_H_NS, mlfq_consts_MLFQ_T_L_NS,
         };
 
         let cfg = Config::default();
@@ -563,6 +582,10 @@ mod tests {
         assert_eq!(cfg.q1_quota, mlfq_consts_MLFQ_Q1_QUOTA);
         assert_eq!(cfg.q2_quota, mlfq_consts_MLFQ_Q2_QUOTA);
         assert_eq!(cfg.dispatch_max_batch, mlfq_consts_MLFQ_DISPATCH_MAX_BATCH);
+        assert_eq!(
+            cfg.rtdl_drain_interval_ns,
+            mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS as u64
+        );
     }
 
     #[test]
@@ -668,6 +691,7 @@ mod tests {
         assert!(s.contains("slices: Q1=1000us Q2=2000us Q3=4000us"));
         assert!(s.contains("T_L=250us, T_H=2000us"));
         assert!(s.contains("aging_period=1s"));
+        assert!(s.contains("rtdl_drain_interval=1000us"));
         assert!(s.contains("quotas: Q1=4 Q2=8 max_batch=32"));
     }
 }
