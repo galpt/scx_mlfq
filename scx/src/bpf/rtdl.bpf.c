@@ -55,6 +55,88 @@ static __always_inline bool mlfq_cpu_occupied(s32 cpu)
 }
 
 /*
+ * Pick a non-occupied CPU out of a membership bitmap for @p: the same
+ * word-major, bit-minor bounded walk the idle scan in select_cpu.bpf.c
+ * uses, skipping occupied CPUs instead of busy ones. No idle marks are
+ * touched: the caller has already decided the wakeup must not land on
+ * an occupied core, and the kernel's idle accounting is unaffected.
+ *
+ * Return: The first non-occupied CPU @p may run on, or -ENOENT.
+ */
+static __always_inline s32
+mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
+			       const struct task_struct *p)
+{
+	u32 word, bit;
+
+	bpf_for(word, 0, MLFQ_BITMAP_WORDS) {
+		bpf_for(bit, 0, 64) {
+			u32 cand = word * 64 + bit;
+
+			if (cand >= MLFQ_MAX_CPUS)
+				break;
+			if (!mlfq_bitmap_test_cpu(bm, cand))
+				continue;
+			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
+				continue;
+			if (mlfq_cpu_occupied((s32)cand))
+				continue;
+			return (s32)cand;
+		}
+	}
+
+	return -ENOENT;
+}
+
+/*
+ * Pick a non-occupied CPU for @p, preferring the cache domain of @origin
+ * (the waker's CPU). The LLC pass walks the origin's membership bitmap;
+ * when it finds nothing, a flat bounded scan takes any non-occupied CPU
+ * @p may run on. An unpopulated LLC bitmap or an unknown LLC falls
+ * through to the flat scan.
+ *
+ * Return: A non-occupied CPU @p may run on, or -ENOENT.
+ */
+static __always_inline s32
+mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
+{
+	const struct mlfq_bitmap *bm;
+	s32 pick;
+	u32 cand;
+
+	if (origin >= 0 && (u32)origin < MLFQ_MAX_CPUS && mlfq_nr_llcs > 0) {
+		u32 origin_llc = mlfq_cpu_llc[(u32)origin];
+
+		if (origin_llc < MLFQ_MAX_LLCS && origin_llc < mlfq_nr_llcs) {
+			bm = bpf_map_lookup_elem(&mlfq_llc_bitmaps, &origin_llc);
+			if (bm) {
+				pick = mlfq_pick_unoccupied_in_bitmap(bm, p);
+				if (pick >= 0)
+					return pick;
+			}
+		}
+	}
+
+	/*
+	 * Global fallback: any non-occupied CPU in a flat bounded scan.
+	 * The LLC bitmaps partition the machine, but walking all of them
+	 * would nest three loops; a single scan over the CPU id space
+	 * reaches the same set in one bounded pass.
+	 */
+	bpf_for(cand, 0, MLFQ_MAX_CPUS) {
+		if (cand >= nr_cpu_ids)
+			break;
+		if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
+			continue;
+		if (mlfq_cpu_occupied((s32)cand))
+			continue;
+		return (s32)cand;
+	}
+
+	return -ENOENT;
+}
+
+/*
  * mlfq_rtdl_drain - Evacuation pass for a taken-over CPU.
  * @cpu: The CPU a realtime task took over.
  * @now: Current time (scx_bpf_now()).

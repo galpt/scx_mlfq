@@ -48,6 +48,13 @@
  * task for a full slice. Resolving the keep up front reads the queue
  * state once, before the slot loops churn it, and keeps the loop bodies
  * to a single job each.
+ *
+ * Realtime-takeover interaction: stealing from an occupied CPU's queue
+ * DSQs stays legal -- the steal scan is the second evacuation channel
+ * for tasks stranded by a takeover -- and no path dispatches TO an
+ * occupied CPU's local DSQ: dispatch runs only on CPUs the kernel hands
+ * to sched_ext, and the class-pick loop reaches sched_ext only when no
+ * higher-priority class has a runnable task.
  */
 
 /*

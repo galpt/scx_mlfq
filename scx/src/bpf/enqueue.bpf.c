@@ -95,6 +95,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	u8 old_queue;
 	bool wakeup, runout, local_fast_path, migration_disabled;
 	bool sched_idle;
+	bool skip_preempt = false;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 	s32 target_cpu;
 
@@ -280,12 +281,17 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	local_fast_path = __COMPAT_is_enq_cpu_selected(enq_flags) &&
 			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_VALID) &&
-			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_IDLE);
+			  (tctx->wake_cpu_state & MLFQ_WAKE_CPU_IDLE) &&
+			  !mlfq_cpu_occupied(bpf_get_smp_processor_id());
 	if (local_fast_path) {
 		/*
 		 * The FIFO local-DSQ insert does not consume a deadline,
 		 * so placement is deferred to the next real placement,
-		 * which re-anchors the task under the lag clamp.
+		 * which re-anchors the task under the lag clamp. The
+		 * occupied guard closes the window between the idle claim
+		 * and this insert: a realtime task taking the CPU over in
+		 * between would otherwise strand the wakeup in its local
+		 * DSQ until the takeover drain.
 		 */
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
 				   enq_flags);
@@ -311,6 +317,38 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	/* A concurrent affinity change may have dropped target_cpu; use the enqueueing CPU. */
 	if (!bpf_cpumask_test_cpu((u32)target_cpu, p->cpus_ptr))
 		target_cpu = bpf_get_smp_processor_id();
+
+	/*
+	 * A placement targeted at a CPU a realtime task is occupying is
+	 * redirected to a non-occupied CPU, and a wakeup's preemption is
+	 * skipped: preempting into an occupied CPU's local DSQ would
+	 * strand the wakeup behind the realtime task, so it falls
+	 * through to the regular vtime placement into the owning queue
+	 * DSQ instead. The redirect covers wakeups and the reenqueues of
+	 * the takeover drain alike: a reenqueued task's target is the
+	 * enqueueing CPU, which is the taken-over one, so without the
+	 * redirect the evacuation would only re-anchor the task in
+	 * place. The regular placement kicks the fallback CPU, so the
+	 * redirected task runs there. Classification and the lag clamp
+	 * are untouched -- only the owning queue DSQ changes, and the
+	 * queue DSQs of different CPUs share the per-queue virtual
+	 * clock, so the placement is identical wherever it lands. Run-out
+	 * re-enqueues and pinned tasks get no redirect: a run-out can be
+	 * enqueued by the kernel while the CPU is being taken over,
+	 * before the hook marks it, and lands in the owning queue DSQ
+	 * where the takeover drain or the steal scans serve it; a pinned
+	 * task cannot legally run elsewhere.
+	 */
+	if ((wakeup || (enq_flags & SCX_ENQ_REENQ)) &&
+	    mlfq_cpu_occupied(target_cpu)) {
+		s32 fallback = mlfq_pick_unoccupied_cpu(p, bpf_get_smp_processor_id());
+
+		skip_preempt = true;
+		if (fallback >= 0) {
+			target_cpu = fallback;
+			__sync_fetch_and_add(&mlfq_stats.rt_redirects, 1);
+		}
+	}
 
 	/*
 	 * Wakeup preemption: a wakeup outranks the task running on the CPU
@@ -339,9 +377,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	 * enqueue must not target a CPU outside the allowed set; the
 	 * local-DSQ insert is a same-rq operation, so the failure is a
 	 * placement violation rather than a fatal error, and the queue
-	 * placement is the correct fallback.
+	 * placement is the correct fallback. The redirect above sets
+	 * skip_preempt when the target CPU is occupied, so this block never
+	 * inserts into an occupied CPU's local DSQ.
 	 */
-	if (wakeup && !migration_disabled) {
+	if (wakeup && !migration_disabled && !skip_preempt) {
 		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
 		bool owed = false;
 

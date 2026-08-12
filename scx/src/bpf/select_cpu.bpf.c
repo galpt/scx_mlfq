@@ -222,9 +222,14 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * ops.update_idle() and this path is gated on mlfq_idle_tracking,
 	 * which is set only when the kernel keeps its built-in idle
 	 * tracking alongside the callback; without it, the behavior is
-	 * unchanged.
+	 * unchanged. An occupied prev_cpu falls through to the scans
+	 * regardless of the count: the idle count only tracks the kernel's
+	 * idle-thread transitions and can be stale about a realtime
+	 * takeover, so a CPU a realtime task is running on must not be
+	 * returned through this path.
 	 */
-	if (mlfq_idle_tracking && !mlfq_idle_count)
+	if (mlfq_idle_tracking && !mlfq_idle_count &&
+	    !mlfq_cpu_occupied(prev_cpu))
 		return prev_cpu;
 
 	/*
