@@ -296,10 +296,8 @@ void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 		return;
 
 	if (idle) {
-		cpu_state->idle_since = scx_bpf_now();
 		__sync_fetch_and_add(&mlfq_idle_count, 1);
 	} else {
-		cpu_state->idle_since = 0;
 		__sync_fetch_and_sub(&mlfq_idle_count, 1);
 	}
 }
