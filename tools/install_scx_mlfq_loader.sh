@@ -249,8 +249,12 @@ EOF
 
     info 'building the patched loader and scxctl (release profile)'
     # Own the target directory explicitly: the caller (install_scx_mlfq.sh)
-    # may have exported CARGO_TARGET_DIR for its own build.
-    if ! (cd "$BUILD_DIR" && CARGO_TARGET_DIR="$BUILD_DIR/target" cargo build --release -p scx_loader -p scxctl); then
+    # may have exported CARGO_TARGET_DIR for its own build. Cap the job
+    # count at half the cores so the build does not saturate the machine
+    # and stall the desktop it is running on.
+    _jobs=$(( $(nproc) / 2 ))
+    [ "$_jobs" -lt 2 ] && _jobs=2
+    if ! (cd "$BUILD_DIR" && CARGO_TARGET_DIR="$BUILD_DIR/target" cargo build --release -j "$_jobs" -p scx_loader -p scxctl); then
         err 'cargo build failed'
         exit 1
     fi
