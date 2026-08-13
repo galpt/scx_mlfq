@@ -432,7 +432,7 @@ ownership_gate() {
         warn "$BIN_PATH is a symlink; it will be replaced by a regular file"
     fi
 
-    # MEDIUM-2: pacman -Qo exit 0 means owned, exit 1 means unowned, any
+    # pacman -Qo exit 0 means owned, exit 1 means unowned, any
     # other exit (database locked/corrupt) must abort, never silently
     # proceed as "unowned".
     if pacman -Qo "$BIN_PATH" >/dev/null 2>&1; then

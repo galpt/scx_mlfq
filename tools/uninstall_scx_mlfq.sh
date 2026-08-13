@@ -23,6 +23,14 @@
 # use, and the drop-in is removed only if its content byte-matches what the
 # installer writes.
 #
+# When the loader manifest records webui_unblock=1 (or the web UI drop-in
+# byte-matches the content the loader installer writes), the
+# mlfq-webui.conf drop-in - which lifted the network sandbox the loader
+# applies to its scheduler children so the web UI can bind its loopback
+# HTTP port - is removed and systemd reloaded, restoring the sandbox. The
+# removal is by fixed filename plus a byte check, so a foreign drop-in in
+# the same directory can never be touched.
+#
 # When the scheduler detaches (either because scx.service is stopped or
 # because the binary is replaced), the kernel reverts to CFS automatically.
 #
@@ -48,6 +56,7 @@ LOADER_BIN="/usr/local/bin/scx_loader"
 SCXCTL_BIN="/usr/local/bin/scxctl"
 LOADER_DROPIN_DIR="/etc/systemd/system/scx_loader.service.d"
 LOADER_DROPIN="$LOADER_DROPIN_DIR/mlfq-loader.conf"
+WEBUI_DROPIN="$LOADER_DROPIN_DIR/mlfq-webui.conf"
 LOADER_MANIFEST="$LIB_DIR/scx_mlfq-loader.manifest"
 GUI_MANIFEST="$LIB_DIR/scx_mlfq-gui.manifest"
 GUI_LIB="/usr/lib/libscxctl-ui.so.1.15.12"
@@ -60,6 +69,7 @@ BACKUP_STATE=""
 DROPIN_BACKUP_STATE=""
 QKK_RESULT=""
 LOADER_BAK_STATE=""
+WEBUI_UNBLOCK_STATE=""
 
 info()  { printf '[INFO]  %s\n' "$1"; }
 ok()    { printf '[ OK ]  %s\n' "$1"; }
@@ -236,15 +246,19 @@ restore_or_remove_binary() {
             # Our beta binary is still in place; restore the package file.
             # BACKUP was verified regular (not a symlink) before we got here.
             run mv -f "$BACKUP" "$BIN_PATH"
-            if [ ! -f "$BIN_PATH" ] || [ -L "$BIN_PATH" ]; then
-                err "$BIN_PATH is missing or a symlink after restore; refusing to chmod"
-                exit 1
-            fi
-            run chmod 755 "$BIN_PATH"
-            RESTORED_SHA=$(sha256_of "$BIN_PATH")
-            if [ "$RESTORED_SHA" = "$ORIG_SHA256" ]; then
-                ok "$BIN_PATH restored from backup (sha256 verified against the manifest)"
+            if [ -z "$DRY_RUN" ]; then
+                if [ ! -f "$BIN_PATH" ] || [ -L "$BIN_PATH" ]; then
+                    err "$BIN_PATH is missing or a symlink after restore; refusing to chmod"
+                    exit 1
+                fi
+                run chmod 755 "$BIN_PATH"
+                RESTORED_SHA=$(sha256_of "$BIN_PATH")
             else
+                RESTORED_SHA=""
+            fi
+            if [ -n "$RESTORED_SHA" ] && [ "$RESTORED_SHA" = "$ORIG_SHA256" ]; then
+                ok "$BIN_PATH restored from backup (sha256 verified against the manifest)"
+            elif [ -z "$DRY_RUN" ]; then
                 warn "$BIN_PATH restored, but its sha256 differs from the recorded original"
                 warn "  restored: $RESTORED_SHA"
                 warn "  recorded: $ORIG_SHA256"
@@ -473,6 +487,26 @@ our_loader_dropin() {
     printf '[Service]\nExecStart=\nExecStart=%s\n' "$LOADER_BIN"
 }
 
+# webui_dropin: the exact bytes the loader installer owns for the web UI
+# network unblock (mlfq-webui.conf). Byte-identical to the loader
+# installer's webui_dropin() so the byte check below is a true match.
+webui_dropin() {
+    cat <<'EOF'
+# scx_mlfq Web UI: lift the network restrictions the loader applies to its
+# scheduler children so the web UI can bind the loopback HTTP port.
+# Owned by install_scx_mlfq_loader.sh; removed by uninstall_scx_mlfq.sh.
+[Service]
+RestrictAddressFamilies=
+SocketBindDeny=
+EOF
+}
+
+# webui_dropin_matches: 0 when the web UI drop-in on disk is byte-identical
+# to the content the loader installer writes.
+webui_dropin_matches() {
+    [ -f "$WEBUI_DROPIN" ] && cmp -s "$WEBUI_DROPIN" <(webui_dropin)
+}
+
 # parse_loader_manifest: strict key=value parser for the loader manifest.
 # Duplicate keys, unknown keys, and values with control characters are
 # rejected. Populates the LOADER_* globals used by remove_loader_patch().
@@ -485,6 +519,7 @@ parse_loader_manifest() {
     LOADER_VERSION=""
     SCXCTL_BIN_MF=""
     SCXCTL_SHA256_MF=""
+    WEBUI_UNBLOCK_MF=""
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
@@ -510,7 +545,9 @@ parse_loader_manifest() {
                 ;;
         esac
         case "$key" in
-            name|version|loader_bin|loader_dropin|loader_sha256|loader_dropin_backup|loader_scxctl_bin|loader_scxctl_sha256|install_time) ;;
+            name|version|loader_bin|loader_dropin|loader_sha256|\
+            loader_dropin_backup|loader_scxctl_bin|loader_scxctl_sha256|\
+            webui_unblock|install_time) ;;
             *)
                 err "loader manifest contains an unknown key: $(sanitize "$key")"
                 return 1
@@ -530,6 +567,7 @@ parse_loader_manifest() {
             loader_scxctl_bin) SCXCTL_BIN_MF="$value" ;;
             loader_scxctl_sha256) SCXCTL_SHA256_MF="$value" ;;
             loader_version) LOADER_VERSION="$value" ;;
+            webui_unblock) WEBUI_UNBLOCK_MF="$value" ;;
         esac
     done < "$LOADER_MANIFEST"
 }
@@ -603,6 +641,92 @@ remove_loader_patch() {
             run systemctl restart scx_loader                 || warn 'scx_loader restart failed; the stock loader takes over at the next start'
         fi
     fi
+}
+
+# report_webui_sandbox: read-only. Print the EFFECTIVE (merged) network
+# restrictions of scx_loader.service so the user can see whether the
+# packaged sandbox is in force again or a foreign drop-in still lifts it.
+# systemd renders an empty RestrictAddressFamilies as '~' and omits an
+# empty SocketBindDeny. Reports only, never touches anything.
+report_webui_sandbox() {
+    local out raf sbd
+
+    if [ -n "$DRY_RUN" ]; then
+        dry "systemctl show -p RestrictAddressFamilies -p SocketBindDeny scx_loader.service"
+    fi
+    out=$(systemctl show -p RestrictAddressFamilies \
+          -p SocketBindDeny scx_loader.service 2>/dev/null) || true
+    raf=$(printf '%s\n' "$out" | sed -n 's/^RestrictAddressFamilies=//p')
+    sbd=$(printf '%s\n' "$out" | sed -n 's/^SocketBindDeny=//p')
+
+    if [ -z "$out" ]; then
+        warn 'could not query scx_loader.service; cannot report the network sandbox state'
+        return 0
+    fi
+    if { [ -z "$raf" ] || [ "$raf" = "~" ]; } && [ -z "$sbd" ]; then
+        warn 'network sandbox still lifted by a foreign drop-in; leaving it untouched'
+    elif [ -z "$raf" ] || [ "$raf" = "~" ]; then
+        warn "network sandbox partially lifted (RestrictAddressFamilies empty, SocketBindDeny=$sbd)"
+    elif [ -z "$sbd" ]; then
+        warn "network sandbox partially restricted (RestrictAddressFamilies=$raf,"
+        warn "  SocketBindDeny empty)"
+    else
+        ok "network sandbox restored (RestrictAddressFamilies=$raf, SocketBindDeny=$sbd)"
+    fi
+}
+
+# remove_webui_unblock: remove the mlfq-webui.conf drop-in that lifts the
+# loader's network sandbox for the web UI, reload systemd so the packaged
+# restrictions are live again, restart an active loader, and report the
+# resulting state. The drop-in is removed only when the loader manifest
+# records webui_unblock=1 OR the file byte-matches the content the loader
+# installer writes (belt-and-braces for a lost manifest). The fixed
+# filename plus the byte check make touching a foreign drop-in in the same
+# directory structurally impossible.
+remove_webui_unblock() {
+    local _matches=""
+
+    if [ ! -f "$WEBUI_DROPIN" ]; then
+        info "web UI drop-in not present: $WEBUI_DROPIN"
+        WEBUI_UNBLOCK_STATE="absent"
+        report_webui_sandbox
+        return 0
+    fi
+
+    if webui_dropin_matches; then
+        _matches="1"
+    fi
+
+    if [ "$WEBUI_UNBLOCK_MF" != "1" ] && [ -z "$_matches" ]; then
+        info "web UI drop-in $WEBUI_DROPIN is not recorded as ours and does"
+        info "  not byte-match our content; leaving it"
+        WEBUI_UNBLOCK_STATE="left (not ours)"
+        report_webui_sandbox
+        return 0
+    fi
+
+    if [ -z "$_matches" ] && [ "$WEBUI_UNBLOCK_MF" = "1" ]; then
+        warn "web UI drop-in $WEBUI_DROPIN is recorded in the manifest but does"
+        warn "  not byte-match our content; removing it (the filename is fixed"
+        warn "  to our file)"
+    fi
+
+    run rm -f "$WEBUI_DROPIN"
+    ok "removed web UI drop-in $WEBUI_DROPIN"
+    WEBUI_UNBLOCK_STATE="removed"
+
+    # Reload the unit so the packaged restrictions are live (and
+    # reportable), then restart an active loader only now that the removal
+    # actually happened, mirroring remove_loader_patch's gate.
+    run systemctl daemon-reload || warn 'systemctl daemon-reload failed'
+    if systemctl is-active --quiet scx_loader 2>/dev/null; then
+        if ! run systemctl restart scx_loader; then
+            warn 'scx_loader restart failed; the network sandbox is restored'
+            warn '  at the next loader start'
+        fi
+    fi
+
+    report_webui_sandbox
 }
 
 # parse_gui_manifest: strict key=value parser for the GUI manifest.
@@ -713,13 +837,18 @@ restore_gui_lib() {
             exit 1
         fi
         run mv -f "$GUI_BACKUP" "$GUI_LIB"
-        if [ ! -f "$GUI_LIB" ] || [ -L "$GUI_LIB" ]; then
-            err "$GUI_LIB is missing or a symlink after restore; refusing to chmod"
-            exit 1
+        if [ -z "$DRY_RUN" ]; then
+            if [ ! -f "$GUI_LIB" ] || [ -L "$GUI_LIB" ]; then
+                err "$GUI_LIB is missing or a symlink after restore; refusing to chmod"
+                exit 1
+            fi
+            run chmod 755 "$GUI_LIB"
+            RESTORED_SHA=$(sha256_of "$GUI_LIB")
+        else
+            RESTORED_SHA=""
         fi
-        run chmod 755 "$GUI_LIB"
-        RESTORED_SHA=$(sha256_of "$GUI_LIB")
-        if [ -n "$GUI_ORIG_SHA256" ] && [ "$RESTORED_SHA" = "$GUI_ORIG_SHA256" ]; then
+        if [ -n "$RESTORED_SHA" ] && [ -n "$GUI_ORIG_SHA256" ] && \
+           [ "$RESTORED_SHA" = "$GUI_ORIG_SHA256" ]; then
             ok "$GUI_LIB restored from backup (sha256 verified against the manifest)"
         else
             warn "$GUI_LIB restored, but its sha256 differs from the recorded original"
@@ -765,6 +894,7 @@ summary() {
     printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
     printf '  %-24s %s\n' 'Patched scxctl:' "$SCXCTL_BIN_STATE"
     printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
+    printf '  %-24s %s\n' 'Web UI unblock:' "$WEBUI_UNBLOCK_STATE"
     printf '  %-24s %s\n' 'GUI library:' "$GUI_LIB_STATE"
     printf '  %-24s %s\n' 'scx.service:' 'left in place (not disabled)'
     if [ -n "$DROPIN_BACKUP" ]; then
@@ -927,6 +1057,9 @@ main() {
 
     step 'Removing the patched scx_loader'
     remove_loader_patch
+
+    step 'Restoring the loader network sandbox'
+    remove_webui_unblock
 
     step 'Restoring the GUI library'
     restore_gui_lib
