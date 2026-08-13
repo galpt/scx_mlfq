@@ -591,6 +591,8 @@ remove_loader_patch() {
             info "$SCXCTL_BIN is already absent"
             SCXCTL_BIN_STATE="absent"
         fi
+    else
+        SCXCTL_BIN_STATE="none recorded"
     fi
 
     if [ -n "$LOADER_BIN_STATE" ] && [ -n "$LOADER_DROPIN_STATE" ]        && { [ "$LOADER_BIN_STATE" = "removed" ] || [ "$LOADER_BIN_STATE" = "absent" ]; }        && { [ "$LOADER_DROPIN_STATE" = "removed" ] || [ "$LOADER_DROPIN_STATE" = "absent" ]; }; then
