@@ -183,17 +183,22 @@ Options:
 
 What it does, in order:
 
-1. Downloads the published `scx_loader` crate (pinned version 1.1.2) from
-   crates.io, extracts it, and applies `tools/scx_loader-mlfq.patch`, which
-   adds scx_mlfq to the supported-scheduler enum.
-2. Builds it with `cargo build --release`.
+1. Downloads the published `scx_loader` and `scxctl` crates (pinned
+   version 1.1.2) from crates.io, extracts them, and applies
+   `tools/scx_loader-mlfq.patch`, which adds scx_mlfq to the
+   supported-scheduler enum.
+2. Builds both with `cargo build --release` in a workspace that pins
+   scxctl's `scx_loader` dependency to the patched source, so the
+   command-line tool parses the same enum the patched loader runs.
 3. Installs the patched loader as `/usr/local/bin/scx_loader` and writes a
    systemd drop-in (`scx_loader.service.d/mlfq-loader.conf`) that overrides
    `ExecStart` to use it, so package upgrades of the stock loader do not
    replace it.
-4. Enables `scx_loader.service`, so the patched loader (and with it the
+4. Installs the patched scxctl as `/usr/local/bin/scxctl`, ahead of the
+   packaged binary in PATH, so `scxctl switch --sched mlfq` works.
+5. Enables `scx_loader.service`, so the patched loader (and with it the
    scx_mlfq entry in the GUI) survives reboots.
-5. Records the install in `/usr/lib/scx/scx_mlfq-loader.manifest`
+6. Records the install in `/usr/lib/scx/scx_mlfq-loader.manifest`
    (its own manifest, separate from the beta manifest), so the uninstaller
    can undo exactly this step.
 

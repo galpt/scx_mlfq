@@ -17,6 +17,12 @@
 # GUI then lists scx_mlfq and can start, stop and switch to it like any
 # other registered scheduler.
 #
+# scxctl, the command-line front-end, parses the same SupportedSched
+# enum from the same crate, so it is built against the patched source and
+# installed as /usr/local/bin/scxctl, ahead of the packaged binary in
+# PATH. Without it, scxctl cannot parse scx_mlfq and aborts on any
+# switch command.
+#
 # The install is recorded in the scx_mlfq beta manifest
 # (/usr/lib/scx/scx_mlfq-beta.manifest) under the loader_* keys, so
 # uninstall_scx_mlfq.sh removes exactly the files this script created.
@@ -45,12 +51,17 @@ LOADER_DROPIN_BACKUP="$LIB_DIR/scx_loader.service.d.mlfq-loader.conf.bak"
 LOADER_DROPIN_BACKUP_RECORDED=""
 LOADER_CRATE_VERSION="1.1.2"
 LOADER_CRATE_URL="https://static.crates.io/crates/scx_loader/scx_loader-${LOADER_CRATE_VERSION}.crate"
+SCXCTL_CRATE_VERSION="1.1.2"
+SCXCTL_CRATE_URL="https://static.crates.io/crates/scxctl/scxctl-${SCXCTL_CRATE_VERSION}.crate"
+SCXCTL_BIN="/usr/local/bin/scxctl"
 
 FORCE=""
 DRY_RUN=""
 BUILD_DIR=""
 CRATE_DIR=""
+SCXCTL_DIR=""
 LOADER_BIN_SHA=""
+SCXCTL_BIN_SHA=""
 LOADER_DROPIN_BACKUP_RECORDED=""
 
 info()  { printf '[INFO]  %s\n' "$1"; }
@@ -119,7 +130,7 @@ record_manifest() {
     local _tmp
 
     if [ -n "$DRY_RUN" ]; then
-        dry "write $LOADER_MANIFEST (name, version, loader_bin, loader_dropin, loader_sha256, install_time)"
+        dry "write $LOADER_MANIFEST (name, version, loader_bin, loader_dropin, loader_sha256, loader_scxctl_bin, loader_scxctl_sha256, install_time)"
         return 0
     fi
 
@@ -131,6 +142,8 @@ version=$LOADER_CRATE_VERSION
 loader_bin=$LOADER_BIN
 loader_dropin=$LOADER_DROPIN
 loader_sha256=$LOADER_BIN_SHA
+loader_scxctl_bin=$SCXCTL_BIN
+loader_scxctl_sha256=$SCXCTL_BIN_SHA
 loader_dropin_backup=${LOADER_DROPIN_BACKUP_RECORDED:-}
 install_time=$(date +%Y-%m-%dT%H:%M:%S%z)
 EOF
@@ -178,19 +191,29 @@ fetch_and_patch_crate() {
 
     if [ -n "$DRY_RUN" ]; then
         dry "download $LOADER_CRATE_URL"
-        dry 'extract and apply the scx_loader-mlfq.patch'
-        dry "cargo build --release (in the extracted crate)"
+        dry "download $SCXCTL_CRATE_URL"
+        dry 'extract both crates and apply the scx_loader-mlfq.patch'
+        dry "cargo build --release -p scx_loader -p scxctl (in the workspace)"
         return 0
     fi
 
     BUILD_DIR=$(mktemp -d /tmp/scx_mlfq-loader-build.XXXXXX)
     CRATE_DIR="$BUILD_DIR/scx_loader-$LOADER_CRATE_VERSION"
+    SCXCTL_DIR="$BUILD_DIR/scxctl-$SCXCTL_CRATE_VERSION"
 
     info "downloading $LOADER_CRATE_URL"
-    curl --fail --silent --show-error --location "$LOADER_CRATE_URL" -o "$BUILD_DIR/crate.crate"
-    tar xzf "$BUILD_DIR/crate.crate" -C "$BUILD_DIR"
+    curl --fail --silent --show-error --location "$LOADER_CRATE_URL" -o "$BUILD_DIR/scx_loader.crate"
+    tar xzf "$BUILD_DIR/scx_loader.crate" -C "$BUILD_DIR"
     if [ ! -d "$CRATE_DIR" ]; then
         err "crate archive did not contain $CRATE_DIR"
+        exit 1
+    fi
+
+    info "downloading $SCXCTL_CRATE_URL"
+    curl --fail --silent --show-error --location "$SCXCTL_CRATE_URL" -o "$BUILD_DIR/scxctl.crate"
+    tar xzf "$BUILD_DIR/scxctl.crate" -C "$BUILD_DIR"
+    if [ ! -d "$SCXCTL_DIR" ]; then
+        err "crate archive did not contain $SCXCTL_DIR"
         exit 1
     fi
 
@@ -211,10 +234,23 @@ fetch_and_patch_crate() {
     fi
     ok 'patch applied'
 
-    info 'building the patched loader (release profile)'
+    # scxctl depends on the published scx_loader crate by version. The
+    # workspace below pins that dependency to the patched source, so the
+    # scxctl binary is built against the same SupportedSched enum the
+    # patched loader runs.
+    cat > "$BUILD_DIR/Cargo.toml" <<EOF
+[workspace]
+members = ["scx_loader-$LOADER_CRATE_VERSION", "scxctl-$SCXCTL_CRATE_VERSION"]
+resolver = "2"
+
+[patch.crates-io]
+scx_loader = { path = "scx_loader-$LOADER_CRATE_VERSION" }
+EOF
+
+    info 'building the patched loader and scxctl (release profile)'
     # Own the target directory explicitly: the caller (install_scx_mlfq.sh)
     # may have exported CARGO_TARGET_DIR for its own build.
-    if ! (cd "$CRATE_DIR" && CARGO_TARGET_DIR="$BUILD_DIR/target" cargo build --release); then
+    if ! (cd "$BUILD_DIR" && CARGO_TARGET_DIR="$BUILD_DIR/target" cargo build --release -p scx_loader -p scxctl); then
         err 'cargo build failed'
         exit 1
     fi
@@ -235,6 +271,23 @@ install_loader_binary() {
     LOADER_BIN_SHA=$(sha256_of "$_built")
     install -m 755 "$_built" "$LOADER_BIN"
     ok "installed $LOADER_BIN"
+}
+
+install_scxctl_binary() {
+    local _built="$BUILD_DIR/target/release/scxctl"
+
+    if [ -n "$DRY_RUN" ]; then
+        dry "install the built scxctl to $SCXCTL_BIN"
+        return 0
+    fi
+
+    if [ ! -f "$_built" ]; then
+        err "built scxctl not found at $_built"
+        exit 1
+    fi
+    SCXCTL_BIN_SHA=$(sha256_of "$_built")
+    install -m 755 "$_built" "$SCXCTL_BIN"
+    ok "installed $SCXCTL_BIN (patched scxctl parses scx_mlfq)"
 }
 
 install_dropin() {
@@ -299,21 +352,31 @@ verify_registration() {
 
     if [ -n "$DRY_RUN" ]; then
         dry "verify: SupportedSchedulers lists scx_mlfq (busctl)"
+        dry "verify: $SCXCTL_BIN embeds scx_mlfq (strings)"
         return 0
     fi
 
     if ! systemctl is-active --quiet scx_loader 2>/dev/null; then
         info 'scx_loader is not running; start it (or open the Kernel Manager GUI) to see scx_mlfq'
-        return 0
+    else
+        if OUT=$(busctl --system get-property org.scx.Loader /org/scx/Loader \
+                org.scx.Loader SupportedSchedulers 2>/dev/null) \
+           && [ "$(printf '%s' "$OUT" | grep -c 'scx_mlfq')" -ge 1 ]; then
+            ok 'scx_mlfq is registered with the running scx_loader; the GUI can select it'
+        else
+            warn 'could not confirm scx_mlfq in the loader SupportedSchedulers list'
+            warn "  loader output: ${OUT:-<none>}"
+        fi
     fi
 
-    if OUT=$(busctl --system get-property org.scx.Loader /org/scx/Loader \
-            org.scx.Loader SupportedSchedulers 2>/dev/null) \
-       && [ "$(printf '%s' "$OUT" | grep -c 'scx_mlfq')" -ge 1 ]; then
-        ok 'scx_mlfq is registered with the running scx_loader; the GUI can select it'
+    if [ ! -f "$SCXCTL_BIN" ]; then
+        warn "$SCXCTL_BIN is missing"
+        return 0
+    fi
+    if strings "$SCXCTL_BIN" 2>/dev/null | grep -q 'scx_mlfq'; then
+        ok "$SCXCTL_BIN parses scx_mlfq"
     else
-        warn 'could not confirm scx_mlfq in the loader SupportedSchedulers list'
-        warn "  loader output: ${OUT:-<none>}"
+        warn "$SCXCTL_BIN does not embed scx_mlfq; the packaged binary is still first in PATH"
     fi
 }
 
@@ -345,6 +408,9 @@ main() {
     step 'Installing the patched loader'
     install_loader_binary
 
+    step 'Installing the patched scxctl'
+    install_scxctl_binary
+
     step 'Overriding scx_loader.service'
     install_dropin
 
@@ -362,9 +428,10 @@ main() {
         return 0
     fi
 
-    printf '\n=== patched scx_loader installed ===\n'
+    printf '\n=== patched scx_loader and scxctl installed ===\n'
     printf 'The CachyOS Kernel Manager GUI now lists scx_mlfq and can start,\n'
-    printf 'stop and switch to it like any other registered scheduler.\n'
+    printf 'stop and switch to it like any other registered scheduler, and\n'
+    printf 'scxctl accepts scx_mlfq on the command line.\n'
     printf 'Remove with:  sudo bash uninstall_scx_mlfq.sh\n'
 }
 

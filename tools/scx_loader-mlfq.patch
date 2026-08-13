@@ -1,6 +1,6 @@
 diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/config.rs scx_loader-1.1.2/src/config.rs
---- scx_loader-1.1.2.orig/src/config.rs	2026-08-06 17:25:20.656318870 +0700
-+++ scx_loader-1.1.2/src/config.rs	2026-08-06 17:18:24.963384172 +0700
+--- scx_loader-1.1.2.orig/src/config.rs	2006-07-24 08:21:28.000000000 +0700
++++ scx_loader-1.1.2/src/config.rs	2026-08-13 20:54:24.078082325 +0700
 @@ -110,6 +110,7 @@
          SupportedSched::Pandemonium,
          SupportedSched::Flow,
@@ -19,9 +19,22 @@ diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/co
      }
  }
  
+@@ -370,6 +372,12 @@
+ auto_mode = []
+ gaming_mode = []
+ lowlatency_mode = []
++powersave_mode = []
++server_mode = []
++[scheds.scx_mlfq]
++auto_mode = []
++gaming_mode = []
++lowlatency_mode = []
+ powersave_mode = []
+ server_mode = []
+ "#;
 diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/lib.rs scx_loader-1.1.2/src/lib.rs
---- scx_loader-1.1.2.orig/src/lib.rs	2026-08-06 17:25:20.656359748 +0700
-+++ scx_loader-1.1.2/src/lib.rs	2026-08-06 17:19:09.651496039 +0700
+--- scx_loader-1.1.2.orig/src/lib.rs	2006-07-24 08:21:28.000000000 +0700
++++ scx_loader-1.1.2/src/lib.rs	2026-08-13 20:54:24.068596875 +0700
 @@ -46,6 +46,8 @@
      Flow,
      #[serde(rename = "scx_forge")]
@@ -48,8 +61,8 @@ diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/li
              SupportedSched::P2DQ => "scx_p2dq",
              SupportedSched::Tickless => "scx_tickless",
 diff -ruN '--exclude=Cargo.lock' '--exclude=target' scx_loader-1.1.2.orig/src/main.rs scx_loader-1.1.2/src/main.rs
---- scx_loader-1.1.2.orig/src/main.rs	2026-08-06 17:25:20.656391949 +0700
-+++ scx_loader-1.1.2/src/main.rs	2026-08-06 17:18:24.963315872 +0700
+--- scx_loader-1.1.2.orig/src/main.rs	2006-07-24 08:21:28.000000000 +0700
++++ scx_loader-1.1.2/src/main.rs	2026-08-13 20:54:24.068666836 +0700
 @@ -124,6 +124,7 @@
              "scx_tickless",
              "scx_rustland",

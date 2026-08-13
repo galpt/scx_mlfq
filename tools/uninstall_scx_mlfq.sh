@@ -45,6 +45,7 @@ DROPIN_DIR="/etc/systemd/system/scx.service.d"
 DROPIN="$DROPIN_DIR/scx_mlfq-beta.conf"
 SCX_LOADER_CONFIG="/etc/scx_loader.toml"
 LOADER_BIN="/usr/local/bin/scx_loader"
+SCXCTL_BIN="/usr/local/bin/scxctl"
 LOADER_DROPIN_DIR="/etc/systemd/system/scx_loader.service.d"
 LOADER_DROPIN="$LOADER_DROPIN_DIR/mlfq-loader.conf"
 LOADER_MANIFEST="$LIB_DIR/scx_mlfq-loader.manifest"
@@ -128,6 +129,8 @@ parse_manifest() {
     LOADER_DROPIN_MF=""
     LOADER_SHA256=""
     LOADER_VERSION=""
+    SCXCTL_BIN_MF=""
+    SCXCTL_SHA256_MF=""
     INSTALL_TIME=""
     SOURCE=""
     BRANCH=""
@@ -480,6 +483,8 @@ parse_loader_manifest() {
     LOADER_DROPIN_MF=""
     LOADER_SHA256=""
     LOADER_VERSION=""
+    SCXCTL_BIN_MF=""
+    SCXCTL_SHA256_MF=""
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
@@ -505,7 +510,7 @@ parse_loader_manifest() {
                 ;;
         esac
         case "$key" in
-            name|version|loader_bin|loader_dropin|loader_sha256|loader_dropin_backup|install_time) ;;
+            name|version|loader_bin|loader_dropin|loader_sha256|loader_dropin_backup|loader_scxctl_bin|loader_scxctl_sha256|install_time) ;;
             *)
                 err "loader manifest contains an unknown key: $(sanitize "$key")"
                 return 1
@@ -522,6 +527,8 @@ parse_loader_manifest() {
             loader_bin) LOADER_BIN_MF="$value" ;;
             loader_dropin) LOADER_DROPIN_MF="$value" ;;
             loader_sha256) LOADER_SHA256="$value" ;;
+            loader_scxctl_bin) SCXCTL_BIN_MF="$value" ;;
+            loader_scxctl_sha256) SCXCTL_SHA256_MF="$value" ;;
             loader_version) LOADER_VERSION="$value" ;;
         esac
     done < "$LOADER_MANIFEST"
@@ -529,13 +536,14 @@ parse_loader_manifest() {
 
 # remove_loader_patch: undo the patched-loader install. The drop-in is
 # removed only when it byte-matches the content the loader installer
-# writes; the binary only when its sha256 matches the manifest record.
-# The stock loader then takes over at the next service start.
+# writes; the binaries only when their sha256 matches the manifest
+# records. The stock loader then takes over at the next service start.
 remove_loader_patch() {
-    if [ -z "$LOADER_BIN_MF" ] && [ -z "$LOADER_DROPIN_MF" ]; then
+    if [ -z "$LOADER_BIN_MF" ] && [ -z "$LOADER_DROPIN_MF" ] && [ -z "$SCXCTL_BIN_MF" ]; then
         info 'no patched loader recorded in the manifest; nothing to remove'
         LOADER_BIN_STATE="none recorded"
         LOADER_DROPIN_STATE="none recorded"
+        SCXCTL_BIN_STATE="none recorded"
         return 0
     fi
 
@@ -568,6 +576,20 @@ remove_loader_patch() {
         # Remove the parent directory only if it is now empty.
         if [ -d "$LOADER_DROPIN_DIR" ] && [ -z "$(ls -A "$LOADER_DROPIN_DIR" 2>/dev/null || true)" ]; then
             run rmdir "$LOADER_DROPIN_DIR" || true
+        fi
+    fi
+
+    if [ -n "$SCXCTL_BIN_MF" ]; then
+        if [ -f "$SCXCTL_BIN" ] && [ -n "$SCXCTL_SHA256_MF" ]            && [ "$(sha256_of "$SCXCTL_BIN")" = "$SCXCTL_SHA256_MF" ]; then
+            run rm -f "$SCXCTL_BIN"
+            ok "removed patched scxctl $SCXCTL_BIN"
+            SCXCTL_BIN_STATE="removed"
+        elif [ -e "$SCXCTL_BIN" ]; then
+            warn "$SCXCTL_BIN differs from the recorded patched scxctl; leaving it"
+            SCXCTL_BIN_STATE="left (sha mismatch)"
+        else
+            info "$SCXCTL_BIN is already absent"
+            SCXCTL_BIN_STATE="absent"
         fi
     fi
 
@@ -739,6 +761,7 @@ summary() {
     printf '  %-24s %s\n' 'mlfq default:' "$LOADER_DEFAULT_STATE"
     printf '  %-24s %s\n' 'Loader config backups:' "$LOADER_BAK_STATE"
     printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
+    printf '  %-24s %s\n' 'Patched scxctl:' "$SCXCTL_BIN_STATE"
     printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
     printf '  %-24s %s\n' 'GUI library:' "$GUI_LIB_STATE"
     printf '  %-24s %s\n' 'scx.service:' 'left in place (not disabled)'
