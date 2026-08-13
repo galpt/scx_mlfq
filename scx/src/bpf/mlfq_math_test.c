@@ -10,11 +10,25 @@
  */
 
 #define MLFQ_CHECK 1
+
 #include "intf.h"
+
+/*
+ * Shadow runnable gauges: intf.h declares the per-LLC and per-queue
+ * runnable gauge externs unconditionally (the BPF build gets them from
+ * the main.bpf.c bss block); the harness provides the storage itself so
+ * the pure accounting helpers can be driven against real arrays.
+ */
+volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
+volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
 
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 static int nr_failed;
 
@@ -877,6 +891,389 @@ static void test_mlfq_check_tree_predicates(void)
 		"the feature id masks to 0..7 before the bound check");
 }
 
+/* --- Runnable accounting contract -------------------------------------- */
+
+static void rn_state_reset(void)
+{
+	memset((void *)mlfq_llc_runnable, 0,
+	       sizeof(mlfq_llc_runnable[0]) * MLFQ_MAX_LLCS);
+	memset((void *)mlfq_queue_runnable, 0,
+	       sizeof(mlfq_queue_runnable[0]) * (MLFQ_NR_QUEUES + 1));
+}
+
+static u32 rn_llc_sum(void)
+{
+	u32 sum = 0;
+	u32 i;
+
+	for (i = 0; i < MLFQ_MAX_LLCS; i++)
+		sum += mlfq_llc_runnable[i];
+	return sum;
+}
+
+static u32 rn_queue_sum(void)
+{
+	u32 sum = 0;
+	u32 i;
+
+	for (i = 1; i <= MLFQ_NR_QUEUES; i++)
+		sum += mlfq_queue_runnable[i];
+	return sum;
+}
+
+/*
+ * Fresh enter: an unowned task (wakeup, fork, class-switch-in) is
+ * counted once at the destination LLC and queue, and the ownership
+ * record is set. A second task on the same LLC counts independently.
+ */
+static void test_runnable_enter_fresh(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+	struct task_ctx u = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+
+	rn_state_reset();
+	mlfq_runnable_enter(&t, 1, 2);
+	TEST_OK(mlfq_llc_runnable[2] == 1 && mlfq_queue_runnable[1] == 1 &&
+		t.last_llc == 2 && t.last_qid == 1,
+		"fresh enter counts LLC 2 Q1 once and records ownership");
+
+	mlfq_runnable_enter(&u, 3, 2);
+	TEST_OK(mlfq_llc_runnable[2] == 2 && mlfq_queue_runnable[3] == 1 &&
+		rn_llc_sum() == 2 && rn_queue_sum() == 2,
+		"a second task on the same LLC counts separately");
+}
+
+/*
+ * Continuation enters: the task is already counted, so the call only
+ * moves its ownership. The table drives one task through the moves and
+ * checks the gauge deltas and the invariant that the total counted
+ * stays 1: only a changed LLC or queue moves a unit between indexes.
+ */
+static void test_runnable_enter_continuation_table(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+	struct rn_row {
+		u8 qid;
+		u32 llc;
+		s32 llc_delta;	/* expected LLC-gauge delta for row.llc */
+		s32 q_delta;	/* expected queue-gauge delta for row.qid */
+		u8 exp_llc;
+		u8 exp_qid;
+	};
+	const struct rn_row rows[] = {
+		{ .qid = 1, .llc = 0, .llc_delta = 1, .q_delta = 1,
+		  .exp_llc = 0, .exp_qid = 1 },	/* fresh: count once */
+		{ .qid = 1, .llc = 0, .llc_delta = 0, .q_delta = 0,
+		  .exp_llc = 0, .exp_qid = 1 },	/* run-out: no move */
+		{ .qid = 2, .llc = 0, .llc_delta = 0, .q_delta = 1,
+		  .exp_llc = 0, .exp_qid = 2 },	/* queue move (aging) */
+		{ .qid = 2, .llc = 1, .llc_delta = 1, .q_delta = 0,
+		  .exp_llc = 1, .exp_qid = 2 },	/* LLC move (steal) */
+		{ .qid = 3, .llc = 1, .llc_delta = 0, .q_delta = 1,
+		  .exp_llc = 1, .exp_qid = 3 },	/* queue move again */
+	};
+	u32 i;
+
+	rn_state_reset();
+	for (i = 0; i < ARRAY_SIZE(rows); i++) {
+		const struct rn_row *r = &rows[i];
+		u32 prev_llc = mlfq_llc_runnable[r->llc];
+		u32 prev_q = mlfq_queue_runnable[r->qid];
+
+		mlfq_runnable_enter(&t, r->qid, r->llc);
+		TEST_OK((s32)(mlfq_llc_runnable[r->llc] - prev_llc) == r->llc_delta &&
+			(s32)(mlfq_queue_runnable[r->qid] - prev_q) == r->q_delta &&
+			t.last_llc == r->exp_llc && t.last_qid == r->exp_qid &&
+			rn_llc_sum() == 1 && rn_queue_sum() == 1,
+			"continuation row %u: qid %u llc %u keeps the total at 1",
+			i, r->qid, r->llc);
+	}
+}
+
+/*
+ * A same-LLC, same-queue continuation is the common run-out re-enqueue:
+ * a strict no-op on both gauges and on the ownership record.
+ */
+static void test_runnable_continuation_noop(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+
+	rn_state_reset();
+	mlfq_runnable_enter(&t, 1, 0);
+	mlfq_runnable_enter(&t, 1, 0);
+	TEST_OK(mlfq_llc_runnable[0] == 1 && mlfq_queue_runnable[1] == 1 &&
+		t.last_llc == 0 && t.last_qid == 1,
+		"same-LLC same-queue continuation does not re-count");
+}
+
+/*
+ * Exit releases the task from both gauges and returns the ownership
+ * record to the unowned state; a second exit and an exit of a task
+ * never counted are no-ops (the release is idempotent against a racing
+ * double-release).
+ */
+static void test_runnable_exit(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+	struct task_ctx u = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+	u32 prev;
+
+	rn_state_reset();
+	mlfq_runnable_enter(&t, 2, 1);
+	mlfq_runnable_exit(&t);
+	TEST_OK(mlfq_llc_runnable[1] == 0 && mlfq_queue_runnable[2] == 0 &&
+		t.last_llc == MLFQ_LLC_UNOWNED && t.last_qid == 0,
+		"exit releases LLC and queue counts and resets ownership");
+
+	prev = mlfq_llc_runnable[1] + mlfq_queue_runnable[2];
+	mlfq_runnable_exit(&t);		/* double release */
+	mlfq_runnable_exit(&u);		/* never counted */
+	TEST_OK(mlfq_llc_runnable[1] + mlfq_queue_runnable[2] == prev &&
+		t.last_llc == MLFQ_LLC_UNOWNED && u.last_llc == MLFQ_LLC_UNOWNED,
+		"double release and release of an unowned task are no-ops");
+}
+
+/*
+ * The global-park cycle: a task parked on the kernel-owned global DSQ
+ * is not counted (its enqueue released any prior ownership), and its
+ * runnable episode is observed at ops.running() as a fresh enter. The
+ * exit then releases the episode.
+ */
+static void test_runnable_global_park_cycle(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+
+	rn_state_reset();
+
+	/* First episode: counted at its enqueue, released at quiescent. */
+	mlfq_runnable_enter(&t, 1, 0);
+	mlfq_runnable_exit(&t);
+	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0,
+		"sleep after a counted episode releases everything");
+
+	/* Global park: the enqueue releases, so no gauge moves. */
+	mlfq_runnable_enter(&t, 2, 0);
+	mlfq_runnable_exit(&t);		/* the pinned-global release */
+	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0 &&
+		t.last_llc == MLFQ_LLC_UNOWNED,
+		"global-park release un-counts the parked task");
+
+	/* The running acquisition starts a fresh episode. */
+	mlfq_runnable_enter(&t, 2, 3);
+	TEST_OK(mlfq_llc_runnable[3] == 1 && mlfq_queue_runnable[2] == 1 &&
+		t.last_llc == 3 && t.last_qid == 2,
+		"running acquisition counts the global-parked task");
+
+	mlfq_runnable_exit(&t);
+	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0,
+		"exit releases the running-observed episode");
+}
+
+/*
+ * The sentinel-LLC no-op: when the caller has no valid domain (LLC
+ * awareness disabled, nr_llcs == 0, the mlfq_llc_of_cpu() sentinel),
+ * the whole call is a no-op -- no gauge moves and no ownership record
+ * is written, so an unpopulated machine stays exactly at current
+ * behavior.
+ */
+static void test_runnable_sentinel_llc_noop(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+
+	rn_state_reset();
+	mlfq_runnable_enter(&t, 1, MLFQ_MAX_LLCS);
+	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0 &&
+		t.last_llc == MLFQ_LLC_UNOWNED && t.last_qid == 0,
+		"sentinel LLC is a no-op on gauges and ownership");
+
+	/* The guard is per-call, not sticky: a valid domain still works. */
+	mlfq_runnable_enter(&t, 1, 0);
+	TEST_OK(mlfq_llc_runnable[0] == 1 && t.last_llc == 0,
+		"a valid domain after a sentinel call counts normally");
+}
+
+/*
+ * The queue-index guard is defense in depth: an out-of-range queue id
+ * never moves the queue gauge (the LLC gauge still counts the episode;
+ * callers always pass 1..3).
+ */
+static void test_runnable_qid_guard(void)
+{
+	struct task_ctx t = { .last_llc = MLFQ_LLC_UNOWNED, .last_qid = 0 };
+
+	rn_state_reset();
+	mlfq_runnable_enter(&t, 0, 1);
+	TEST_OK(mlfq_llc_runnable[1] == 1 && rn_queue_sum() == 0,
+		"out-of-range queue id never moves the queue gauge");
+
+	mlfq_runnable_exit(&t);
+	TEST_OK(rn_llc_sum() == 0,
+		"release balances the LLC count of the guarded enter");
+}
+
+static void test_runnable_layout(void)
+{
+	TEST_OK(sizeof(struct mlfq_llc_cpu_list) == 4 + MLFQ_MAX_LLC_CPUS * 4 &&
+		offsetof(struct mlfq_llc_cpu_list, cpus) == 4,
+		"llc cpu list is nr + MLFQ_MAX_LLC_CPUS u32s (132 bytes)");
+	TEST_OK(offsetof(struct task_ctx, last_llc) == 73 &&
+		offsetof(struct task_ctx, last_qid) == 74 &&
+		offsetof(struct task_ctx, pad) == 75,
+		"task_ctx last_llc/last_qid reuse the former pad bytes at 73/74");
+	TEST_OK(offsetof(struct mlfq_stats, steals_same_llc) == 96 &&
+		offsetof(struct mlfq_stats, steals_cross_llc) == 104 &&
+		offsetof(struct mlfq_stats, keep_running) == 112,
+		"steal counter split sits between steals and keep_running");
+	TEST_OK(MLFQ_MAX_LLC_CPUS == 32 && MLFQ_LLC_SCAN_MAX == 32 &&
+		MLFQ_STEER_LLC_MAX == 4 && MLFQ_LLC_UNOWNED == 0xFF,
+		"LLC constants match the declared values");
+}
+
+/*
+ * The steering selection (mlfq_steer_pick_llc), driven table-style
+ * over the pure min-selection pass: empty, single, waker-excluded,
+ * least-loaded, tie-break, all-idle-zero, and the nr_llcs bound on the
+ * candidate set.
+ */
+static void test_steer_pick_llc(void)
+{
+	u32 runnable[MLFQ_MAX_LLCS];
+	u32 idle[MLFQ_MAX_LLCS];
+
+	memset(runnable, 0, sizeof(runnable));
+	memset(idle, 0, sizeof(idle));
+
+	/* Empty: no populated domains. */
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 0, 0, 0) == MLFQ_MAX_LLCS,
+		"steer: nr_llcs 0 yields the sentinel");
+
+	/* Single: the only eligible domain is chosen. */
+	idle[0] = 1;
+	runnable[0] = 3;
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 2, 1, 0) == 0,
+		"steer: a single eligible domain is chosen");
+
+	/* Waker-excluded: only the waker's own domain is idle-populated. */
+	idle[0] = 0;
+	idle[1] = 1;
+	runnable[1] = 3;
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 2, 1, 0) == MLFQ_MAX_LLCS,
+		"steer: the waker's own domain is excluded");
+	idle[1] = 0;
+
+	/* Least-loaded wins among the eligible domains. */
+	idle[0] = 1;
+	runnable[0] = 7;
+	idle[1] = 1;
+	runnable[1] = 2;
+	idle[2] = 1;
+	runnable[2] = 5;
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 0) == 1,
+		"steer: the least-loaded eligible domain wins");
+
+	/*
+	 * Tie-break: equal runnable counts pick the lowest domain id among
+	 * the eligible (non-waker) domains -- 1 over 2 here, with the waker
+	 * on 0 excluded.
+	 */
+	runnable[1] = 7;
+	runnable[2] = 7;
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 0) == 1,
+		"steer: ties are broken by ascending domain id");
+	runnable[1] = 2;
+	runnable[2] = 5;
+
+	/* All-idle-zero: no domain has an idle CPU -> sentinel. */
+	memset(idle, 0, sizeof(idle));
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 0) == MLFQ_MAX_LLCS,
+		"steer: no idle-populated domain yields the sentinel");
+
+	/*
+	 * nr_llcs bounds the candidate set: a domain at or above it is
+	 * never a candidate even when its gauges look populated.
+	 */
+	idle[2] = 1;
+	runnable[2] = 1;
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 2, 0, 0) == MLFQ_MAX_LLCS,
+		"steer: a domain at or above nr_llcs is not a candidate");
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 0) == 2,
+		"steer: the same domain is a candidate within nr_llcs");
+
+	/*
+	 * A visited domain is excluded: the same state with domain 2
+	 * visited leaves nothing eligible.
+	 */
+	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 1ULL << 2) ==
+		MLFQ_MAX_LLCS,
+		"steer: a visited domain is excluded from the pass");
+}
+
+/*
+ * The steering caller loop of step 2.5: the selection is repeated up to
+ * MLFQ_STEER_LLC_MAX times with a visited mask, so at most
+ * MLFQ_STEER_LLC_MAX distinct domains are probed, in ascending-runnable
+ * order, and the loop stops early when no eligible domain remains.
+ */
+static void test_steer_loop_bound(void)
+{
+	u32 runnable[MLFQ_MAX_LLCS];
+	u32 idle[MLFQ_MAX_LLCS];
+	u32 picks[MLFQ_STEER_LLC_MAX];
+	u64 visited = 0;
+	u32 n_picked = 0;
+	u32 llc, attempt;
+
+	memset(runnable, 0, sizeof(runnable));
+	memset(idle, 0, sizeof(idle));
+
+	/*
+	 * Six idle-populated domains with distinct loads; domain 5 is the
+	 * waker's, so the picks must descend 4 -> 1 and the bound cuts the
+	 * tail (the sixth domain, 0, is never reached).
+	 */
+	for (llc = 0; llc < 6; llc++) {
+		idle[llc] = 1;
+		runnable[llc] = 10 * (6 - llc);
+	}
+
+	for (attempt = 0; attempt < MLFQ_STEER_LLC_MAX; attempt++) {
+		u32 pick = mlfq_steer_pick_llc(runnable, idle, MLFQ_MAX_LLCS,
+					       5, visited);
+
+		if (pick >= MLFQ_MAX_LLCS)
+			break;
+		visited |= 1ULL << pick;
+		picks[n_picked++] = pick;
+	}
+
+	TEST_OK(n_picked == MLFQ_STEER_LLC_MAX,
+		"steer: the attempt loop is capped at MLFQ_STEER_LLC_MAX picks");
+	TEST_OK(n_picked == 4 && picks[0] == 4 && picks[1] == 3 &&
+		picks[2] == 2 && picks[3] == 1,
+		"steer: picks descend the load order, waker's domain excluded");
+
+	/* Fewer eligible domains than the cap: the loop stops early. */
+	memset(runnable, 0, sizeof(runnable));
+	memset(idle, 0, sizeof(idle));
+	idle[2] = 1;
+	runnable[2] = 3;
+	idle[3] = 1;
+	runnable[3] = 1;
+	visited = 0;
+	n_picked = 0;
+	for (attempt = 0; attempt < MLFQ_STEER_LLC_MAX; attempt++) {
+		u32 pick = mlfq_steer_pick_llc(runnable, idle, MLFQ_MAX_LLCS,
+					       5, visited);
+
+		if (pick >= MLFQ_MAX_LLCS)
+			break;
+		visited |= 1ULL << pick;
+		n_picked++;
+	}
+	TEST_OK(n_picked == 2,
+		"steer: the loop stops early when no eligible domain remains");
+}
+
 int main(void)
 {
 	test_calc_delta_fair();
@@ -903,6 +1300,16 @@ int main(void)
 	test_tree_golden_shared();
 	test_tree_map_queue();
 	test_mlfq_check_tree_predicates();
+	test_runnable_enter_fresh();
+	test_runnable_enter_continuation_table();
+	test_runnable_continuation_noop();
+	test_runnable_exit();
+	test_runnable_global_park_cycle();
+	test_runnable_sentinel_llc_noop();
+	test_runnable_qid_guard();
+	test_runnable_layout();
+	test_steer_pick_llc();
+	test_steer_loop_bound();
 
 	if (nr_failed) {
 		printf("%d test(s) FAILED\n", nr_failed);

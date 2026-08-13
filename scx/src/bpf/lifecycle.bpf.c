@@ -13,6 +13,12 @@
  * per-CPU idle timestamps; exit_task() deletes the task storage;
  * cpu_release() re-enqueues local-DSQ leftovers when a CPU leaves the
  * scheduler.
+ *
+ * Runnable accounting: the per-LLC/per-queue gauges are entered
+ * at the enqueue inserts (enqueue.bpf.c) and released exactly once per
+ * leave-runnable event by ops.quiescent (see below), which the kernel
+ * fires on every dequeue_task_scx(); the global-park ownership
+ * acquisition is observed at ops.running().
  */
 
 static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
@@ -30,6 +36,14 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 		tctx->weight = 1;
 	tctx->flags = MLFQ_TF_FIRST_RUN;
 	tctx->wake_cpu_state = 0;
+	/*
+	 * The runnable-ownership record starts unowned: a fresh task is
+	 * not counted in the per-LLC/per-queue gauges until its first
+	 * tracked enqueue, and the accounting helpers key their
+	 * "not counted" branch on last_llc == MLFQ_LLC_UNOWNED.
+	 */
+	tctx->last_llc = MLFQ_LLC_UNOWNED;
+	tctx->last_qid = 0;
 	mlfq_reset_classification(tctx);
 }
 
@@ -88,6 +102,22 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 		cpu->running_deadline = tctx->deadline;
 		cpu->run_start_at = now;
 	}
+
+	/*
+	 * Runnable-ownership acquisition for global-parked tasks. The
+	 * kernel consumes SCX_DSQ_GLOBAL into a local DSQ on
+	 * the CPU the task lands on, invisible to this BPF program, so
+	 * the ownership cannot be acquired at the enqueue (the pinned
+	 * path releases any prior ownership there); it is observed here
+	 * instead. A task arriving on a CPU with no recorded ownership
+	 * was parked globally and starts its counted episode now; a task
+	 * that was already counted at its tracked enqueue is left alone.
+	 * The llc_of_cpu() sentinel makes the call a no-op when LLC
+	 * awareness is disabled.
+	 */
+	if (tctx->last_llc == MLFQ_LLC_UNOWNED)
+		mlfq_runnable_enter(tctx, tctx->queue,
+				    mlfq_llc_of_cpu((u32)cpu_id));
 
 	tctx->last_run_at = now;
 	tctx->flags &= ~MLFQ_TF_FIRST_RUN;
@@ -279,6 +309,32 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 }
 
 /*
+ * Leave-runnable accounting: the single release of the per-LLC and
+ * per-queue ownership. The kernel calls
+ * ops.quiescent on every dequeue_task_scx() (ext.c in 6.18 and 7.2,
+ * identical semantics), regardless of the task's ops_state, gated only
+ * on !task_on_rq_migrating -- which sched-ext tasks structurally never
+ * hit, because transfers mark MIGRATING and exclude dequeue. The
+ * callback therefore fires exactly once per task leaving the runnable
+ * set, whether it leaves from a queue DSQ (sleep, exit, property or
+ * class change) or from running (sleep); ops.dequeue is NOT a usable
+ * exit signal for this accounting because it fires only while ops_state
+ * is QUEUED, which the dispatch moves leave set for same-rq moves and
+ * clear for remote transfers. A release of a task with no recorded
+ * ownership is a no-op (idempotent against a racing transfer).
+ */
+void BPF_STRUCT_OPS(mlfq_quiescent, struct task_struct *p, u64 deq_flags)
+{
+	struct task_ctx *tctx;
+
+	tctx = mlfq_lookup_task_ctx(p);
+	if (!tctx)
+		return;
+
+	mlfq_runnable_exit(tctx);
+}
+
+/*
  * Idle-state tracking. The kernel invokes this on every idle transition
  * of a CPU when the scheduler keeps the kernel's built-in idle tracking
  * (the KEEP_BUILTIN_IDLE flag); the callback is left unregistered when
@@ -287,6 +343,11 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
  * selection can skip its idle scans entirely when the system is
  * saturated, which is the common case for a wake-all storm. idle_since
  * records when the CPU went idle (0 = not idle, or never observed).
+ * The per-LLC mirror (mlfq_llc_idle) is the steering gate: it tells
+ * which LLC domains still have an idle CPU. The gate is the
+ * nr_llcs-validated rodata mapping (plus the MLFQ_MAX_LLCS hard array
+ * bound, so a front-end bug cannot index the bss array out of bounds);
+ * an unpopulated domain map leaves the per-LLC counter untouched.
  */
 void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 {
@@ -299,6 +360,25 @@ void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 		__sync_fetch_and_add(&mlfq_idle_count, 1);
 	} else {
 		__sync_fetch_and_sub(&mlfq_idle_count, 1);
+	}
+
+	if (cpu >= 0 && cpu < (s32)MLFQ_MAX_CPUS) {
+		u32 llc = mlfq_cpu_llc[cpu];
+
+		/*
+		 * The per-LLC RMW is bounded by the hard array bound as
+		 * well as the populated-domain count: mlfq_llc_idle has
+		 * MLFQ_MAX_LLCS entries, so a front-end bug writing
+		 * mlfq_nr_llcs above 32 must not index it out of bounds.
+		 * An unmapped CPU reads the MLFQ_MAX_LLCS sentinel (the
+		 * front-end's default), which fails both gates.
+		 */
+		if (llc < MLFQ_MAX_LLCS && llc < mlfq_nr_llcs) {
+			if (idle)
+				__sync_fetch_and_add(&mlfq_llc_idle[llc], 1);
+			else
+				__sync_fetch_and_sub(&mlfq_llc_idle[llc], 1);
+		}
 	}
 }
 

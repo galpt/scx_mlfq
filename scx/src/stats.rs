@@ -56,6 +56,18 @@ pub struct Metrics {
     pub cpuperf_boosts: u64,
     #[stat(desc = "Dispatch moves from remote queue DSQs")]
     pub steals: u64,
+    /*
+     * The dispatch steal is split by cache domain (see the two-tier
+     * steal scan): the same-LLC tier moves work inside a domain, the
+     * cross-LLC tier moves it between domains. steals == steals_same_llc +
+     * steals_cross_llc whenever the LLC data is populated (mlfq_nr_llcs
+     * > 0); a machine with LLC awareness disabled leaves the split
+     * counters at 0 and all moves count as `steals`.
+     */
+    #[stat(desc = "Dispatch moves from remote queue DSQs within the same LLC")]
+    pub steals_same_llc: u64,
+    #[stat(desc = "Dispatch moves from remote queue DSQs across LLC domains")]
+    pub steals_cross_llc: u64,
     #[stat(desc = "Solo-task keep-running grants on empty dispatch")]
     pub keep_running: u64,
     #[stat(desc = "Enqueues dropped when task state cannot be allocated")]
@@ -214,6 +226,8 @@ impl Metrics {
             preemption_kicks: self.preemption_kicks.wrapping_sub(rhs.preemption_kicks),
             cpuperf_boosts: self.cpuperf_boosts.wrapping_sub(rhs.cpuperf_boosts),
             steals: self.steals.wrapping_sub(rhs.steals),
+            steals_same_llc: self.steals_same_llc.wrapping_sub(rhs.steals_same_llc),
+            steals_cross_llc: self.steals_cross_llc.wrapping_sub(rhs.steals_cross_llc),
             keep_running: self.keep_running.wrapping_sub(rhs.keep_running),
             enq_no_tctx: self.enq_no_tctx.wrapping_sub(rhs.enq_no_tctx),
             enq_bad_weight: self.enq_bad_weight.wrapping_sub(rhs.enq_bad_weight),

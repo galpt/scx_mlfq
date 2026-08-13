@@ -4,14 +4,18 @@
  *
  * CPU selection, included by main.bpf.c via #include.
  *
- * Placement preference, in order: the prev CPU when idle, an idle CPU in
- * the waker's LLC, then the global fallbacks (an idle primary core for
- * Q1, any idle CPU otherwise). The per-step detail is at the
- * corresponding points in mlfq_select_cpu() below. When no CPU is
- * selected, prev_cpu is returned: the kernel validates the return as a
- * CPU number (any negative value aborts the scheduler), and the task
- * then goes through the normal enqueue path into the owning CPU's queue
- * vtime DSQ.
+ * Placement preference, in order: the prev CPU when idle, the prev
+ * CPU's SMT sibling (non-interactive wakeups only), the largest-LLC
+ * domain (interactive wakeups only), the waker's LLC, the least-loaded
+ * LLC with an idle CPU (when idle tracking is live), then the global
+ * fallbacks (an idle primary core for Q1, any idle CPU otherwise). Each
+ * step after the prev fast path is gated on the state that populates
+ * it, so an unpopulated machine reproduces the plain order exactly.
+ * The per-step detail is at the corresponding points in
+ * mlfq_select_cpu() below. When no CPU is selected, prev_cpu is
+ * returned: the kernel validates the return as a CPU number (any
+ * negative value aborts the scheduler), and the task then goes through
+ * the normal enqueue path into the owning CPU's queue vtime DSQ.
  *
  * With SCX_OPS_ENQ_MIGRATION_DISABLED the kernel never invokes this
  * callback for migration-disabled tasks.
@@ -211,6 +215,33 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
+	 * Step 1.5: SMT sibling preference, non-interactive wakeups only.
+	 * When prev is busy, its core sibling shares the L1/L2 caches, so
+	 * a Q2/Q3 wakeup lands there before any scan -- the shared-cache
+	 * warmth that the LLC and global scans cannot offer. Interactive
+	 * wakeups are excluded: SCX_PICK_IDLE_CORE is authoritative for
+	 * them (the whole-core preference in steps 2 and 3), and settling
+	 * an interactive wakeup on a sibling would split the core. The
+	 * affinity fix-up above guarantees prev_cpu is in p->cpus_ptr, so
+	 * only the sibling's own affinity is tested here. mlfq_smt_on
+	 * gates the whole step, so an unwritten (all-zero) rodata table
+	 * can never fire it; the idle mark is claimed only through
+	 * scx_bpf_test_and_clear_cpu_idle, and occupied CPUs are never
+	 * idle-marked, so a realtime-occupied sibling cannot be claimed.
+	 */
+	if (!interactive && mlfq_smt_on && prev_cpu >= 0 &&
+	    prev_cpu < MLFQ_MAX_CPUS) {
+		u32 sib = mlfq_cpu_sibling[prev_cpu];
+
+		if (sib != (u32)prev_cpu && sib < MLFQ_MAX_CPUS &&
+		    bpf_cpumask_test_cpu(sib, p->cpus_ptr) &&
+		    scx_bpf_test_and_clear_cpu_idle((s32)sib)) {
+			cpu_id = (s32)sib;
+			goto direct;
+		}
+	}
+
+	/*
 	 * Saturation fast path: when the scheduler's idle-CPU count is
 	 * zero, no CPU is idle, so the LLC and global idle scans below can
 	 * only fail; they would still cost an idle-scan kfunc each (and a
@@ -222,7 +253,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * ops.update_idle() and this path is gated on mlfq_idle_tracking,
 	 * which is set only when the kernel keeps its built-in idle
 	 * tracking alongside the callback; without it, the behavior is
-	 * unchanged. An occupied prev_cpu falls through to the scans
+	 * unchanged. An occupied prev_cpu proceeds to the scans
 	 * regardless of the count: the idle count only tracks the kernel's
 	 * idle-thread transitions and can be stale about a realtime
 	 * takeover, so a CPU a realtime task is running on must not be
@@ -233,10 +264,54 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu;
 
 	/*
-	 * Step 2: LLC-aware placement, which keeps the wakeup in the waker's
-	 * cache domain. The waker is the current CPU. For Q1 an
-	 * all-efficiency LLC is skipped entirely so the wakeup can land on
-	 * an idle primary of a faster LLC via the global fallbacks below.
+	 * The waker's LLC domain, resolved once and shared by the
+	 * largest-LLC step (1.9), the waker-LLC step (2) and the
+	 * least-loaded steering step (2.5). MLFQ_MAX_LLCS marks an
+	 * unavailable domain: LLC awareness disabled (mlfq_nr_llcs == 0)
+	 * or the waker CPU unmapped. Steps 2 and 2.5 are dead then, and
+	 * step 1.9 cannot fire on an unpopulated machine (its own gates
+	 * require a populated domain).
+	 */
+	waker_cpu = (u32)bpf_get_smp_processor_id();
+	if (mlfq_nr_llcs > 0 && waker_cpu < MLFQ_MAX_CPUS &&
+	    mlfq_cpu_llc[waker_cpu] < MLFQ_MAX_LLCS &&
+	    mlfq_cpu_llc[waker_cpu] < mlfq_nr_llcs)
+		waker_llc = mlfq_cpu_llc[waker_cpu];
+	else
+		waker_llc = MLFQ_MAX_LLCS;
+
+	/*
+	 * Step 1.9: largest-LLC bias (interactive wakeups only). When the
+	 * machine has a strictly-largest LLC domain and it is not the
+	 * waker's own (which step 2 is about to scan), an interactive
+	 * wakeup is placed there first: cache capacity serves Q1 latency
+	 * best, the clock tradeoff of a larger (often lower-clocked) L3
+	 * is worth it for interactive work, and the idle claim is
+	 * authoritative, so the bias is non-exclusive. The
+	 * mlfq_llc_has_primary gate keeps the "interactive never parks on
+	 * an efficiency core" invariant on hybrid systems and
+	 * require_primary is belt-and-suspenders. The step is dead on
+	 * single-LLC machines, on ties or failed discovery (the
+	 * MLFQ_MAX_LLCS sentinel), and when the largest domain is the
+	 * waker's; the MLFQ_MAX_LLCS bound in the gate keeps the
+	 * has_primary index verifier-bounded.
+	 */
+	if (interactive && mlfq_llc_largest < MLFQ_MAX_LLCS &&
+	    mlfq_llc_largest < mlfq_nr_llcs &&
+	    mlfq_llc_largest != waker_llc &&
+	    mlfq_llc_has_primary[mlfq_llc_largest]) {
+		cpu_id = mlfq_pick_idle_in_bitmap(&mlfq_llc_bitmaps,
+						  mlfq_llc_largest, p,
+						  true, primary_bm);
+		if (cpu_id >= 0)
+			goto direct;
+	}
+
+	/*
+	 * Step 2: LLC-aware placement, which keeps the wakeup in the
+	 * waker's cache domain. For Q1 an all-efficiency LLC is skipped
+	 * entirely so the wakeup can land on an idle primary of a faster
+	 * LLC via the global fallbacks below.
 	 *
 	 * On a machine with a single LLC, the cache domain is the whole
 	 * machine, so the kernel's idle scan serves the placement directly
@@ -246,23 +321,63 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * kfunc call per candidate until it finds an idle one. The
 	 * whole-core preference for Q1 matches the step-3 fallback.
 	 */
-	waker_cpu = (u32)bpf_get_smp_processor_id();
-	if (mlfq_nr_llcs > 0 && waker_cpu < MLFQ_MAX_CPUS) {
-		waker_llc = mlfq_cpu_llc[waker_cpu];
-		if (waker_llc < MLFQ_MAX_LLCS && waker_llc < mlfq_nr_llcs &&
-		    (!interactive || mlfq_llc_has_primary[waker_llc])) {
-			if (mlfq_nr_llcs == 1) {
-				cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr,
-							       interactive ?
-							       SCX_PICK_IDLE_CORE : 0);
-				if (cpu_id < 0)
-					cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			} else {
-				cpu_id = mlfq_pick_idle_in_bitmap(&mlfq_llc_bitmaps,
-								  waker_llc, p,
-								  interactive,
-								  primary_bm);
-			}
+	if (waker_llc < MLFQ_MAX_LLCS &&
+	    (!interactive || mlfq_llc_has_primary[waker_llc])) {
+		if (mlfq_nr_llcs == 1) {
+			cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr,
+						       interactive ?
+						       SCX_PICK_IDLE_CORE : 0);
+			if (cpu_id < 0)
+				cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+		} else {
+			cpu_id = mlfq_pick_idle_in_bitmap(&mlfq_llc_bitmaps,
+							  waker_llc, p,
+							  interactive,
+							  primary_bm);
+		}
+		if (cpu_id >= 0)
+			goto direct;
+	}
+
+	/*
+	 * Step 2.5: least-loaded-LLC steering. When the waker-LLC walk
+	 * found nothing and other LLCs have an idle CPU, the wakeup is
+	 * placed on the least-loaded of them: the per-LLC runnable gauge
+	 * is the load metric, the per-LLC idle gate the candidate filter,
+	 * and the idle claim inside the bitmap walk stays the
+	 * authoritative placement. The selection repeats up to
+	 * MLFQ_STEER_LLC_MAX times over the eligible domains in ascending
+	 * runnable order (ties by ascending id, so the order is
+	 * deterministic), stopping early when a walk claims an idle CPU
+	 * or no eligible domain remains; each failed walk (affinity-stale
+	 * bitmap) marks its domain visited so the next pass picks the
+	 * next-least-loaded. The gauges are advisory: a stale count costs
+	 * one suboptimal but still-idle placement in a race window, never
+	 * a correctness issue -- the same trust model as the saturation
+	 * fast path. The step is gated on idle tracking (the gauges live
+	 * only then), on more than one LLC (a single-LLC machine was fully
+	 * covered by step 2) and on some idle CPU existing; the per-LLC
+	 * idle gate excludes every unpopulated domain, so the all-zero
+	 * state proceeds to the global fallbacks unchanged.
+	 */
+	if (mlfq_idle_tracking && mlfq_nr_llcs > 1 &&
+	    mlfq_idle_count > 0) {
+		u64 visited = 0;
+		u32 attempt;
+
+		bpf_for(attempt, 0, MLFQ_STEER_LLC_MAX) {
+			u32 steer_llc = mlfq_steer_pick_llc(mlfq_llc_runnable,
+							    mlfq_llc_idle,
+							    mlfq_nr_llcs,
+							    waker_llc, visited);
+
+			if (steer_llc >= MLFQ_MAX_LLCS)
+				break;
+			visited |= 1ULL << steer_llc;
+			cpu_id = mlfq_pick_idle_in_bitmap(&mlfq_llc_bitmaps,
+							  steer_llc, p,
+							  interactive,
+							  primary_bm);
 			if (cpu_id >= 0)
 				goto direct;
 		}

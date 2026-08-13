@@ -48,6 +48,17 @@
  * paths (pinned-idle and the idle-CPU fast path) skip placement entirely:
  * the insert does not consume a deadline, so placement is deferred to the
  * next real placement, which re-anchors the task under the lag clamp.
+ *
+ * Runnable accounting: every insert below calls
+ * mlfq_runnable_enter() with the owning CPU's LLC and the final queue,
+ * so the per-LLC/per-queue runnable gauges track each tracked task's
+ * ownership from its first enqueue (wakeup, fork, class-switch-in) to
+ * its leave-runnable release in ops.quiescent. Continuation re-enqueues
+ * (run-out, preemption of the displaced resident, REENQ, ENQ_LAST) do
+ * not re-count: the helper only moves the ownership when the LLC or the
+ * queue changed. The pinned-global path is the one release here: a task
+ * parked on the kernel-owned global DSQ leaves LLC ownership, and
+ * ops.running() re-acquires it when the kernel hands it a CPU.
  */
 
 static __always_inline bool mlfq_task_is_migration_disabled(const struct task_struct *p)
@@ -226,6 +237,17 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		if (!bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
 			__sync_fetch_and_add(&mlfq_stats.enq_pinned_global, 1);
+			/*
+			 * The task leaves LLC ownership: the global DSQ is
+			 * kernel-owned and drained invisibly to this BPF
+			 * program (consume_global_dsq), so no LLC may be
+			 * charged for the parked wait. A task that was
+			 * counted by a previous placement is released now;
+			 * ops.running() re-acquires its ownership when the
+			 * kernel hands it a CPU. A task never counted
+			 * (first global park of a fresh task) is a no-op.
+			 */
+			mlfq_runnable_exit(tctx);
 			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL,
 					   slice, enq_flags);
 			tctx->wake_cpu_state = 0;
@@ -245,6 +267,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * the lag clamp.
 			 */
 			__sync_fetch_and_add(&mlfq_stats.enq_pinned_idle, 1);
+			mlfq_runnable_enter(tctx, (u8)qid,
+					    mlfq_llc_of_cpu((u32)prev_cpu));
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
 					   slice, enq_flags);
 			mlfq_stat_placement(qid);
@@ -270,6 +294,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			return;
 		}
 		__sync_fetch_and_add(&mlfq_stats.enq_pinned_busy, 1);
+		mlfq_runnable_enter(tctx, (u8)qid,
+				    mlfq_llc_of_cpu((u32)prev_cpu));
 		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
 					 slice, deadline,
 					 enq_flags);
@@ -298,6 +324,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 * between would otherwise strand the wakeup in its local
 		 * DSQ until the takeover drain.
 		 */
+		mlfq_runnable_enter(tctx, (u8)qid,
+				    mlfq_llc_of_cpu((u32)bpf_get_smp_processor_id()));
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
 				   enq_flags);
 		__sync_fetch_and_add(&mlfq_stats.enq_fastpath, 1);
@@ -438,6 +466,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 */
 			if (mlfq_preempt_slice_ns < preempt_slice)
 				preempt_slice = mlfq_preempt_slice_ns;
+			mlfq_runnable_enter(tctx, (u8)qid,
+					    mlfq_llc_of_cpu((u32)prev_cpu));
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
 					   preempt_slice, enq_flags | SCX_ENQ_PREEMPT);
 			__sync_fetch_and_add(&mlfq_stats.preemption_kicks, 1);
@@ -458,6 +488,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
+	mlfq_runnable_enter(tctx, (u8)qid,
+			    mlfq_llc_of_cpu((u32)target_cpu));
 	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
 				 slice, deadline, enq_flags);
 	mlfq_stat_placement(qid);

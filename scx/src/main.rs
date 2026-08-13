@@ -316,6 +316,15 @@ impl<'a> Scheduler<'a> {
         if let Err(e) = topology::write_llc_bitmaps(&mut skel, &topology_plan.llcs) {
             log::warn!("failed to write the LLC bitmaps, disabling LLC-aware placement: {e:#}");
         }
+        // The per-LLC CPU lists feed the dispatch Tier-A same-LLC steal
+        // scan. A list-write failure degrades *stealing* only: the
+        // placement bitmaps above stay live, so the two fallbacks are
+        // independent and the scheduler keeps its placement hints.
+        if let Err(e) = topology::write_llc_cpu_lists(&mut skel, &topology_plan.llcs) {
+            log::warn!(
+                "failed to write the per-LLC CPU lists, disabling LLC-aware stealing: {e:#}"
+            );
+        }
 
         let struct_ops = scx_ops_attach!(skel, mlfq_ops)?;
 
@@ -429,6 +438,8 @@ impl<'a> Scheduler<'a> {
             preemption_kicks: s.preemption_kicks,
             cpuperf_boosts: s.cpuperf_boosts,
             steals: s.steals,
+            steals_same_llc: s.steals_same_llc,
+            steals_cross_llc: s.steals_cross_llc,
             keep_running: s.keep_running,
             enq_no_tctx: s.enq_no_tctx,
             enq_bad_weight: s.enq_bad_weight,

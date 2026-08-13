@@ -41,9 +41,19 @@
                 },{
                     "mlfq_primary_all": true
                 },{
-                    "mlfq_nr_llcs": 0
+                    "mlfq_nr_llcs": 2
+                },{
+                    "mlfq_llc_has_primary": [1, 1]
+                },{
+                    "mlfq_cpu_llc": [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]
+                },{
+                    "mlfq_llc_largest": 0
                 },{
                     "mlfq_idle_tracking": 1
+                },{
+                    "mlfq_smt_on": true
+                },{
+                    "mlfq_cpu_sibling": [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14]
                 },{
                     "__SCX_ENQ_WAKEUP": 1
                 },{
@@ -56,6 +66,10 @@
                     "__SCX_DSQ_LOCAL_ON": 13835058055282163712
                 },{
                     "uei_dump_len": 32768
+                }
+            ],
+            ".bss": [{
+                    "mlfq_idle_count": 4
                 }
             ]
         }

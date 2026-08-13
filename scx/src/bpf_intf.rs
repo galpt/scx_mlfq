@@ -9,5 +9,9 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
+// The bindgen output's zero-length-array placeholder carries unsafe
+// accessor helpers without safety docs; the generated code is
+// bindgen-owned, so the lint is suppressed at the module level.
+#![allow(clippy::missing_safety_doc)]
 
 include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));

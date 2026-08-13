@@ -83,6 +83,25 @@ struct mlfq_op_lat_map mlfq_op_lat SEC(".maps");
 volatile u64 nr_cpu_ids;
 volatile u32 mlfq_steal_scan;
 volatile u32 mlfq_idle_count;
+
+/*
+ * Per-LLC and per-queue runnable gauges, maintained by
+ * mlfq_runnable_enter()/mlfq_runnable_exit() at every tracked insert
+ * and leave-runnable event. mlfq_llc_runnable[llc] is the number of
+ * tracked runnable tasks owned by each LLC domain; mlfq_queue_runnable
+ * is the same count split per queue (index 0 unused, 1..3 = Q1..Q3);
+ * mlfq_llc_idle[llc] mirrors mlfq_idle_count per domain, the steering
+ * gate of the least-loaded-LLC placement step. The counts are advisory:
+ * they cover tracked tasks only (the drop paths never touch them) and
+ * drive placement heuristics, never correctness. The gauges are
+ * zero-default, so the unpopulated state (LLC awareness disabled)
+ * leaves them untouched by construction.
+ * Declared before mlfq_stats so the tree-ctrl cache-line isolation
+ * reasoning below stays accurate.
+ */
+volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
+volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
+volatile u32 mlfq_llc_idle[MLFQ_MAX_LLCS];
 volatile struct mlfq_stats mlfq_stats;
 
 /*
@@ -102,9 +121,9 @@ struct mlfq_tree_map mlfq_tree_map SEC(".maps");
  * the publish and the sample-window winner, so it must not share a line
  * with the write-hammered mlfq_stats counters: the
  * __attribute__((aligned(64))) on this instance pins it to a dedicated
- * 64-byte cache line, and the declaration order (after mlfq_stats, which
- * is padded to a 64-byte multiple) keeps the aligned placement adjacent
- * to it.
+ * 64-byte cache line, so the compiler places it on the line boundary
+ * following mlfq_stats (256 bytes, a whole number of lines), and the
+ * two blocks never share a line.
  */
 volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
 
@@ -149,6 +168,21 @@ struct {
 } mlfq_llc_bitmaps SEC(".maps");
 
 /*
+ * Per-LLC CPU lists (see intf.h): mlfq_llc_cpus[llc_id] holds the CPUs
+ * of one LLC domain, the Tier-A same-LLC steal window of the dispatch
+ * path. The Rust front-end writes the values after
+ * load, and the dispatch path reads them directly as map values; an
+ * unpopulated map entry (write failed or LLC awareness disabled) reads
+ * as nr == 0, which skips the Tier-A scan and keeps today's behavior.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MLFQ_MAX_LLCS);
+	__type(key, u32);
+	__type(value, struct mlfq_llc_cpu_list);
+} mlfq_llc_cpus SEC(".maps");
+
+/*
  * Constants: rodata. The declared defaults match the constants in
  * intf.h and are written by the Rust front-end before load; the section
  * is read-only afterwards, and the compiler must not fold them as
@@ -186,8 +220,8 @@ const volatile bool mlfq_primary_all = true;
  * Cache-domain data written by the Rust front-end before load. mlfq_nr_llcs
  * is the number of LLC domains with usable masks (0 disables the LLC step
  * entirely); mlfq_llc_has_primary marks LLCs that contain at least one
- * primary (big) core; mlfq_cpu_llc maps a CPU to its LLC domain (0 when
- * unknown).
+ * primary (big) core; mlfq_cpu_llc maps a CPU to its LLC domain
+ * (MLFQ_MAX_LLCS, the sentinel, when the CPU is unknown or unmapped).
  */
 const volatile u32 mlfq_nr_llcs;
 const volatile u8 mlfq_llc_has_primary[MLFQ_MAX_LLCS];
@@ -201,6 +235,28 @@ const volatile u32 mlfq_cpu_llc[MLFQ_MAX_CPUS];
  * the lean path is dead and the behavior is unchanged.
  */
 const volatile u32 mlfq_idle_tracking = 0;
+
+/*
+ * SMT sibling preference table, written by the Rust front-end
+ * before load. mlfq_cpu_sibling[cpu] is the lowest-id other CPU sharing
+ * cpu's physical core, or the CPU itself when the core is unpaired.
+ * mlfq_smt_on is true only when at least one sibling differs from its
+ * CPU, and it gates the sibling step: with SMT off or the table
+ * unwritten (all-zero rodata can never fire it, and the write is
+ * atomic pre-load) the step is dead and placement is unchanged.
+ */
+const volatile bool mlfq_smt_on = false;
+const volatile u32 mlfq_cpu_sibling[MLFQ_MAX_CPUS];
+
+/*
+ * Largest-LLC domain id for the Q1 placement bias, written by the
+ * Rust front-end before load. The sentinel MLFQ_MAX_LLCS means "no
+ * bias": discovery failed, the machine has fewer than two LLC domains,
+ * or two domains tie for the largest cache size. The bias is Q1-only
+ * and non-exclusive, trading clock speed for cache capacity; the
+ * sentinel keeps the step dead unless a strictly-largest domain exists.
+ */
+const volatile u32 mlfq_llc_largest = MLFQ_MAX_LLCS;
 
 static struct task_ctx *mlfq_lookup_task_ctx(const struct task_struct *p)
 {
@@ -221,6 +277,31 @@ static __always_inline struct mlfq_cpu_state *mlfq_lookup_cpu_state(s32 cpu)
 		return NULL;
 	key = (u32)cpu;
 	return bpf_map_lookup_elem(&cpu_state_stor, &key);
+}
+
+/*
+ * mlfq_llc_of_cpu - LLC domain of a CPU, validated against the populated set.
+ * @cpu: CPU id.
+ *
+ * Returns the rodata cpu->llc mapping when @cpu is in range and the
+ * value is a populated domain id, MLFQ_MAX_LLCS (the hard bound of the
+ * runnable gauges) otherwise. The sentinel turns every accounting
+ * helper call into a no-op, so with LLC awareness disabled
+ * (mlfq_nr_llcs == 0) every call yields it and the gauges never move --
+ * the unpopulated state reproduces current behavior by construction.
+ * The hard bound is checked as well as the populated count: an unmapped
+ * CPU reads the MLFQ_MAX_LLCS sentinel from the front-end's default,
+ * and a front-end bug writing mlfq_nr_llcs above MLFQ_MAX_LLCS must
+ * not validate the sentinel (or a larger id) into a domain index.
+ */
+static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
+{
+	u32 llc;
+
+	if (cpu >= MLFQ_MAX_CPUS)
+		return MLFQ_MAX_LLCS;
+	llc = mlfq_cpu_llc[cpu];
+	return llc < MLFQ_MAX_LLCS && llc < mlfq_nr_llcs ? llc : MLFQ_MAX_LLCS;
 }
 
 #include "vtime.bpf.c"
@@ -246,9 +327,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * Snapshot the CPU count once; the DSQ creation loop and the
-	 * id-space invariant below are keyed on it.
-	 */
+ * Snapshot the CPU count once; the DSQ creation loop and the
+ * id-space invariant below are keyed on it.
+ */
 	nr_cpus = (u32)nr_cpu_ids;
 	if (nr_cpus == 0) {
 		scx_bpf_error("no possible CPUs");
@@ -256,19 +337,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * Clamp the Q2/Q3 steal-scan window to the CPU count: on a machine
-	 * with fewer CPUs than the cap, an unscaled window would re-peek
-	 * the same remote DSQs multiple times per slot.
-	 */
+ * Clamp the Q2/Q3 steal-scan window to the CPU count: on a machine
+ * with fewer CPUs than the cap, an unscaled window would re-peek
+ * the same remote DSQs multiple times per slot.
+ */
 	mlfq_steal_scan = nr_cpus < MLFQ_STEAL_SCAN_MAX ?
 			  nr_cpus : (u32)MLFQ_STEAL_SCAN_MAX;
 
 	/*
-	 * Create the per-CPU vtime-ordered queue DSQs. bpf_for() is an
-	 * iterator-backed loop: the bound is a runtime value (the checked
-	 * CPU count) and the iterator contract lets the verifier bound the
-	 * iteration without unrolling it.
-	 */
+ * Create the per-CPU vtime-ordered queue DSQs. bpf_for() is an
+ * iterator-backed loop: the bound is a runtime value (the checked
+ * CPU count) and the iterator contract lets the verifier bound the
+ * iteration without unrolling it.
+ */
 	bpf_for(cpu, 0, nr_cpus) {
 		for (qid = 1; qid <= MLFQ_NR_QUEUES; qid++) {
 			ret = scx_bpf_create_dsq(mlfq_dsq_id(qid, cpu), -1);
@@ -281,12 +362,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * The dispatch batch is served as q1 + q2 + q3, with the Q3 share
-	 * computed as the unsigned remainder of dispatch_max_batch (see
-	 * dispatch.bpf.c). Quotas that cover the whole batch would wrap
-	 * that remainder and unbind the Q3 service loop, so the
-	 * configuration is rejected outright.
-	 */
+ * The dispatch batch is served as q1 + q2 + q3, with the Q3 share
+ * computed as the unsigned remainder of dispatch_max_batch (see
+ * dispatch.bpf.c). Quotas that cover the whole batch would wrap
+ * that remainder and unbind the Q3 service loop, so the
+ * configuration is rejected outright.
+ */
 	if (mlfq_q1_quota + mlfq_q2_quota >= mlfq_dispatch_max_batch) {
 		scx_bpf_error("Q1+Q2 quotas (%u+%u) must leave a Q3 share of "
 			      "max batch %u",
@@ -296,12 +377,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * The queue DSQ id space must stay below the top bits the kernel
-	 * reserves for the SCX_DSQ_LOCAL / SCX_DSQ_LOCAL_ON flags, so the
-	 * mlfq_dsq_id() arithmetic never collides with the local DSQ
-	 * range. With the per-CPU layout the highest id is owned by the
-	 * last queue on the last CPU.
-	 */
+ * The queue DSQ id space must stay below the top bits the kernel
+ * reserves for the SCX_DSQ_LOCAL / SCX_DSQ_LOCAL_ON flags, so the
+ * mlfq_dsq_id() arithmetic never collides with the local DSQ
+ * range. With the per-CPU layout the highest id is owned by the
+ * last queue on the last CPU.
+ */
 	if (mlfq_dsq_id(MLFQ_NR_QUEUES, (s32)(nr_cpus - 1)) >= SCX_DSQ_LOCAL_ON) {
 		scx_bpf_error("queue DSQ id space overflows SCX_DSQ_LOCAL_ON");
 		return -EINVAL;
@@ -332,6 +413,20 @@ SCX_OPS_DEFINE(mlfq_ops,
 	       .cpu_release		= (void *)mlfq_cpu_release,
 	       .running			= (void *)mlfq_running,
 	       .stopping		= (void *)mlfq_stopping,
+	       /*
+		* The runnable-accounting exit signal. The kernel
+		* invokes ops.quiescent on every dequeue_task_scx()
+		* regardless of the task's ops_state, gated only on
+		* !task_on_rq_migrating (structurally unreachable for
+		* sched-ext tasks), so it fires exactly once per
+		* leave-runnable event. ops.dequeue is deliberately NOT
+		* used: it fires only while ops_state is QUEUED, which the
+		* dispatch moves leave set for same-rq moves and clear for
+		* remote transfers, so it is not a complete signal on its
+		* own. The callback releases the task's LLC/queue gauge
+		* ownership.
+		*/
+	       .quiescent		= (void *)mlfq_quiescent,
 	       .update_idle		= (void *)mlfq_update_idle,
 	       .enable			= (void *)mlfq_enable,
 	       .init			= (void *)mlfq_init,

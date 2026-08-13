@@ -32,6 +32,30 @@ typedef int pid_t;
 #endif
 
 /*
+ * Native-harness fallback for the iterator-based bpf_for loops below.
+ * The BPF build gets the real iterator macro from scx/common.bpf.h
+ * (included by main.bpf.c before this header); the pure-math harness
+ * compiles this header without any BPF machinery, so a plain bounded
+ * for-loop preserves the same semantics for the pure functions. The
+ * iterator form is what keeps the verifier's exploration of the loop
+ * flat -- a plain constant-bound loop is not unrolled and the verifier
+ * processes each iteration until its states converge, which blows the
+ * instruction budget for the steering scan.
+ */
+#ifndef __VMLINUX_H__
+#ifndef bpf_for
+/*
+ * Harness-only stand-in for the kernel's iterator loop: the native
+ * unit-test build has no BPF iterator machinery, and the call sites
+ * pass a plain loop variable, which is the iterator contract (the
+ * first argument is always a fresh scalar). The BPF build uses the
+ * kernel's bpf_for from the toolchain headers instead.
+ */
+#define bpf_for(i, start, end) for ((i) = (start); (i) < (end); (i)++)
+#endif
+#endif
+
+/*
  * Instrumentation. Set to 1 to compile the invariant checks
  * into the BPF object; they are compiled out by default. The check
  * predicates themselves live under the same guard and are exercised by the
@@ -186,6 +210,35 @@ enum mlfq_consts {
 	 * startup (the userspace side refuses to populate the bitmaps).
 	 */
 	MLFQ_MAX_LLCS			= 32ULL,
+
+	/*
+	 * Tier-A same-LLC steal window: the flat scan over the consuming
+	 * CPU's own-LLC CPU list, one peek per slot. The compile-time
+	 * bound keeps the verifier's exploration flat, identical in shape
+	 * to the cross-LLC window it gates.
+	 */
+	MLFQ_LLC_SCAN_MAX		= 32ULL,
+
+	/*
+	 * Per-LLC CPU-list bound: the largest CPU count any LLC domain may
+	 * publish into the mlfq_llc_cpus map values. Equal to the Tier-A
+	 * scan window, so the window's constant modulo covers the whole
+	 * populated list: the front-end populates a domain's list only up
+	 * to MLFQ_LLC_SCAN_MAX CPUs, and a domain that exceeds the bound
+	 * gets an EMPTY list (nr == 0) instead -- Tier A then skips it and
+	 * the Tier B rotating window covers the domain, never a silently
+	 * shrunk subset of it. The cpus[] array is exactly the window
+	 * width, so every published entry is reachable by the scan.
+	 */
+	MLFQ_MAX_LLC_CPUS		= MLFQ_LLC_SCAN_MAX,
+
+	/*
+	 * Steering scan cap: the number of least-loaded-LLC selection
+	 * attempts the steering path may make before falling through
+	 * to the global fallbacks. The tuning knob lives with the other
+	 * steering constants.
+	 */
+	MLFQ_STEER_LLC_MAX		= 4ULL,
 
 	/*
 	 * Number of 64-bit words needed to hold one CPU bit per CPU.
@@ -358,6 +411,15 @@ struct mlfq_tree_sample {
 };
 
 /*
+ * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
+ * ids are 0..MLFQ_MAX_LLCS-1 (0..31), which fit in a u8; 0xFF marks a
+ * task that is not counted in the per-LLC runnable gauges: it is not
+ * runnable, or it is parked on the kernel-owned global DSQ where no LLC
+ * owns it.
+ */
+#define MLFQ_LLC_UNOWNED 0xFFU
+
+/*
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the owning queue's virtual-time clock and is
  * re-anchored to the queue's clock at every placement. The struct is
@@ -380,7 +442,24 @@ struct task_ctx {
 	u8  wake_cnt;			/* consecutive short-sleep wakeups */
 	u8  flags;			/* MLFQ_TF_* */
 	u8  wake_cpu_state;		/* bit0 idle, bit1 valid */
-	u8  pad[4];
+	/*
+	 * Runnable-ownership record, maintained by the accounting helpers
+	 * (mlfq_runnable_enter/exit). last_llc is the LLC domain owning
+	 * the task's current DSQ or running CPU, MLFQ_LLC_UNOWNED when
+	 * the task is not runnable or is parked on the kernel-owned
+	 * global DSQ; last_qid is the queue (1..3) of the last counted
+	 * placement, 0 when unowned. The pair is the single source of
+	 * truth for "is this task counted in the per-LLC/per-queue
+	 * runnable gauges": the helpers treat last_llc == MLFQ_LLC_UNOWNED
+	 * as not counted. The read-modify-write is lock-free: the kernel
+	 * serializes enqueue/dequeue/stopping per task, so the counter
+	 * RMWs stay exact in the absence of a cross-rq race; a torn read
+	 * can only defer one release, self-healed by the next episode
+	 * entry.
+	 */
+	u8  last_llc;			/* owning LLC, MLFQ_LLC_UNOWNED if none */
+	u8  last_qid;			/* queue of the last placement, 0 if none */
+	u8  pad[2];
 	u64 prev_burst_ns;		/* last completed run segment, tree feature */
 	u64 last_sample_at;		/* scx_bpf_now() of the last emitted
 					 * training sample, per-task rate limit */
@@ -513,6 +592,8 @@ struct mlfq_stats {
 	u64 cpuperf_boosts;
 	/* Dispatch-path counters: remote-DSQ moves and solo-task keep grants. */
 	u64 steals;
+	u64 steals_same_llc;		/* steals within one LLC domain */
+	u64 steals_cross_llc;		/* steals across LLC domains */
 	u64 keep_running;
 	/* Enqueue-path diagnostics: the early-return drop counters. */
 	u64 enq_no_tctx;
@@ -535,17 +616,19 @@ struct mlfq_stats {
 	u64 rt_redirects;		/* wakeups redirected off occupied CPUs */
 	u64 rt_reenqs;			/* SCX_ENQ_REENQ re-enqueues counted */
 	/*
-	 * Pad the counter struct to a 64-byte multiple: the counters
-	 * before the pad are write-hammered by the hot paths, and the
-	 * published tree meta line (mlfq_tree_ctrl) must not share a line
-	 * with them. The isolation itself comes from the
-	 * __attribute__((aligned(64))) on the mlfq_tree_ctrl instance in
-	 * main.bpf.c, which pins that line to a dedicated cache line; the
-	 * padding here is the size hygiene that lets the aligned instance
-	 * sit on the following boundary by the plain declaration order,
-	 * so the two never land on the same line by layout accident.
+	 * The counter struct is exactly 32 u64s = 256 bytes (four 64-byte
+	 * lines): the counters before the pad are write-hammered by the
+	 * hot paths, and the published tree meta line (mlfq_tree_ctrl)
+	 * must not share a line with them. The isolation itself comes
+	 * from the __aligned(64) on the mlfq_tree_ctrl
+	 * instance in main.bpf.c, which pins that line to a dedicated
+	 * cache line; the size hygiene here lets the aligned instance sit
+	 * on the following boundary by the plain declaration order, so
+	 * the two never land on the same line by layout accident. The pad
+	 * is empty at this exact field count; adding any counter requires
+	 * recomputing it to keep the 256-byte size.
 	 */
-	u64 pad[2];
+	u64 pad[0];
 };
 
 /*
@@ -556,6 +639,20 @@ struct mlfq_stats {
  */
 struct mlfq_bitmap {
 	u64 words[MLFQ_BITMAP_WORDS];
+};
+
+/*
+ * One LLC domain's CPU list, the value type of the mlfq_llc_cpus array
+ * map. Written by the Rust front-end after load; the dispatch Tier-A
+ * scan walks the consuming CPU's own-LLC entry as its same-LLC steal
+ * window. 132 bytes per value (4 + 32 * 4), far under the ARRAY-map
+ * value-size limit; the unpopulated map state means "feature off", and
+ * an empty per-domain list (nr == 0, an oversized domain) means "Tier A
+ * skips this domain, Tier B's full window covers it".
+ */
+struct mlfq_llc_cpu_list {
+	u32 nr;				/* valid CPUs in cpus[] */
+	u32 cpus[MLFQ_MAX_LLC_CPUS];	/* the domain's CPU ids */
 };
 
 /*
@@ -1378,6 +1475,181 @@ static __always_inline u64 mlfq_tree_predict(const struct mlfq_tree_feats *f)
 
 	return mlfq_tree_walk(store, f);
 }
+
 #endif /* __VMLINUX_H__ */
 
+/*
+ * The per-LLC and per-queue runnable gauges, defined in the main.bpf.c
+ * bss block before mlfq_stats. The externs are declared here, outside
+ * the BPF-only guard above, so the accounting helpers below can
+ * reference them in every build: the BPF build links them against the
+ * bss block, and the native harness supplies its own shadow storage.
+ */
+extern volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
+extern volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
+
+/**
+ * mlfq_llc_add - One atomic step on the per-LLC runnable gauge.
+ * @llc: The LLC domain id.
+ * @delta: +1 to count, -1 to un-count.
+ *
+ * The index is validated against the hard array bound; an out-of-range
+ * id (the MLFQ_MAX_LLCS sentinel the call sites pass for an unpopulated
+ * domain) is a no-op. The gauge is advisory, so a lost update under
+ * contention is absorbed by the next RMW.
+ */
+static __always_inline void mlfq_llc_add(u32 llc, s64 delta)
+{
+	if (llc >= MLFQ_MAX_LLCS)
+		return;
+	if (delta > 0)
+		__sync_fetch_and_add(&mlfq_llc_runnable[llc], (u32)delta);
+	else
+		__sync_fetch_and_sub(&mlfq_llc_runnable[llc], (u32)(-delta));
+}
+
+/**
+ * mlfq_queue_add - One atomic step on the per-queue runnable gauge.
+ * @qid: The queue id (1..3; index 0 is unused).
+ * @delta: +1 to count, -1 to un-count.
+ *
+ * The index is validated against the queue range; an out-of-range id is
+ * a no-op (defense in depth on top of the classification range checks).
+ */
+static __always_inline void mlfq_queue_add(u32 qid, s64 delta)
+{
+	if (qid < 1 || qid > MLFQ_NR_QUEUES)
+		return;
+	if (delta > 0)
+		__sync_fetch_and_add(&mlfq_queue_runnable[qid], (u32)delta);
+	else
+		__sync_fetch_and_sub(&mlfq_queue_runnable[qid], (u32)(-delta));
+}
+
+/**
+ * mlfq_runnable_enter - Count a task's LLC/queue ownership at an insert.
+ * @tctx: The task being placed.
+ * @qid: The queue it is placed into (1..3).
+ * @llc: The LLC owning the target CPU (mlfq_llc_of_cpu(); the sentinel
+ *	is a no-op).
+ *
+ * Called once per DSQ insert, after the queue and the owning CPU are
+ * final. A task with no recorded ownership starts a runnable episode
+ * (wakeup, fork, class-switch-in) and is counted once at the destination
+ * LLC and queue; a task already counted is a continuation (run-out,
+ * preemption, REENQ, a dispatch move) and the call only moves its LLC
+ * and/or queue ownership when either changed, leaving the total count
+ * unchanged. The mlfq_llc_of_cpu() sentinel makes the whole call a no-op
+ * when LLC awareness is disabled (nr_llcs == 0), so an unpopulated
+ * machine never moves any gauge.
+ */
+static __always_inline void mlfq_runnable_enter(struct task_ctx *tctx,
+						u8 qid, u32 llc)
+{
+	/*
+	 * The llc guard is the populated-state gate: the call sites pass
+	 * mlfq_llc_of_cpu(), which yields the MLFQ_MAX_LLCS sentinel for
+	 * an unknown domain or when nr_llcs == 0. The whole call is a
+	 * no-op then, counters and ownership record alike.
+	 */
+	if (llc >= MLFQ_MAX_LLCS)
+		return;
+
+	if (tctx->last_llc == MLFQ_LLC_UNOWNED) {
+		mlfq_llc_add(llc, 1);
+		mlfq_queue_add(qid, 1);
+		tctx->last_llc = (u8)llc;
+		tctx->last_qid = qid;
+		return;
+	}
+
+	/* Continuation: the task is counted, only its ownership moves. */
+	if (tctx->last_llc != (u8)llc) {
+		mlfq_llc_add(tctx->last_llc, -1);
+		mlfq_llc_add(llc, 1);
+		tctx->last_llc = (u8)llc;
+	}
+	if (tctx->last_qid != qid) {
+		mlfq_queue_add(tctx->last_qid, -1);
+		mlfq_queue_add(qid, 1);
+		tctx->last_qid = qid;
+	}
+}
+
+/**
+ * mlfq_runnable_exit - Release a task's LLC/queue ownership.
+ * @tctx: The task leaving the runnable set (or leaving LLC ownership).
+ *
+ * The single release primitive: a task that was counted is removed from
+ * the per-LLC and per-queue gauges and its ownership record returns to
+ * the unowned state. A task with no recorded ownership (never counted,
+ * or already released) is a no-op, which makes the call idempotent
+ * against a racing double-release.
+ */
+static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
+{
+	if (tctx->last_llc == MLFQ_LLC_UNOWNED)
+		return;
+	mlfq_llc_add(tctx->last_llc, -1);
+	mlfq_queue_add(tctx->last_qid, -1);
+	tctx->last_llc = MLFQ_LLC_UNOWNED;
+	tctx->last_qid = 0;
+}
+
+/**
+ * mlfq_steer_pick_llc - Least-loaded eligible LLC selection.
+ * @runnable: Per-LLC runnable gauge (advisory, stale-tolerant).
+ * @idle: Per-LLC idle-CPU gate; a zero entry excludes the domain.
+ * @nr_llcs: Number of populated LLC domains; domains at or above it are
+ *	excluded (defense in depth on top of the idle gate, which already
+ *	keeps the unpopulated-domain gauges at zero).
+ * @waker_llc: The waker's own domain, always excluded.
+ * @visited: Bitmask of domains already tried by earlier selection passes
+ *	of this steering step (bit llc set = excluded).
+ *
+ * One min-selection pass over the eligible domains (idle-populated,
+ * other than @waker_llc, not visited), returning the one with the lowest
+ * runnable count; ties are broken by ascending domain id, so the
+ * selection is deterministic. The caller repeats the pass up to
+ * MLFQ_STEER_LLC_MAX times, marking each returned domain visited, so at
+ * most MLFQ_STEER_LLC_MAX distinct domains are ever probed and the
+ * bitmap walks (the expensive part) stay bounded.
+ *
+ * The step is advisory: a stale runnable count costs one suboptimal
+ * (still idle) placement in a race window, never a correctness issue --
+ * the same trust model as the idle-count saturation fast path. The
+ * empty state (nr_llcs == 0, or every idle gauge zero) yields the
+ * sentinel and the step dies; placement then proceeds unchanged.
+ *
+ * The scan is compile-time bounded (MLFQ_MAX_LLCS iterations) and uses
+ * the iterator form (bpf_for) so the verifier explores the pass once
+ * instead of re-walking a plain loop until its states converge; the
+ * native harness drives the same code through the fallback macro above.
+ *
+ * Return: The chosen domain id, or MLFQ_MAX_LLCS when no domain is
+ * eligible.
+ */
+static __always_inline u32
+mlfq_steer_pick_llc(const volatile u32 *runnable, const volatile u32 *idle,
+		    u32 nr_llcs, u32 waker_llc, u64 visited)
+{
+	u32 llc, best = MLFQ_MAX_LLCS;
+
+	bpf_for(llc, 0, MLFQ_MAX_LLCS) {
+		if (llc >= nr_llcs)
+			continue;
+		if (llc == waker_llc)
+			continue;
+		if (visited & (1ULL << llc))
+			continue;
+		if (!idle[llc])
+			continue;
+		if (best >= MLFQ_MAX_LLCS ||
+		    runnable[llc] < runnable[best] ||
+		    (runnable[llc] == runnable[best] && llc < best))
+			best = llc;
+	}
+
+	return best;
+}
 #endif /* __SCX_MLFQ_INTF_H */
