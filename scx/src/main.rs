@@ -25,6 +25,7 @@ mod config;
 mod mlfq_tree;
 mod stats;
 mod topology;
+mod webui;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -68,6 +69,17 @@ const SCHEDULER_NAME: &str = "scx_mlfq";
 const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NODES as usize;
 const MLFQ_TREE_MAX_DEPTH: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_DEPTH as usize;
 const MLFQ_TREE_MIN_SAMPLES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MIN_SAMPLES as usize;
+
+/* Compile-time bounds from src/bpf/intf.h, used by the web metrics. */
+const MLFQ_MAX_CPUS: usize = crate::bpf_intf::mlfq_consts_MLFQ_MAX_CPUS as usize;
+
+/*
+ * Web-UI runnable gauges. The BPF side maintains `mlfq_llc_runnable`,
+ * `mlfq_queue_runnable` and `mlfq_llc_idle` in the bss block directly
+ * before `mlfq_stats` (the declaration order keeps the published-tree
+ * control line isolated, see main.bpf.c); the generated bss type carries
+ * the arrays, so the web metrics read them as typed fields.
+ */
 
 /*
  * Training-window cap, in samples. Eight retrain generations at the
@@ -152,6 +164,15 @@ struct Opts {
     #[clap(long, value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
 
+    /// Disable the loopback web UI. The UI binds [::1]:50005 (falling
+    /// back to 127.0.0.1:50005, then to the /tmp/scx_mlfq.sock unix
+    /// socket when the loader sandbox blocks TCP) and is unauthenticated:
+    /// the loopback address is the localhost trust boundary, and the
+    /// counters it exposes are already world-readable through the stats
+    /// server. This flag skips the thread entirely.
+    #[clap(long = "no-webui", action = clap::ArgAction::SetTrue)]
+    no_webui: bool,
+
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     libbpf: LibbpfOpts,
 }
@@ -184,6 +205,15 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
+    /*
+     * Web UI plumbing: the metrics sender (None when --no-webui, in
+     * which case the webui thread is never spawned and the metrics are
+     * never collected) and the once-per-attach per-CPU static seed
+     * (freq, LLC, SMT) the web metrics merge the dynamic BPF state into.
+     */
+    webui_tx: Option<crossbeam::channel::Sender<stats::WebMetrics>>,
+    webui_join: Option<std::thread::JoinHandle<()>>,
+    cpu_static: Vec<stats::PerCpuMetrics>,
     started_at: std::time::Instant,
     /*
      * PM QoS idle-latency constraint on /dev/cpu_dma_latency, held for
@@ -221,6 +251,7 @@ impl<'a> Scheduler<'a> {
     fn init(
         opts: &'a Opts,
         open_object: &'a mut MaybeUninit<libbpf_rs::OpenObject>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         try_set_rlimit_infinity();
 
@@ -362,6 +393,33 @@ impl<'a> Scheduler<'a> {
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
         /*
+         * The web UI: a small bounded metrics channel (capacity 16;
+         * try_send drops a frame when the buffer is full, so the run
+         * loop never blocks and the buffer never grows) feeding a
+         * detached server thread that exits on the shared shutdown
+         * flag. The per-CPU static seed is captured once here; with
+         * --no-webui neither the thread nor the seed exist.
+         */
+        let (webui_tx, webui_join): (
+            Option<crossbeam::channel::Sender<stats::WebMetrics>>,
+            Option<std::thread::JoinHandle<()>>,
+        ) = if opts.no_webui {
+            (None, None)
+        } else {
+            let (tx, rx) = crossbeam::channel::bounded::<stats::WebMetrics>(16);
+            let shutdown = shutdown.clone();
+            let jh = std::thread::spawn(move || {
+                webui::start(rx, shutdown);
+            });
+            (Some(tx), Some(jh))
+        };
+        let cpu_static = if opts.no_webui {
+            Vec::new()
+        } else {
+            topology::web_cpu_static()
+        };
+
+        /*
          * The training-sample ring buffer: the callback parses each
          * record as the mlfq_tree_sample mirror and forwards it into a
          * bounded channel the run loop drains. try_send drops the sample
@@ -402,6 +460,9 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops: Some(struct_ops),
             stats_server,
+            webui_tx,
+            webui_join,
+            cpu_static,
             started_at: std::time::Instant::now(),
             pm_qos_fd,
             rb_mgr,
@@ -468,6 +529,138 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Web-metrics snapshot: the raw scheduler counters plus the per-CPU
+    /// state and the runnable gauges, pushed to the web UI every run-loop
+    /// iteration. Gauges only - no interval deltas.
+    fn get_web_metrics(&self) -> stats::WebMetrics {
+        let bss_data = self
+            .skel
+            .maps
+            .bss_data
+            .as_ref()
+            .expect("bss_data missing, the BPF object has no .bss section");
+
+        // Merge the per-CPU dynamic state (running queue, running pid,
+        // realtime occupancy) from the per-CPU maps into the once-per-
+        // attach static seed (freq, LLC, SMT). One entry per CPU in
+        // bss_data.nr_cpu_ids, capped at MLFQ_MAX_CPUS.
+        let nr_cpus = (bss_data.nr_cpu_ids as usize).min(MLFQ_MAX_CPUS);
+        let mut statics = vec![None; nr_cpus];
+        for s in &self.cpu_static {
+            if (s.id as usize) < nr_cpus {
+                statics[s.id as usize] = Some(s.clone());
+            }
+        }
+        let mut per_cpu = Vec::with_capacity(nr_cpus);
+        for (cpu, static_entry) in statics.iter().enumerate() {
+            let mut entry = static_entry.clone().unwrap_or_default();
+            entry.id = cpu as u32;
+
+            let state = self.read_cpu_state(cpu);
+            entry.running_queue = state.running_queue;
+            entry.running_pid = state.running_pid;
+
+            let rt = self.read_rtdl_state(cpu);
+            entry.rt_occupied = rt.flags & crate::bpf_intf::MLFQ_RTDL_OCCUPIED != 0;
+            per_cpu.push(entry);
+        }
+
+        stats::WebMetrics {
+            stats: self.get_metrics(),
+            per_cpu,
+            queue_runnable: self.read_queue_runnable(),
+            llc_runnable: self.read_llc_runnable(),
+        }
+    }
+
+    /// Read one CPU's dynamic state from the per-CPU array map. A failed
+    /// lookup or an unexpected value size yields an all-zero state.
+    fn read_cpu_state(&self, cpu: usize) -> mlfq_cpu_state {
+        let key = (cpu as u32).to_ne_bytes();
+        match self
+            .skel
+            .maps
+            .cpu_state_stor
+            .lookup(&key, libbpf_rs::MapFlags::ANY)
+        {
+            Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_cpu_state>() => {
+                // SAFETY: mlfq_cpu_state is the repr(C) bindgen mirror of
+                // the map's value type; reading the value bytes as the
+                // struct is a plain reinterpretation of integer fields.
+                unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_cpu_state>()) }
+            }
+            _ => mlfq_cpu_state {
+                running_queue: 0,
+                running_pid: 0,
+                steal_scan_off: 0,
+                cpu_ema: 0,
+                cpu_ema_at: 0,
+                running_deadline: 0,
+                run_start_at: 0,
+            },
+        }
+    }
+
+    /// Read one CPU's realtime-occupancy state from the per-CPU array
+    /// map; a failed lookup yields an all-zero state (not occupied).
+    fn read_rtdl_state(&self, cpu: usize) -> mlfq_rtdl_state {
+        let key = (cpu as u32).to_ne_bytes();
+        match self
+            .skel
+            .maps
+            .rtdl_state_stor
+            .lookup(&key, libbpf_rs::MapFlags::ANY)
+        {
+            Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_rtdl_state>() => {
+                // SAFETY: as in read_cpu_state: a repr(C) mirror of the
+                // map's value type.
+                unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_rtdl_state>()) }
+            }
+            _ => mlfq_rtdl_state {
+                flags: 0,
+                pad: 0,
+                last_drain_at: 0,
+            },
+        }
+    }
+
+    /// Tracked runnable tasks per queue (index 0 unused, 1..3 = Q1..Q3).
+    ///
+    /// The gauge is the BPF-side `mlfq_queue_runnable` bss array, which
+    /// counts the runnable tasks placed in each queue's DSQs (the
+    /// accounting contract is in `intf.h` next to the counters). Read
+    /// through the generated bss type, so a layout change is a compile
+    /// error rather than a silent misread.
+    fn read_queue_runnable(&self) -> Vec<u64> {
+        let bss_data = self
+            .skel
+            .maps
+            .bss_data
+            .as_ref()
+            .expect("bss_data missing, the BPF object has no .bss section");
+        bss_data
+            .mlfq_queue_runnable
+            .iter()
+            .map(|v| *v as u64)
+            .collect()
+    }
+
+    /// Tracked runnable tasks per LLC domain (MLFQ_MAX_LLCS entries).
+    /// Same contract and access path as `read_queue_runnable`.
+    fn read_llc_runnable(&self) -> Vec<u64> {
+        let bss_data = self
+            .skel
+            .maps
+            .bss_data
+            .as_ref()
+            .expect("bss_data missing, the BPF object has no .bss section");
+        bss_data
+            .mlfq_llc_runnable
+            .iter()
+            .map(|v| *v as u64)
+            .collect()
+    }
+
     fn exited(&self) -> bool {
         uei_exited!(&self.skel, uei)
     }
@@ -518,8 +711,20 @@ impl<'a> Scheduler<'a> {
             self.poll_train_results();
 
             match req_ch.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) => res_ch.send(self.get_metrics())?,
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(()) => {
+                    // Push a web snapshot on the stats request too, so
+                    // the UI cadence is the run-loop cadence, not the
+                    // browser's 1 s poll.
+                    if let Some(ref tx) = self.webui_tx {
+                        let _ = tx.try_send(self.get_web_metrics());
+                    }
+                    res_ch.send(self.get_metrics())?
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(ref tx) = self.webui_tx {
+                        let _ = tx.try_send(self.get_web_metrics());
+                    }
+                }
                 Err(e) => Err(e)?,
             }
         }
@@ -533,13 +738,14 @@ impl<'a> Scheduler<'a> {
 
         let m = self.get_metrics();
         log::info!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={}",
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} steals_same_llc={} steals_cross_llc={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
             m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
             m.enq_no_deadline, m.promotions, m.demotions, m.aging_boosts,
             m.short_sleep_boosts, m.cpuperf_boosts, m.preemption_kicks,
-            m.total_runtime, m.on_cpu, m.steals, m.keep_running,
+            m.total_runtime, m.on_cpu, m.steals, m.steals_same_llc,
+            m.steals_cross_llc, m.keep_running,
             m.rt_takeovers, m.rt_evacuations, m.rt_redirects, m.rt_reenqs,
             m.tree_model_generation, m.tree_model_nodes, m.tree_model_samples,
             m.tree_mae_tree_us, m.tree_mae_ema_us, self.model.corr,
@@ -743,6 +949,15 @@ impl Drop for Scheduler<'_> {
          * previous idle-latency constraint; the field drop below does
          * this on every exit path.
          */
+        /*
+         * Join the web UI thread so its unblock-write flag (see
+         * webui.rs) is visible before the caller's restore decision;
+         * the thread exits within its poll interval of the shutdown
+         * flag, so the join is bounded.
+         */
+        if let Some(jh) = self.webui_join.take() {
+            let _ = jh.join();
+        }
         info!("Unregister {SCHEDULER_NAME} scheduler");
     }
 }
@@ -971,7 +1186,7 @@ fn main() -> Result<()> {
 
     let mut open_object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
     loop {
-        let mut sched = Scheduler::init(&opts, &mut open_object)?;
+        let mut sched = Scheduler::init(&opts, &mut open_object, shutdown.clone())?;
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
         }
@@ -979,6 +1194,17 @@ fn main() -> Result<()> {
         // re-initializing the BPF object for the next incarnation.
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    /*
+     * If this run wrote the runtime loader-sandbox unblock (see
+     * webui.rs), restore it now: the drop-in is per-boot state under
+     * /run, so it must be undone once, at the final exit after the
+     * restart loop, not on every internal restart. The web UI thread
+     * of the last incarnation is joined first, so its unblock-write
+     * flag is visible before the restore decision (the thread exits
+     * within its poll interval of the shutdown flag).
+     */
+    webui::restore_loader_sandbox();
 
     info!("Scheduler exited");
 

@@ -124,6 +124,50 @@ pub struct Metrics {
     pub tree_mae_ema_us: u64,
 }
 
+/// One entry of the web UI's per-CPU card grid.
+///
+/// The static fields (`freq_khz`, `llc_id`, `smt`) are seeded once at
+/// attach from the host topology (`topology::web_cpu_static`); the
+/// dynamic fields (`running_queue`, `running_pid`, `rt_occupied`) are
+/// refreshed from the BPF per-CPU maps on every web-metrics poll. The
+/// carriers do not take part in the stats server's `delta()` accounting.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PerCpuMetrics {
+    /// CPU id.
+    pub id: u32,
+    /// Maximum operating frequency of the CPU, in kHz.
+    pub freq_khz: u64,
+    /// LLC domain id of the CPU (0 when the domain is unknown).
+    pub llc_id: u32,
+    /// True when the CPU shares its core with a sibling thread.
+    pub smt: bool,
+    /// Queue of the currently running task (0 = idle, 1..3).
+    pub running_queue: i32,
+    /// PID of the currently running task, 0 when idle.
+    pub running_pid: u32,
+    /// True when a realtime-class task currently occupies the CPU.
+    pub rt_occupied: bool,
+}
+
+/// Snapshot served by the web UI's `/api/stats` endpoint.
+///
+/// The run loop pushes one of these every iteration (both the stats
+/// request and the idle-timeout branches); the webui thread keeps the
+/// newest snapshot behind a mutex for the HTTP handlers. All fields are
+/// instantaneous gauges, not interval deltas: the gauges bypass the
+/// stats server's `delta()` entirely.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WebMetrics {
+    /// The scheduler-wide counters, raw (no delta applied).
+    pub stats: Metrics,
+    /// One entry per online CPU.
+    pub per_cpu: Vec<PerCpuMetrics>,
+    /// Tracked runnable tasks per queue; index 0 unused, 1..3 = Q1..Q3.
+    pub queue_runnable: Vec<u64>,
+    /// Tracked runnable tasks per LLC domain.
+    pub llc_runnable: Vec<u64>,
+}
+
 /// Bucket edges of the op-latency histogram, matching `enum
 /// mlfq_op_lat_consts` in `src/bpf/intf.h`, in microseconds.
 const OP_LAT_EDGES_US: [u64; 7] = [

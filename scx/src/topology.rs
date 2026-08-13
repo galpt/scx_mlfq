@@ -433,6 +433,79 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
     Ok(TopologyPlan { capacity, llcs })
 }
 
+/// Per-CPU static data for the web UI, seeded once at attach.
+///
+/// Runs `Topology::new()` a second time (besides `init_topology()`) and
+/// reports, per online CPU: the maximum operating frequency (`Cpu.max_freq`,
+/// in kHz), the LLC domain id (from the same `plan_llcs` mapping the
+/// placement path uses) and whether the CPU shares its core with a
+/// sibling thread (the `plan_sibling_table` test `sibling[i] != i`, the
+/// same pairing the wakeup-preference path consumes). The dynamic
+/// per-CPU fields are filled by the web-metrics poll from the BPF
+/// per-CPU maps.
+///
+/// Best-effort like the rest of the topology discovery: any failure
+/// yields an empty list and the web UI shows no per-CPU cards rather
+/// than aborting the scheduler.
+pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
+    let topo = match Topology::new() {
+        Ok(topo) => topo,
+        Err(e) => {
+            warn!("CPU topology discovery failed, the web UI reports no per-CPU data: {e}");
+            return Vec::new();
+        }
+    };
+
+    let primaries: Vec<u32> = match get_primary_cpus(Powermode::Performance) {
+        Ok(cpus) => cpus.into_iter().map(|cpu| cpu as u32).collect(),
+        Err(e) => {
+            warn!("primary CPU discovery failed, the web UI reports no per-CPU data: {e}");
+            Vec::new()
+        }
+    };
+
+    let cpu_to_llc: Vec<(u32, u32)> = topo
+        .all_cpus
+        .iter()
+        .map(|(id, cpu)| (*id as u32, cpu.llc_id as u32))
+        .collect();
+    let llcs = plan_llcs(&cpu_to_llc, &primaries, MAX_LLCS);
+
+    // SMT is the sibling table's test (sibling[i] != i): the same
+    // per-core pairing the wakeup-preference path consumes.
+    let cpu_to_core: Vec<(u32, u32)> = topo
+        .all_cpus
+        .iter()
+        .map(|(id, cpu)| (*id as u32, cpu.core_id as u32))
+        .collect();
+    let siblings = plan_sibling_table(&cpu_to_core);
+
+    topo.all_cpus
+        .iter()
+        .map(|(id, cpu)| {
+            // The placement path's MLFQ_MAX_LLCS sentinel (an unmapped
+            // or unknown CPU) is mapped to 0 for display: the UI shows
+            // the LLC id as-is, and "no LLC" is the field's documented
+            // convention, not a sentinel value from the placement side.
+            let llc_id = llcs.cpu_llc.get(*id).copied().unwrap_or(0);
+            let llc_id = if llc_id == mlfq_consts_MLFQ_MAX_LLCS {
+                0
+            } else {
+                llc_id
+            };
+            crate::stats::PerCpuMetrics {
+                id: *id as u32,
+                freq_khz: cpu.max_freq as u64,
+                llc_id,
+                smt: siblings.cpu_sibling.get(*id).copied().unwrap_or(*id as u32) != *id as u32,
+                running_queue: 0,
+                running_pid: 0,
+                rt_occupied: false,
+            }
+        })
+        .collect()
+}
+
 /// Phase 2 (post-load): write the primary (big-core) membership bitmap.
 ///
 /// With uniform capacity the BPF selector short-circuits on
