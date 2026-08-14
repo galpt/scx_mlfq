@@ -34,11 +34,11 @@ typedef int pid_t;
 /*
  * Native-harness fallback for the iterator-based bpf_for loops below.
  * The BPF build gets the real iterator macro from scx/common.bpf.h
- * (included by main.bpf.c before this header); the pure-math harness
+ * (included by main.bpf.c before this header). The pure-math harness
  * compiles this header without any BPF machinery, so a plain bounded
  * for-loop preserves the same semantics for the pure functions. The
  * iterator form is what keeps the verifier's exploration of the loop
- * flat -- a plain constant-bound loop is not unrolled and the verifier
+ * flat. A plain constant-bound loop is not unrolled and the verifier
  * processes each iteration until its states converge, which blows the
  * instruction budget for the steering scan.
  */
@@ -93,14 +93,42 @@ enum mlfq_consts {
 	MLFQ_T_L_NS			= (250ULL * NSEC_PER_USEC),
 	MLFQ_T_H_NS			= (2ULL * NSEC_PER_MSEC),
 
+	/*
+	 * Ceiling of the per-task service-quality EMA and of the system
+	 * wakeup-latency gauge, in nsecs. A task that waits 100 ms in a
+	 * queue under overload saturates both at 16 ms: that is the
+	 * "latency pressure" signal the adaptation reacts to, and the
+	 * bounded ceiling keeps every downstream gauge and threshold in a
+	 * small, overflow-free range.
+	 */
+	MLFQ_SQ_EMA_MAX_NS		= (16ULL * NSEC_PER_MSEC),
+	MLFQ_SYS_LAT_MAX_NS		= (16ULL * NSEC_PER_MSEC),
+
 	/* EMA decay half-life. */
 	MLFQ_EMA_HALF_LIFE_NS		= (24ULL * NSEC_PER_MSEC),
+
+	/*
+	 * Seconds-scale time constant of the system gauges (wakeup
+	 * latency and wakeup rate). The gauges smooth the workload over
+	 * seconds while the per-task classification reacts in
+	 * milliseconds, so the adaptation they drive cannot chase
+	 * sample-level noise.
+	 */
+	MLFQ_SYS_GAUGE_HALF_LIFE_NS	= (1ULL * NSEC_PER_SEC),
+
+	/*
+	 * Ceiling of the wakeup-rate gauge, in wakeups per second. The
+	 * rate is carried in FP_SHIFT fixed point, so the ceiling sits
+	 * below the u32 fixed-point overflow point and the stored value
+	 * (a u64) is exact.
+	 */
+	MLFQ_SYS_RATE_MAX		= 1000000ULL,
 
 	/*
 	 * Short-sleep boost window: covers periodic wakeup cadences such
 	 * as the 60 Hz frame interval, so latency-sensitive consumers of
 	 * CPU are recognized as interactive even when their runtime
-	 * consumption would otherwise classify them as CPU-bound; the
+	 * consumption would otherwise classify them as CPU-bound. The
 	 * per-task boost rate limit keeps the churn bounded.
 	 * The value is set against the slowest common cadence: faster refresh
 	 * rates sleep for a shorter interval per frame and fall inside the
@@ -138,7 +166,7 @@ enum mlfq_consts {
 	MLFQ_PREEMPT_SLICE_NS		= (150ULL * NSEC_PER_USEC),
 
 	/*
-	 * A sleep longer than this collapses the gauge to (near) zero; the
+	 * A sleep longer than this collapses the gauge to (near) zero. The
 	 * wakeup then re-adopts the base mapping. Five EMA half-lives =
 	 * 120 ms.
 	 */
@@ -225,7 +253,7 @@ enum mlfq_consts {
 	 * scan window, so the window's constant modulo covers the whole
 	 * populated list: the front-end populates a domain's list only up
 	 * to MLFQ_LLC_SCAN_MAX CPUs, and a domain that exceeds the bound
-	 * gets an EMPTY list (nr == 0) instead -- Tier A then skips it and
+	 * gets an EMPTY list (nr == 0) instead. Tier A then skips it and
 	 * the Tier B rotating window covers the domain, never a silently
 	 * shrunk subset of it. The cpus[] array is exactly the window
 	 * width, so every published entry is reachable by the scan.
@@ -248,7 +276,7 @@ enum mlfq_consts {
 	/*
 	 * MLFQ regression-tree constants. The tree predicts the next CPU
 	 * burst from per-task features and maps the prediction to a queue
-	 * band (pred < T_INT -> Q1, pred < T_BOUND -> Q2, else Q3); the
+	 * band (pred < T_INT -> Q1, pred < T_BOUND -> Q2, else Q3). The
 	 * EMA gauge stays on as a tree feature and as the untrained
 	 * fallback. Internal tuning constants, not user-facing knobs.
 	 */
@@ -256,6 +284,76 @@ enum mlfq_consts {
 	MLFQ_TREE_MAX_DEPTH		= 12,		/* walk depth bound */
 	MLFQ_TREE_T_INT_NS		= (1ULL * NSEC_PER_MSEC), /* Q1/Q2 split */
 	MLFQ_TREE_T_BOUND_NS		= (3ULL * NSEC_PER_MSEC), /* Q2/Q3 split */
+
+	/*
+	 * Version tag of the emitted training-sample record layout. The
+	 * ring-buffer records are parsed by the daemon with a
+	 * byte-for-byte struct mirror compiled from this same header, and
+	 * the native harness pins the layout at compile time; the tag is
+	 * the runtime check of that contract, so a record produced by an
+	 * out-of-tree builder (or a daemon built against a different
+	 * intf.h) fails loudly at the parse instead of misreading the
+	 * fields.
+	 */
+	MLFQ_TREE_SAMPLE_VERSION	= 2,
+
+	/*
+	 * Adaptation control law. The adaptation is a proportional-only
+	 * controller on the system wakeup-latency gauge. The band edges
+	 * move by a common relative shift, slew-limited per step, within
+	 * the hard floor/ceiling ranges below. The target latency equals
+	 * the interactive slice, the natural service target of the Q1
+	 * boost; k = 0.5 maps a full-range gauge error to half the shift
+	 * range, and the slew caps a single step at 10% of the base, so a
+	 * full swing needs at least five steps and one bad sample can
+	 * never move the bands more than one step.
+	 */
+	MLFQ_ADAPT_MIN_INTERVAL_NS	= (1ULL * NSEC_PER_SEC),
+	MLFQ_ADAPT_TARGET_LAT_NS	= (1ULL * NSEC_PER_MSEC),
+	MLFQ_ADAPT_K			= (FP_ONE / 2),
+	MLFQ_ADAPT_MAX_SHIFT		= (FP_ONE / 2),
+	MLFQ_ADAPT_MAX_STEP		= (FP_ONE / 10),
+
+	/*
+	 * Hard bounds of the effective band edges. The floor/ceiling
+	 * ranges are disjoint per band pair (T_L ceiling 500 us sits below
+	 * the T_H floor 1.2 ms, and the T_INT ceiling 1.6 ms below the
+	 * T_BOUND floor 1.8 ms), so no admissible shift can collapse a
+	 * band to zero width or invert the queue semantics. T_H - T_L
+	 * >= 700 us and T_BOUND - T_INT >= 200 us for every reachable
+	 * shift. The bounds are enforced on the effective value, never on
+	 * the shift input.
+	 */
+	MLFQ_ADAPT_T_L_FLOOR_NS		= (150ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_L_CEIL_NS		= (500ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_H_FLOOR_NS		= (1200ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_H_CEIL_NS		= (3200ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_INT_FLOOR_NS	= (600ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_INT_CEIL_NS	= (1600ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_BND_FLOOR_NS	= (1800ULL * NSEC_PER_USEC),
+	MLFQ_ADAPT_T_BND_CEIL_NS	= (4800ULL * NSEC_PER_USEC),
+
+	/*
+	 * Ceiling of the effective same-queue preemption residency guard,
+	 * in nsecs. The guard is the throughput channel of the
+	 * adaptation: it stays at zero under latency pressure (the
+	 * interactive Q1->Q1 preemption remains unconditional) and rises
+	 * to at most 250 us under throughput pressure. A quarter of the
+	 * Q1 slice, so preemption is never effectively disabled.
+	 */
+	MLFQ_ADAPT_GUARD_MAX_NS		= (250ULL * NSEC_PER_USEC),
+
+	/*
+	 * Wakeup-rate storm gate. When the system wakeup-rate gauge
+	 * exceeds this high threshold (200k wakeups per second, an order
+	 * of magnitude above a normal desktop wakeup cadence), the
+	 * positive shift is capped at +0.25 instead of +0.5: under a
+	 * wakeup storm the band edges must not chase the latency error as
+	 * far as in the normal regime. The threshold is in FP_SHIFT fixed
+	 * point to match the gauge.
+	 */
+	MLFQ_ADAPT_RATE_GATE_HIGH	= (200000ULL << FP_SHIFT),
+	MLFQ_ADAPT_RATE_GATE_SHIFT	= (FP_ONE / 4),
 
 	/*
 	 * Global training-sample emission limiter: at most one sample per
@@ -299,6 +397,15 @@ enum mlfq_consts {
 /* task_ctx flags */
 enum mlfq_task_flags {
 	MLFQ_TF_FIRST_RUN		= 1U << 0,	/* first placement */
+	/*
+	 * The current enqueue was a wakeup: the enqueue-to-run wait
+	 * measured at ops.running() is a wakeup-to-run latency and feeds
+	 * the wakeup-latency features and gauges. Set on the wakeup
+	 * insert paths only, cleared at the measurement and on every
+	 * non-wakeup re-enqueue, so a re-enqueued (takeover-drained) task
+	 * is never attributed a wakeup latency it did not have.
+	 */
+	MLFQ_TF_ENQ_WAKEUP		= 1U << 1,
 };
 
 /*
@@ -313,8 +420,13 @@ enum mlfq_task_flags {
 
 /*
  * Feature vector of the prediction tree, one value per split feature.
- * 32 bytes. Field order is part of the shared ABI: emitted samples
+ * 48 bytes. Field order is part of the shared ABI: emitted samples
  * (mlfq_tree_sample) and the Rust-side TreeFeats use the same layout.
+ * The last three fields capture the measured enqueue-to-run service of
+ * the task's previous episode (the wakeup latency, the queue wait and
+ * the per-task service-quality EMA). The fitter currently splits on the
+ * first five features only, so the new fields are carried in the samples
+ * as inert data.
  */
 struct mlfq_tree_feats {
 	u64 prev_burst_ns;		/* last completed run segment */
@@ -322,12 +434,15 @@ struct mlfq_tree_feats {
 	u64 ema;			/* EMA interactivity gauge */
 	u32 io_wait;			/* 1 if the wakeup is an I/O completion */
 	u32 wake_cnt;			/* consecutive short-sleep wakeups */
+	u32 wake_lat_us;		/* last wakeup-to-run latency, us */
+	u32 queue_wait_us;		/* last enqueue-to-run wait, us */
+	u64 sq_ema;			/* service-quality EMA, ns */
 };
 
 /*
  * One node of the serialized tree. threshold is the split point in
- * nsecs; left is the left child index, or the leaf prediction in nsecs
- * when right == 0; right is the right child index, 0 marking a leaf;
+ * nsecs. left is the left child index, or the leaf prediction in nsecs
+ * when right == 0. right is the right child index, 0 marking a leaf.
  * feature is the split feature id (0..4, indexing the walk's feat[]
  * slots). 24 bytes.
  */
@@ -345,7 +460,7 @@ struct mlfq_tree_node {
  * buffer. The daemon fills the inactive entry and flips to it with a
  * single meta write (mlfq_tree_ctrl.meta), so a reader that has loaded
  * the meta once walks a consistent tree and never observes a torn
- * publish: the meta commit is the last write of a publish, and the tree
+ * publish. The meta commit is the last write of a publish, and the tree
  * contents it points at were fully written before it.
  *
  * The protocol is sound at the 60 s publish cadence: a reader could
@@ -355,7 +470,7 @@ struct mlfq_tree_node {
  * one walk. The consequence of the theoretical race (a reader that
  * loaded the meta between two back-to-back publishes and walks the
  * freshly overwritten buffer) is one mispredicted burst, which the
- * queue-band nets absorb -- it is not a memory-safety issue because the
+ * queue-band nets absorb. It is not a memory-safety issue because the
  * walk masks every index to the buffer bound. 49152 bytes.
  */
 struct mlfq_tree_store {
@@ -400,15 +515,27 @@ extern volatile struct mlfq_tree_ctrl mlfq_tree_ctrl;
 /*
  * One training sample emitted by the scheduler and consumed by the
  * daemon. pid and queue identify the emitter, feats is the feature
- * vector at classification time and label_ns the run segment that
- * followed. 48 bytes; field order is shared with the Rust front-end.
+ * vector at classification time, label_ns the run segment that followed
+ * and version the record-layout tag (MLFQ_TREE_SAMPLE_VERSION), checked
+ * by the daemon's parse so a record from a foreign producer or a stale
+ * build fails loudly instead of being misread. 68 bytes. Field order is
+ * shared with the Rust front-end.
+ *
+ * The struct carries `packed, aligned(4)`. The packed attribute drops
+ * the trailing pad the 8-byte-aligned feature vector would otherwise
+ * add (72 bytes), and the align(4) keeps the record on a 4-byte
+ * boundary for ring-buffer consumers. Every field keeps its naturally
+ * aligned offset. The 64-bit fields sit at 8-byte-aligned offsets, and
+ * so the packed attribute changes no field placement, only the record
+ * size.
  */
 struct mlfq_tree_sample {
 	u32 pid;
 	u32 queue;
 	struct mlfq_tree_feats feats;
 	u64 label_ns;
-};
+	u32 version;			/* MLFQ_TREE_SAMPLE_VERSION */
+} __attribute__((packed, aligned(4)));
 
 /*
  * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
@@ -423,9 +550,11 @@ struct mlfq_tree_sample {
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the owning queue's virtual-time clock and is
  * re-anchored to the queue's clock at every placement. The struct is
- * 144 bytes: the 96-byte classification/vtime block below plus the
- * 48-byte MLFQ tree sample block (pending_feats + pending_queue rounded
- * to a u64 for pending_valid).
+ * 184 bytes. The 96-byte classification/vtime block, the 24-byte
+ * enqueue-to-run measurement block, plus the 64-byte MLFQ tree sample
+ * block (the 48-byte feature vector -- the vector grew with the
+ * service fields, plus pending_queue and pending_valid rounded to a
+ * u64).
  */
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
@@ -450,8 +579,8 @@ struct task_ctx {
 	 * global DSQ; last_qid is the queue (1..3) of the last counted
 	 * placement, 0 when unowned. The pair is the single source of
 	 * truth for "is this task counted in the per-LLC/per-queue
-	 * runnable gauges": the helpers treat last_llc == MLFQ_LLC_UNOWNED
-	 * as not counted. The read-modify-write is lock-free: the kernel
+	 * runnable gauges". The helpers treat last_llc == MLFQ_LLC_UNOWNED
+	 * as not counted. The read-modify-write is lock-free. The kernel
 	 * serializes enqueue/dequeue/stopping per task, so the counter
 	 * RMWs stay exact in the absence of a cross-rq race; a torn read
 	 * can only defer one release, self-healed by the next episode
@@ -460,6 +589,20 @@ struct task_ctx {
 	u8  last_llc;			/* owning LLC, MLFQ_LLC_UNOWNED if none */
 	u8  last_qid;			/* queue of the last placement, 0 if none */
 	u8  pad[2];
+	/*
+	 * Enqueue-to-run measurement block. enq_at is stamped at every
+	 * DSQ insert (except the global park, whose wait is kernel-side)
+	 * and the wait since it is measured at the first ops.running()
+	 * of the episode: last_q_wait_ns for every episode, last_wake_lat_ns
+	 * for wakeup episodes only (MLFQ_TF_ENQ_WAKEUP). sq_ema is the
+	 * per-task saturating EMA of the wakeup latency, the service
+	 * quality prior the tree can split on. The block is zeroed by
+	 * mlfq_reset_task_ctx like every other field.
+	 */
+	u64 enq_at;			/* stamp of the current enqueue episode */
+	u32 last_wake_lat_ns;		/* last wakeup-to-run latency, ns */
+	u32 last_q_wait_ns;		/* last enqueue-to-run wait, ns */
+	u64 sq_ema;			/* service-quality EMA [0, SQ_EMA_MAX] */
 	u64 prev_burst_ns;		/* last completed run segment, tree feature */
 	u64 last_sample_at;		/* scx_bpf_now() of the last emitted
 					 * training sample, per-task rate limit */
@@ -483,7 +626,7 @@ struct task_ctx {
 
 /*
  * Per-queue virtual clock. clock is the service point the queue
- * has reached: it advances monotonically as the queue's tasks run, and
+ * has reached. It advances monotonically as the queue's tasks run, and
  * placement anchors a task's lag to it. No weighted-average aggregate is
  * maintained because computing it needs consistent reads of two shared
  * sums, which in BPF would require mutual exclusion; the bounded-lag
@@ -507,7 +650,7 @@ struct queue_ctx {
  * Global idle tracking. mlfq_idle_count is the number of currently idle
  * CPUs, maintained by ops.update_idle() with atomic RMWs (a single u32;
  * the only consumer treats it as a zero/non-zero test). mlfq_idle_tracking
- * is a rodata gate written by the Rust front-end: it is 1 only when the
+ * is a rodata gate written by the Rust front-end. It is 1 only when the
  * kernel keeps its built-in idle tracking alongside the callback (the
  * KEEP_BUILTIN_IDLE flag), 0 otherwise. Declared here so the modules and
  * the pure-math harness share the same contract.
@@ -535,7 +678,7 @@ struct mlfq_cpu_state {
  * Per-CPU realtime-occupancy state, keyed by cpu id in the
  * rtdl_state_stor array map. flags reflects the class of the last task
  * that ran on the CPU (see the sched_switch hook in rtdl.bpf.c), which
- * decides whether the CPU is treated as unavailable to the SCX classes;
+ * decides whether the CPU is treated as unavailable to the SCX classes.
  * last_drain_at rate-limits the evacuation pass of the takeover path.
  */
 struct mlfq_rtdl_state {
@@ -547,8 +690,8 @@ struct mlfq_rtdl_state {
 /*
  * Op-latency histogram. Each slot (MLFQ_OP_LAT_* below) charges the
  * wall time its callback spends running into one of eight buckets that
- * delimit the elapsed microseconds: [0, 2) [2, 5) [5, 10) [10, 20)
- * [20, 50) [50, 100) [100, 250) [250, inf). The preemption path is
+ * delimit the elapsed microseconds. The buckets are [0, 2), [2, 5), [5, 10), [10, 20),
+ * [20, 50), [50, 100), [100, 250) and [250, inf). The preemption path is
  * healthy when its charges stay in the first few buckets; a regression
  * shows up as a visible shift toward the tail.
  */
@@ -622,7 +765,7 @@ struct mlfq_stats {
 	 * must not share a line with them. The isolation itself comes
 	 * from the __aligned(64) on the mlfq_tree_ctrl
 	 * instance in main.bpf.c, which pins that line to a dedicated
-	 * cache line; the size hygiene here lets the aligned instance sit
+	 * cache line. The size hygiene here lets the aligned instance sit
 	 * on the following boundary by the plain declaration order, so
 	 * the two never land on the same line by layout accident. The pad
 	 * is empty at this exact field count; adding any counter requires
@@ -630,6 +773,72 @@ struct mlfq_stats {
 	 */
 	u64 pad[0];
 };
+
+/*
+ * System-level wakeup gauges, the inputs of the threshold adaptation.
+ * lat_ema is a wakeup-latency EMA with its own 1 s half-life (climbed
+ * at every measured wakeup episode, decayed by the wall time since the
+ * last sample). rate_ema is a wakeup-rate EMA in FP_SHIFT fixed point,
+ * folded once per adaptation step. step_at gates the adaptation cadence
+ * (the compare-and-swap single-winner step of the adaptation layer).
+ * gauge_at is the wall time of the last latency-gauge sample. The
+ * wakeup arrival counters live in the per-CPU map mlfq_wakeup_stats
+ * (see mlfq_wakeup_counters below), not here, so the wakeup path never
+ * touches this line. Each CPU owns its own map slot and the u64 totals
+ * cannot wrap. The rate fold consumes the per-CPU window slots once
+ * per step. While the adaptation is disabled the fold never runs and
+ * the rate EMA stays frozen, but the lifetime totals still grow on
+ * every wakeup and are summed at stats read (the observation-only
+ * contract). 40 bytes.
+ */
+struct mlfq_sys_gauge {
+	u64 lat_ema;		/* wakeup-latency EMA, ns, [0, SYS_LAT_MAX] */
+	u64 rate_ema;		/* wakeup rate, wakeups/s in FP_SHIFT fixed point */
+	u64 gauge_at;		/* scx_bpf_now() of the last latency-gauge sample */
+	u64 step_at;		/* scx_bpf_now() of the last adaptation step */
+	u32 adapt_steps;	/* lifetime adaptation steps */
+	u32 pad;
+};
+
+/*
+ * Per-CPU wakeup-arrival counters, one slot per CPU in the per-CPU
+ * array map mlfq_wakeup_stats. Each CPU owns its own slot, so the
+ * wakeup path needs no locked operation on a shared line. total is the
+ * lifetime arrival count of the owning CPU, a u64 so it cannot wrap.
+ * window counts the arrivals since the last rate fold, consumed and
+ * zeroed by the adaptation step with an atomic exchange. The stats
+ * read sums every CPU's total with atomic loads, so the counters stay
+ * tear-free for the readers. While the adaptation is disabled the fold
+ * never runs and the rate EMA stays frozen, but total still grows on
+ * every wakeup (the observation-only contract).
+ */
+struct mlfq_wakeup_counters {
+	u64 total;		/* lifetime wakeup arrivals of this CPU */
+	u64 window;		/* arrivals since the last rate fold */
+};
+
+/*
+ * Effective adaptation state, the values the classification predicates
+ * consume. Every field is written only by the 1 Hz adaptation step and
+ * by mlfq_init() (which copies the rodata bases in, so the bss-zeroed
+ * state, which zero thresholds would map every task to Q1, can never be
+ * observed). shift_fp is the slew-limited common relative shift of both
+ * band pairs, in FP_SHIFT fixed point; the t_*_eff_ns fields are the
+ * clamped effective band edges; guard_eff_ns is the effective same-queue
+ * preemption residency guard. 48 bytes.
+ */
+struct mlfq_adapt_state {
+	s64 shift_fp;		/* slew-limited relative shift, FP */
+	u64 t_l_eff_ns;		/* effective EMA Q1/Q2 band edge */
+	u64 t_h_eff_ns;		/* effective EMA Q2/Q3 band edge */
+	u64 t_int_eff_ns;	/* effective tree Q1/Q2 band edge */
+	u64 t_bnd_eff_ns;	/* effective tree Q2/Q3 band edge */
+	u64 guard_eff_ns;	/* effective same-queue residency guard */
+};
+
+extern volatile struct mlfq_sys_gauge mlfq_sys_gauge;
+extern volatile struct mlfq_adapt_state mlfq_adapt_state;
+extern const volatile bool mlfq_adapt_enabled;
 
 /*
  * Plain u64 bitmap of CPU membership (bit N set = CPU N present). The
@@ -788,7 +997,7 @@ static __always_inline bool mlfq_ss_boost_pending(const struct task_ctx *tctx,
  * mlfq_cpuperf_from_ema - CPU performance level for a busy-ns gauge.
  * @ema: The per-CPU EMA of the recent run time.
  *
- * Maps the busy-ns gauge to the sched_ext cpuperf scale: a CPU that ran
+ * Maps the busy-ns gauge to the sched_ext cpuperf scale. A CPU that ran
  * tasks for the whole gauge window requests the maximum level and a
  * lightly loaded CPU requests a proportionally lower one. The gauge
  * ceiling is the per-task budget, so a CPU saturated over the gauge
@@ -808,7 +1017,7 @@ static __always_inline u32 mlfq_cpuperf_from_ema(u64 ema)
  * @delta: Physical time in nsecs.
  * @weight: Task weight in scx scale (nice-0 = 100, min 1).
  *
- * EEVDF virtual time grows at rate w_i/NICE_0_LOAD while running; with
+ * EEVDF virtual time grows at rate w_i/NICE_0_LOAD while running. With
  * the scx weight scale this is delta * 100 / weight.
  *
  * Return: The virtual time delta.
@@ -823,7 +1032,7 @@ static __always_inline u64 calc_delta_fair_bpf(u64 delta, u32 weight)
  * @q: The queue.
  * @weight: Task weight.
  *
- * limit = calc_delta_fair(max_slice + TICK, weight): a task is placed at
+ * limit = calc_delta_fair(max_slice + TICK, weight). A task is placed at
  * most one request plus one tick behind the queue's virtual clock, the
  * bounded-lag horizon of entity_lag() in kernel/sched/fair.c.
  *
@@ -839,9 +1048,9 @@ static __always_inline u64 mlfq_lag_limit(const struct queue_ctx *q, u32 weight)
  * @q: The queue.
  * @vruntime: The virtual runtime just charged for the queue.
  *
- * The clock follows the service given to the queue: it is advanced to
+ * The clock follows the service given to the queue. It is advanced to
  * @vruntime whenever @vruntime is ahead of it, as a monotone max update.
- * The clock never moves backward: the compare-and-swap stores only when
+ * The clock never moves backward. The compare-and-swap stores only when
  * the clock still holds the value the advance read, and the winner of a
  * contended update is the store that lands first, not necessarily the
  * largest one. A losing update can therefore leave the clock behind the
@@ -865,7 +1074,7 @@ static __always_inline void mlfq_queue_advance_clock(struct queue_ctx *q,
  * @q: The queue being placed into.
  * @tctx: The task being placed.
  *
- * The placement formula of mlfq_place_entity() without the commit: the
+ * The placement formula of mlfq_place_entity() without the commit. The
  * deadline a placement against @q's virtual clock would produce, computed
  * from the pre-placement task state. The wakeup-preemption decision uses
  * it to compare a wakeup's fresh deadline against the resident's before
@@ -919,7 +1128,7 @@ mlfq_place_entity_deadline(const struct queue_ctx *q,
  * @q: The queue being placed into.
  * @tctx: The task being placed.
  *
- * EEVDF placement against the queue's virtual clock:
+ * EEVDF placement against the queue's virtual clock is this.
  *
  *   limit        = calc_delta_fair(max_slice + TICK, weight)
  *   lag          = clamp(clock - vruntime, 0, limit)
@@ -980,10 +1189,10 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
  * @now: Current time.
  * @min_run_ns: Minimum residency before the resident may be displaced.
  *
- * Two same-queue rules:
+ * There are two same-queue rules.
  *
  * - Interactive (Q1 onto Q1): the residency guard alone decides.
- *   Interactive wakeups need immediate service; the virtual-time order
+ *   Interactive wakeups need immediate service. The virtual-time order
  *   still governs the queue DSQ ordering, while the preemption is the
  *   wakeup-latency mechanism. The guard protects the waker's own run
  *   (the wake-all walk executes in the first tens of microseconds of the
@@ -1037,7 +1246,7 @@ static __always_inline bool mlfq_sameq_preempt_owed(u8 qid, u8 running_queue,
  *   ema += min(step, budget_max - ema)
  *
  * with delta clamped to budget_max. The step factorizes the remaining gap,
- * so a CPU-bound task converges to budget_max; the rate is 1/tau_climb
+ * so a CPU-bound task converges to budget_max. The rate is 1/tau_climb
  * with tau_climb = budget_max * FP_ONE / alpha. alpha is fixed.
  *
  * Return: The updated gauge.
@@ -1065,8 +1274,8 @@ static __always_inline u64 mlfq_ema_climb(u64 ema, u64 delta, u64 budget_max,
  * @sleep_ns: Physical sleep time in nsecs.
  * @half_life: Gauge half-life (MLFQ_EMA_HALF_LIFE_NS).
  *
- * Shift decay with a 2nd-order Taylor residual for the sub-period: whole
- * half-lives shift the gauge right; the fractional period is
+ * Shift decay with a 2nd-order Taylor residual for the sub-period. Whole
+ * half-lives shift the gauge right. The fractional period is
  * approximated by 2^-x ~= 1 - x*ln2 + (x*ln2)^2/2 in FP_ONE fixed point
  * (relative error < 10% for x in [0,1)). The gauge is zeroed at or beyond
  * 64 half-lives.
@@ -1094,12 +1303,234 @@ static __always_inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
 }
 
 /**
+ * mlfq_sys_lat_update - Update the system wakeup-latency gauge.
+ * @lat_ema: The gauge, wakeup-latency EMA in nsecs.
+ * @gauge_at: scx_bpf_now() of the last gauge sample (0 = never).
+ * @now: Current time.
+ * @wait: The measured wakeup-to-run latency, nsecs.
+ * @half_life: Decay half-life (MLFQ_SYS_GAUGE_HALF_LIFE_NS).
+ * @max_ns: Gauge ceiling (MLFQ_SYS_LAT_MAX_NS).
+ * @alpha: Climb aggressiveness (MLFQ_ALPHA).
+ *
+ * The wall time since the last sample decays the gauge (the seconds-
+ * scale time constant), then the fresh wait climbs it. A stale or
+ * future timestamp yields a zero elapsed time, so a clock wrap cannot
+ * inject a spurious decay. The climb is the same saturating shape as
+ * the per-task gauge, bounded at @max_ns by construction.
+ *
+ * Return: The updated gauge.
+ */
+static __always_inline u64 mlfq_sys_lat_update(u64 lat_ema, u64 gauge_at,
+					       u64 now, u64 wait,
+					       u64 half_life, u64 max_ns,
+					       u64 alpha)
+{
+	u64 elapsed = mlfq_time_before(now, gauge_at) ? 0 : now - gauge_at;
+
+	lat_ema = mlfq_ema_decay(lat_ema, elapsed, half_life);
+	return mlfq_ema_climb(lat_ema, wait, max_ns, alpha);
+}
+
+/**
+ * mlfq_sys_rate_step - Fold the wakeup-rate EMA at an adaptation step.
+ * @rate_ema: The rate gauge, FP_SHIFT fixed point.
+ * @wakeup_cnt: Wakeup arrivals since the last fold.
+ * @elapsed: Wall time since the last fold, in nsecs.
+ *
+ * The instantaneous rate is the arrival count over the elapsed window,
+ * clamped to MLFQ_SYS_RATE_MAX, and the EMA folds it at the same 1 s
+ * half-life as the latency gauge. The elapsed window is clamped to
+ * [MLFQ_ADAPT_MIN_INTERVAL_NS, 60 s]. The compare-and-swap gate lets
+ * the winner through only when at least a full interval has passed
+ * since the last step, so a sub-second window is reachable only on the
+ * u64 clock wrap path, where the elapsed computes to about zero. The
+ * upper clamp covers a multi-minute idle gap (the boot or a long idle
+ * stretch before the first step).
+ *
+ * Overflow: the count argument is a u32, so the rate product is at
+ * most 2^32 * 1e9 ~= 4.3e18, inside u64. The fold sums the per-CPU
+ * window slots in u64 and truncates to the u32 count, and a one-second
+ * arrival total cannot reach 2^32 on any machine, so the truncation
+ * cannot clip a measured rate. rate_i is clamped below 1e6, so the
+ * fixed-point EMA operands are at most 1e6 << 8 ~= 2.6e8 and the
+ * products at most ~6.6e10, far inside u64.
+ *
+ * Return: The updated gauge.
+ */
+static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
+					      u64 elapsed)
+{
+	u64 rate_i, rate_i_fp, factor;
+
+	if (elapsed < MLFQ_ADAPT_MIN_INTERVAL_NS)
+		elapsed = MLFQ_ADAPT_MIN_INTERVAL_NS;
+	if (elapsed > (60ULL * NSEC_PER_SEC))
+		elapsed = 60ULL * NSEC_PER_SEC;
+
+	rate_i = (u64)wakeup_cnt * NSEC_PER_SEC / elapsed;
+	if (rate_i > MLFQ_SYS_RATE_MAX)
+		rate_i = MLFQ_SYS_RATE_MAX;
+	rate_i_fp = rate_i << FP_SHIFT;
+
+	/* The EMA fold: rate_ema * factor + rate_i * (1 - factor). */
+	factor = mlfq_ema_decay(FP_ONE, elapsed, MLFQ_SYS_GAUGE_HALF_LIFE_NS);
+	rate_ema = rate_ema * factor / FP_ONE +
+		   rate_i_fp * (FP_ONE - factor) / FP_ONE;
+	return rate_ema;
+}
+
+/**
+ * mlfq_adapt_shift_target - Shift target from the latency and rate gauges.
+ * @lat_ema: The wakeup-latency gauge, nsecs.
+ * @rate_ema: The wakeup-rate gauge, FP_SHIFT fixed point.
+ *
+ * The proportional control law of the adaptation is this.
+ *
+ *   shift = clamp((lat - target) * K / target, -MAX_SHIFT, +MAX_SHIFT)
+ *
+ * with K = FP_ONE/2, so a full-range gauge error moves the target by
+ * half the shift range. The wakeup-rate storm gate caps the positive
+ * target at +FP_ONE/4 when the rate gauge exceeds
+ * MLFQ_ADAPT_RATE_GATE_HIGH: under a wakeup storm the bands must not
+ * chase the latency error as far as in the normal regime.
+ *
+ * Overflow: the error is at most 15 ms and K is 128, so the product
+ * is at most ~1.9e9, inside u64; the division brings the target well
+ * below the clamp range before the clamp applies.
+ *
+ * Return: The slew target, FP_SHIFT fixed point, in
+ * [-MLFQ_ADAPT_MAX_SHIFT, +MLFQ_ADAPT_MAX_SHIFT].
+ */
+static __always_inline s64 mlfq_adapt_shift_target(u64 lat_ema, u64 rate_ema)
+{
+	s64 err = (s64)lat_ema - (s64)MLFQ_ADAPT_TARGET_LAT_NS;
+	u64 mag, scaled;
+	s64 target;
+
+	/*
+	 * BPF has no signed division, so the magnitude is scaled in u64
+	 * and the sign reapplied after the clamps. The error is at most
+	 * 15 ms and K is 128, so the product is ~1.9e9, inside u64.
+	 */
+	mag = err < 0 ? (u64)(-err) : (u64)err;
+	scaled = mag * MLFQ_ADAPT_K / MLFQ_ADAPT_TARGET_LAT_NS;
+	target = err < 0 ? -(s64)scaled : (s64)scaled;
+
+	if (target > (s64)MLFQ_ADAPT_MAX_SHIFT)
+		target = (s64)MLFQ_ADAPT_MAX_SHIFT;
+	if (target < -(s64)MLFQ_ADAPT_MAX_SHIFT)
+		target = -(s64)MLFQ_ADAPT_MAX_SHIFT;
+	if (rate_ema > MLFQ_ADAPT_RATE_GATE_HIGH &&
+	    target > (s64)MLFQ_ADAPT_RATE_GATE_SHIFT)
+		target = (s64)MLFQ_ADAPT_RATE_GATE_SHIFT;
+	return target;
+}
+
+/**
+ * mlfq_adapt_slew - Slew-limited shift update.
+ * @prev: The current shift, FP_SHIFT fixed point.
+ * @target: The gauge-derived shift target.
+ *
+ * The shift moves by at most MLFQ_ADAPT_MAX_STEP (10% of the base)
+ * per step. Together with the gauge's 1 s half-life this is a cascaded
+ * first-order limit. A single bad latency sample moves the bands at
+ * most one step, and a full regime flip converges over at least five
+ * steps. The difference is bounded by twice the shift range, so the
+ * arithmetic cannot overflow.
+ *
+ * Return: The updated shift.
+ */
+static __always_inline s64 mlfq_adapt_slew(s64 prev, s64 target)
+{
+	s64 step = target - prev;
+
+	if (step > (s64)MLFQ_ADAPT_MAX_STEP)
+		step = (s64)MLFQ_ADAPT_MAX_STEP;
+	if (step < -(s64)MLFQ_ADAPT_MAX_STEP)
+		step = -(s64)MLFQ_ADAPT_MAX_STEP;
+	return prev + step;
+}
+
+/**
+ * mlfq_adapt_band - Effective band edge from the base and the shift.
+ * @base: The base (rodata) band edge, nsecs.
+ * @shift_fp: The current shift, FP_SHIFT fixed point.
+ * @floor: The band's hard floor, nsecs.
+ * @ceil: The band's hard ceiling, nsecs.
+ *
+ * effective = clamp(base + base * shift / FP_ONE, floor, ceil). The
+ * clamps apply to the result, not the input, so a shift at either
+ * extreme can never push a band past its hard bound. With shift 0 the
+ * effective value is exactly the base, which is what keeps the
+ * disabled state (init copies the bases) identical to the fixed
+ * thresholds.
+ *
+ * Overflow: the largest base is below 6 ms and the shift range is
+ * +-128, so the product is at most ~7.7e8, inside s64.
+ *
+ * Return: The effective band edge, clamped to [@floor, @ceil].
+ */
+static __always_inline u64 mlfq_adapt_band(u64 base, s64 shift_fp,
+					   u64 floor, u64 ceil)
+{
+	s64 v = (s64)base;
+	u64 mag, scaled;
+
+	/*
+	 * BPF has no signed division, so the delta is scaled in u64
+	 * (the shift magnitude) and subtracted or added by sign. The
+	 * largest base is below 6 ms and the shift range is +-128, so
+	 * the product is at most ~7.7e8, inside s64.
+	 */
+	mag = shift_fp < 0 ? (u64)(-shift_fp) : (u64)shift_fp;
+	scaled = base * mag / FP_ONE;
+	if (shift_fp < 0)
+		v -= (s64)scaled;
+	else
+		v += (s64)scaled;
+
+	if (v < (s64)floor)
+		v = (s64)floor;
+	if (v > (s64)ceil)
+		v = (s64)ceil;
+	return (u64)v;
+}
+
+/**
+ * mlfq_adapt_guard - Effective same-queue preemption residency guard.
+ * @lat_ema: The wakeup-latency gauge, nsecs.
+ *
+ * guard = GUARD_MAX * (target - lat) / target for lat < target, 0
+ * otherwise. The fraction is at most 1 (lat >= 0), so the guard never
+ * exceeds MLFQ_ADAPT_GUARD_MAX_NS and needs no upper clamp. The guard
+ * is the throughput channel of the adaptation. Under latency pressure
+ * it stays at zero, keeping the interactive Q1->Q1 preemption
+ * unconditional (the fixed default), and under throughput pressure it
+ * rises to at most MLFQ_ADAPT_GUARD_MAX_NS. It is recomputed, never
+ * integrated, so it is bounded and hysteresis-free.
+ *
+ * Overflow: the product is at most 250 us * 1 ms = 2.5e11, inside u64.
+ *
+ * Return: The effective guard, in nsecs.
+ */
+static __always_inline u64 mlfq_adapt_guard(u64 lat_ema)
+{
+	u64 v;
+
+	if (lat_ema >= MLFQ_ADAPT_TARGET_LAT_NS)
+		return 0;
+	v = MLFQ_ADAPT_GUARD_MAX_NS *
+	    (MLFQ_ADAPT_TARGET_LAT_NS - lat_ema) / MLFQ_ADAPT_TARGET_LAT_NS;
+	return v;
+}
+
+/**
  * mlfq_queue_from_ema - Base queue mapping from the EMA gauge.
  * @ema: The gauge value.
  * @t_l: Interactive threshold (MLFQ_T_L_NS).
  * @t_h: CPU-bound threshold (MLFQ_T_H_NS).
  *
- * Base mapping: ema <= T_L -> Q1, ema >= T_H -> Q3, else Q2.
+ * The base mapping is ema <= T_L -> Q1, ema >= T_H -> Q3, else Q2.
  *
  * Return: 1, 2 or 3.
  */
@@ -1120,9 +1551,9 @@ static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
  * @t_h: CPU-bound threshold.
  * @short_sleep: A sleep at most this long counts toward wake_cnt.
  *
- * Hysteresis: Q2->Q1 when ema < T_L/2 and wake_cnt >= 2
- * consecutive short sleeps; Q3->Q2 when ema < T_H/2 and wake_cnt >= 2.
- * wake_cnt is reset on a long sleep; reenq_cnt is left for the caller to
+ * The hysteresis promotes Q2->Q1 when ema < T_L/2 and wake_cnt >= 2
+ * consecutive short sleeps, and Q3->Q2 when ema < T_H/2 and wake_cnt >= 2.
+ * wake_cnt is reset on a long sleep. reenq_cnt is left for the caller to
  * clear on the wakeup path.
  *
  * Return: true if the task was promoted.
@@ -1156,7 +1587,8 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
 /**
  * mlfq_demote_on_reenq - Slice-exhaustion demotion state machine.
  * @tctx: The task.
- * @t_h: CPU-bound threshold.
+ * @t_h: CPU-bound threshold (the effective EMA Q2/Q3 edge).
+ * @t_bound: Q2/Q3 tree band bound (the effective tree edge).
  * @pred: The tree's predicted next burst (0 while untrained).
  *
  * Called on run-out re-enqueues (ops.enqueue() with flags == 0, the
@@ -1170,7 +1602,7 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * untrained fallback. The gate is the plain EMA-gauge test while
  * untrained.
  *
- * Demotion requires a sustained run without sleeping: eight consecutive
+ * Demotion requires a sustained run without sleeping. Eight consecutive
  * exhaustions (about 8 ms at the interactive slice) must accumulate
  * while the task is CPU-bound. A task that sleeps between bursts is
  * re-boosted at its wakeup, which resets reenq_cnt, so a bursty
@@ -1181,14 +1613,15 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * Return: true if the task was demoted.
  */
 static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
-						 u64 t_h, u64 pred)
+						 u64 t_h, u64 t_bound,
+						 u64 pred)
 {
 	bool demoted = false;
 	bool cpu_bound;
 
 	tctx->reenq_cnt++;
 
-	cpu_bound = pred ? pred >= MLFQ_TREE_T_BOUND_NS : tctx->ema > t_h;
+	cpu_bound = pred ? pred >= t_bound : tctx->ema > t_h;
 
 	if ((tctx->queue == 1 || tctx->queue == 2) &&
 	    cpu_bound && tctx->reenq_cnt >= 8) {
@@ -1249,8 +1682,28 @@ static __always_inline bool mlfq_check_tree_node_index(u32 idx)
 
 static __always_inline bool mlfq_check_tree_feature(u8 feature)
 {
-	/* Only the five populated feat[] slots may be split on. */
+	/*
+	 * Only ids 0..4 may be split on: the fitter caps the split
+	 * feature range there, so a tree splitting on the populated
+	 * ids 5..6 (or on the zeroed id 7) is out of contract.
+	 */
 	return (feature & 0x7) < 5;
+}
+
+static __always_inline bool mlfq_check_bands(u64 t_l, u64 t_h,
+					     u64 t_int, u64 t_bnd)
+{
+	/*
+	 * The effective band edges must keep the queue semantics of the
+	 * fixed thresholds: each band sits within its hard floor/ceiling
+	 * and the two edges of each pair stay strictly ordered (T_L <
+	 * T_H, T_INT < T_BOUND), so no band can collapse to zero width.
+	 */
+	return t_l < t_h && t_int < t_bnd &&
+	       t_l >= MLFQ_ADAPT_T_L_FLOOR_NS && t_l <= MLFQ_ADAPT_T_L_CEIL_NS &&
+	       t_h >= MLFQ_ADAPT_T_H_FLOOR_NS && t_h <= MLFQ_ADAPT_T_H_CEIL_NS &&
+	       t_int >= MLFQ_ADAPT_T_INT_FLOOR_NS && t_int <= MLFQ_ADAPT_T_INT_CEIL_NS &&
+	       t_bnd >= MLFQ_ADAPT_T_BND_FLOOR_NS && t_bnd <= MLFQ_ADAPT_T_BND_CEIL_NS;
 }
 #endif /* MLFQ_CHECK */
 
@@ -1261,18 +1714,20 @@ static __always_inline bool mlfq_check_tree_feature(u8 feature)
  *
  * The descent is a compile-time bound of MLFQ_TREE_MAX_DEPTH steps.
  * Every index is masked to the node budget (MLFQ_TREE_MAX_NODES - 1),
- * so a corrupted tree can never address outside the buffer: an
+ * so a corrupted tree can never address outside the buffer. An
  * out-of-range feature id reads a zeroed feat[] slot, and a walk past
  * the tree tail lands on a zeroed node, which is a leaf predicting 0.
  * A leaf is a node with right == 0 and carries its prediction in left.
- * A tree deeper than the bound is cut: the walk returns the last
- * reachable node's left, and only when that node is a leaf -- a
+ * A tree deeper than the bound is cut. The walk returns the last
+ * reachable node's left, and only when that node is a leaf. A
  * deeper-than-the-bound internal node returns 0 instead of leaking a
  * child index as a prediction.
  *
- * The feat[] array lays out the five feature slots in order followed by
- * three zero slots, so a split feature id above 4 reads zero and routes
- * to the left of any non-zero threshold.
+ * The feat[] array lays out the seven feature slots in order followed
+ * by one zero slot, so a split feature id above 6 reads zero and routes
+ * to the left of any non-zero threshold. Only ids 0..4 are split on by
+ * any published tree (the fitter and the validator cap the split
+ * feature range), so ids 5..6 are populated but inert.
  *
  * Return: The predicted burst in nsecs.
  */
@@ -1281,7 +1736,8 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 	       const struct mlfq_tree_feats *f)
 {
 	u64 feat[8] = { f->prev_burst_ns, f->sleep_ns, f->ema,
-			f->io_wait, f->wake_cnt, 0, 0, 0 };
+			f->io_wait, f->wake_cnt, f->wake_lat_us,
+			f->queue_wait_us, 0 };
 	u32 idx = 0, nidx;
 	const struct mlfq_tree_node *n;
 	u8 feature;
@@ -1306,7 +1762,7 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 	}
 
 	/*
-	 * Depth exhausted: the last reachable node is returned as a leaf
+	 * When the depth is exhausted, the last reachable node is returned as a leaf
 	 * only when it really is one. An internal node here means the
 	 * tree is deeper than the walk bound; returning its left would
 	 * leak a child index as a prediction, so a non-leaf yields 0.
@@ -1324,23 +1780,26 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
  * mlfq_tree_map_queue - Promotion-only queue mapping of a prediction.
  * @pred: The predicted next burst, 0 while untrained.
  * @cur: The task's current queue (1..3).
+ * @t_int: The tree Q1/Q2 band edge (the effective value).
+ * @t_bound: The tree Q2/Q3 band edge (the effective value).
  *
  * The wakeup path is promotion-only: a Q1-band prediction raises the
  * queue to 1, a Q2-band prediction raises a Q3 task to 2, and a
  * Q3-band or untrained prediction leaves the queue unchanged. Demotions
  * are the run-out gate's job (mlfq_demote_on_reenq), so a single wakeup
  * prediction can never demote a task and bypass the exhaustion
- * hysteresis -- the classic MLFQ asymmetry where the wakeup only
+ * hysteresis, the classic MLFQ asymmetry where the wakeup only
  * promotes and the run-out only demotes.
  *
  * Return: The new queue.
  */
-static __always_inline u8 mlfq_tree_map_queue(u64 pred, u8 cur)
+static __always_inline u8 mlfq_tree_map_queue(u64 pred, u8 cur,
+					      u64 t_int, u64 t_bound)
 {
 	/* 0 is the untrained sentinel: it never moves the queue. */
-	if (pred && pred < MLFQ_TREE_T_INT_NS)
+	if (pred && pred < t_int)
 		return 1;
-	if (pred && pred < MLFQ_TREE_T_BOUND_NS && cur > 2)
+	if (pred && pred < t_bound && cur > 2)
 		return 2;
 	return cur;
 }
@@ -1349,7 +1808,7 @@ static __always_inline u8 mlfq_tree_map_queue(u64 pred, u8 cur)
 /*
  * The published tree as a two-entry array map, defined in main.bpf.c.
  * The type and the extern are declared here so the BPF wrapper can look
- * up the active entry; both are skipped outside the BPF build, where
+ * up the active entry. Both are skipped outside the BPF build, where
  * the native harness has no map machinery.
  */
 struct mlfq_tree_map {
@@ -1364,7 +1823,7 @@ extern struct mlfq_tree_map mlfq_tree_map;
 /*
  * The per-CPU realtime-occupancy state as a BPF array map, defined in
  * main.bpf.c. The type and the extern are declared here so the BPF
- * modules can look up the state; both are skipped outside the BPF
+ * modules can look up the state. Both are skipped outside the BPF
  * build, where the native harness has no map machinery.
  */
 struct mlfq_rtdl_state_map {
@@ -1379,7 +1838,7 @@ extern struct mlfq_rtdl_state_map rtdl_state_stor;
 /*
  * The op-latency histogram as a per-CPU array map, defined in
  * main.bpf.c. The type, the extern and the charge helper are declared
- * here so the modules can charge their callbacks; all of it is skipped
+ * here so the modules can charge their callbacks. All of it is skipped
  * outside the BPF build, where the native harness has no map machinery.
  */
 struct mlfq_op_lat_map {
@@ -1390,6 +1849,23 @@ struct mlfq_op_lat_map {
 };
 
 extern struct mlfq_op_lat_map mlfq_op_lat;
+
+/*
+ * The per-CPU wakeup-arrival counters as a one-entry per-CPU array map,
+ * defined in main.bpf.c. The type and the extern are declared here so
+ * the enqueue module can bump the counters. Each CPU owns its own
+ * slot, so the wakeup path needs no locked operation on a shared line,
+ * and the fold (mlfq_adapt_step) iterates the slots with
+ * bpf_map_lookup_percpu_elem.
+ */
+struct mlfq_wakeup_stats_map {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct mlfq_wakeup_counters);
+};
+
+extern struct mlfq_wakeup_stats_map mlfq_wakeup_stats;
 
 /**
  * mlfq_op_lat_bucket - Histogram bucket covering an elapsed time.
@@ -1425,7 +1901,7 @@ static __always_inline u32 mlfq_op_lat_bucket(u64 delta_us)
  * @start_ns: scx_bpf_now() captured at the op entry.
  *
  * Computes the elapsed time and increments the covering bucket of the
- * per-CPU histogram; a failed map lookup is a no-op. The per-CPU
+ * per-CPU histogram. A failed map lookup is a no-op. The per-CPU
  * counters never contend, and the Rust front-end sums the CPUs for the
  * stats output.
  */
@@ -1456,7 +1932,7 @@ static __always_inline void mlfq_op_lat_charge(u32 op, u64 start_ns)
  * written one (the daemon writes the inactive entry first and commits
  * the meta last).
  *
- * Return: The predicted burst in nsecs; 0 while untrained or on a
+ * Return: The predicted burst in nsecs. 0 while untrained or on a
  * failed map lookup.
  */
 static __always_inline u64 mlfq_tree_predict(const struct mlfq_tree_feats *f)
@@ -1482,7 +1958,7 @@ static __always_inline u64 mlfq_tree_predict(const struct mlfq_tree_feats *f)
  * The per-LLC and per-queue runnable gauges, defined in the main.bpf.c
  * bss block before mlfq_stats. The externs are declared here, outside
  * the BPF-only guard above, so the accounting helpers below can
- * reference them in every build: the BPF build links them against the
+ * reference them in every build. The BPF build links them against the
  * bss block, and the native harness supplies its own shadow storage.
  */
 extern volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
@@ -1530,13 +2006,13 @@ static __always_inline void mlfq_queue_add(u32 qid, s64 delta)
  * mlfq_runnable_enter - Count a task's LLC/queue ownership at an insert.
  * @tctx: The task being placed.
  * @qid: The queue it is placed into (1..3).
- * @llc: The LLC owning the target CPU (mlfq_llc_of_cpu(); the sentinel
+ * @llc: The LLC owning the target CPU (mlfq_llc_of_cpu(). The sentinel
  *	is a no-op).
  *
  * Called once per DSQ insert, after the queue and the owning CPU are
  * final. A task with no recorded ownership starts a runnable episode
  * (wakeup, fork, class-switch-in) and is counted once at the destination
- * LLC and queue; a task already counted is a continuation (run-out,
+ * LLC and queue. A task already counted is a continuation (run-out,
  * preemption, REENQ, a dispatch move) and the call only moves its LLC
  * and/or queue ownership when either changed, leaving the total count
  * unchanged. The mlfq_llc_of_cpu() sentinel makes the whole call a no-op
@@ -1580,7 +2056,7 @@ static __always_inline void mlfq_runnable_enter(struct task_ctx *tctx,
  * mlfq_runnable_exit - Release a task's LLC/queue ownership.
  * @tctx: The task leaving the runnable set (or leaving LLC ownership).
  *
- * The single release primitive: a task that was counted is removed from
+ * The single release primitive. A task that was counted is removed from
  * the per-LLC and per-queue gauges and its ownership record returns to
  * the unowned state. A task with no recorded ownership (never counted,
  * or already released) is a no-op, which makes the call idempotent
@@ -1599,7 +2075,7 @@ static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
 /**
  * mlfq_steer_pick_llc - Least-loaded eligible LLC selection.
  * @runnable: Per-LLC runnable gauge (advisory, stale-tolerant).
- * @idle: Per-LLC idle-CPU gate; a zero entry excludes the domain.
+ * @idle: Per-LLC idle-CPU gate. A zero entry excludes the domain.
  * @nr_llcs: Number of populated LLC domains; domains at or above it are
  *	excluded (defense in depth on top of the idle gate, which already
  *	keeps the unpopulated-domain gauges at zero).
@@ -1616,8 +2092,8 @@ static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
  * bitmap walks (the expensive part) stay bounded.
  *
  * The step is advisory: a stale runnable count costs one suboptimal
- * (still idle) placement in a race window, never a correctness issue --
- * the same trust model as the idle-count saturation fast path. The
+ * (still idle) placement in a race window, never a correctness issue.
+ * This is the same trust model as the idle-count saturation fast path. The
  * empty state (nr_llcs == 0, or every idle gauge zero) yields the
  * sentinel and the step dies; placement then proceeds unchanged.
  *

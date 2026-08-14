@@ -12,8 +12,8 @@
 //! tree that predicts the next CPU burst from per-task features (see
 //! mlfq_tree.rs), with the EMA interactivity gauge as a tree feature and the
 //! fallback before the first model. The wakeup path is promotion-only,
-//! through the tree, the short-sleep and I/O boost and the band hysteresis;
-//! demotion flows through the run-out gate. See README.md for the design
+//! through the tree, the short-sleep and I/O boost and the band hysteresis.
+//! Demotion flows through the run-out gate. See README.md for the design
 //! overview.
 
 mod bpf_skel;
@@ -64,6 +64,9 @@ use mlfq_tree::TreeSample;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mlfq";
+
+/* Time units from src/bpf/intf.h, used for the gauge unit conversions. */
+const NSEC_PER_USEC: u64 = crate::bpf_intf::mlfq_consts_NSEC_PER_USEC as u64;
 
 /* MLFQ tree daemon tuning, from src/bpf/intf.h. */
 const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NODES as usize;
@@ -198,7 +201,7 @@ struct ModelMeta {
     corr: f64,
 }
 
-/// Scheduler facade: owns the loaded skeleton, the struct_ops link, the
+/// The Scheduler facade owns the loaded skeleton, the struct_ops link, the
 /// stats server and the MLFQ tree daemon state; drives the run loop
 /// until shutdown or UEI exit.
 struct Scheduler<'a> {
@@ -314,9 +317,9 @@ impl<'a> Scheduler<'a> {
 
         /*
          * The sched_switch hook tracks realtime-class occupancy and
-         * attempts the takeover drain. It is needed on every kernel --
-         * the occupancy flag drives placement even where the drain
-         * cannot run -- so the optional tracepoint program is
+         * attempts the takeover drain. It is needed on every kernel.
+         * The occupancy flag drives placement even where the drain
+         * cannot run, so the optional tracepoint program is
          * force-enabled here; the evacuation branches inside are
          * ksym-gated and self-prune on kernels without the reenqueue
          * kfuncs. The flip side of forcing it is that a kernel which
@@ -425,8 +428,10 @@ impl<'a> Scheduler<'a> {
          * bounded channel the run loop drains. try_send drops the sample
          * when the channel is full, which the ring-buffer backpressure
          * absorbs first. TreeSample is a repr(C) POD mirroring the
-         * 48-byte BPF record, so the parse is a plain byte
-         * reinterpretation.
+         * 68-byte BPF record, so the parse is a plain byte
+         * reinterpretation. The record's version tag is checked before
+         * the record is admitted, so a record from a foreign producer or
+         * a mismatched build is dropped instead of misread.
          */
         let (sample_tx, sample_rx) = crossbeam::channel::bounded(4096);
         let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
@@ -434,11 +439,14 @@ impl<'a> Scheduler<'a> {
             if data.len() < size_of::<TreeSample>() {
                 return 0;
             }
-            // SAFETY: TreeSample is a repr(C) mirror of the 48-byte
+            // SAFETY: TreeSample is a repr(C) mirror of the 68-byte
             // mlfq_tree_sample the stopping path submits; reading the
             // record as the struct is a plain byte reinterpretation of
             // integer fields.
             let s = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<TreeSample>()) };
+            if !mlfq_tree::sample_version_matches(&s) {
+                return 0;
+            }
             let _ = sample_tx.try_send(s);
             0
         })?;
@@ -485,6 +493,8 @@ impl<'a> Scheduler<'a> {
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
         let s = &bss_data.mlfq_stats;
+        let g = &bss_data.mlfq_sys_gauge;
+        let a = &bss_data.mlfq_adapt_state;
         Metrics {
             on_cpu: s.on_cpu,
             total_runtime: s.total_runtime,
@@ -526,12 +536,23 @@ impl<'a> Scheduler<'a> {
             tree_model_samples: self.model.nr_samples as u64,
             tree_mae_tree_us: self.model.mae_tree_us,
             tree_mae_ema_us: self.model.mae_ema_us,
+            tree_corr_milli: (self.model.corr * 1000.0).round() as i64,
+            sys_lat_ema_us: g.lat_ema / NSEC_PER_USEC,
+            sys_rate_ema: g.rate_ema,
+            t_l_eff_us: a.t_l_eff_ns / NSEC_PER_USEC,
+            t_h_eff_us: a.t_h_eff_ns / NSEC_PER_USEC,
+            t_int_eff_us: a.t_int_eff_ns / NSEC_PER_USEC,
+            t_bnd_eff_us: a.t_bnd_eff_ns / NSEC_PER_USEC,
+            guard_eff_us: a.guard_eff_ns / NSEC_PER_USEC,
+            adapt_shift: a.shift_fp,
+            wakeup_total: self.read_wakeup_total(),
+            adapt_steps: u64::from(g.adapt_steps),
         }
     }
 
-    /// Web-metrics snapshot: the raw scheduler counters plus the per-CPU
+    /// Web-metrics snapshot. The raw scheduler counters plus the per-CPU
     /// state and the runnable gauges, pushed to the web UI every run-loop
-    /// iteration. Gauges only - no interval deltas.
+    /// iteration. Gauges only, no interval deltas.
     fn get_web_metrics(&self) -> stats::WebMetrics {
         let bss_data = self
             .skel
@@ -667,7 +688,7 @@ impl<'a> Scheduler<'a> {
 
     /// Sum the per-CPU op-latency histogram into a flat per-op vector
     /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major). The
-    /// map is per-CPU so the BPF charges never contend; a failed lookup
+    /// map is per-CPU so the BPF charges never contend. A failed lookup
     /// or an unexpected value size yields zeros for that entry.
     fn read_op_lat(&self) -> Vec<u64> {
         let nr_ops = crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize;
@@ -692,6 +713,32 @@ impl<'a> Scheduler<'a> {
             }
         }
         out
+    }
+
+    /// Sum the per-CPU lifetime wakeup totals from the mlfq_wakeup_stats
+    /// map. Each CPU's total is bumped atomically on the wakeup path, so
+    /// this read is tear-free, and the u64 slots cannot wrap. A failed
+    /// lookup yields zero. The observation-only contract holds, so the
+    /// totals grow even while the adaptation is disabled.
+    fn read_wakeup_total(&self) -> u64 {
+        let cpu_values = self
+            .skel
+            .maps
+            .mlfq_wakeup_stats
+            .lookup_percpu(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        cpu_values
+            .iter()
+            .map(|chunk| {
+                u64::from_ne_bytes(
+                    chunk[0..8]
+                        .try_into()
+                        .expect("the total field is the first 8 bytes"),
+                )
+            })
+            .fold(0u64, u64::wrapping_add)
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
@@ -738,7 +785,7 @@ impl<'a> Scheduler<'a> {
 
         let m = self.get_metrics();
         log::info!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} steals_same_llc={} steals_cross_llc={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={}",
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} steals_same_llc={} steals_cross_llc={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={} wakeups={} adapt_steps={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
             m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
@@ -751,18 +798,17 @@ impl<'a> Scheduler<'a> {
             m.tree_mae_tree_us, m.tree_mae_ema_us, self.model.corr,
             m.tree_inference, m.tree_fallback, m.tree_disagree,
             m.tree_samples_emitted, m.tree_samples_dropped,
-            m.tree_samples_cap_dropped
+            m.tree_samples_cap_dropped, m.wakeup_total, m.adapt_steps
         );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
 
     /// Fold one emitted sample into the sliding training window and
-    /// kick a retrain on the cadence: on the first window that reaches
+    /// kick a retrain on the cadence. On the first window that reaches
     /// the minimum training size, then every MLFQ_TREE_RETRAIN_INTERVAL.
     ///
-    /// The window admits at most MLFQ_TREE_PER_PID_CAP samples per pid. A pid that already holds its share is dropped here and
-    /// counted in tree_samples_cap_dropped. The cap check runs before
+    /// The window admits at most MLFQ_TREE_PER_PID_CAP samples per pid. A pid that already holds its share is dropped here and counted in tree_samples_cap_dropped. The cap check runs before
     /// the window accounting, so a rejected sample never disturbs the
     /// per-pid counts, and the eviction bookkeeping below decrements the
     /// pid of the sample the window actually pops.
@@ -896,7 +942,7 @@ impl<'a> Scheduler<'a> {
     /// publish moves up to 2048 nodes, so two consecutive publishes
     /// cannot complete inside one walk. The consequence of the
     /// theoretical race is one mispredicted burst, which the queue-band
-    /// nets absorb; the walk masks every index to the buffer bound, so
+    /// nets absorb. The walk masks every index to the buffer bound, so
     /// it is never a memory-safety issue.
     fn publish_tree(&mut self, tree: &mlfq_tree::SerializedTree, gen: u64) -> Result<()> {
         let old_meta = {
@@ -946,7 +992,7 @@ impl Drop for Scheduler<'_> {
         /*
          * Dropping pm_qos_fd closes the /dev/cpu_dma_latency fd, which
          * makes the kernel drop the PM QoS request and restore the
-         * previous idle-latency constraint; the field drop below does
+         * previous idle-latency constraint. The field drop below does
          * this on every exit path.
          */
         /*
@@ -1001,8 +1047,7 @@ fn split_holdout(samples: &[TreeSample]) -> Result<(&[TreeSample], &[TreeSample]
     }
 }
 
-/// Admit one sample of `pid` into the window under the per-pid cap. Returns true when the sample is admitted and the pid's
-/// count is incremented, false when the pid already holds its
+/// Admit one sample of `pid` into the window under the per-pid cap. Returns true when the sample is admitted and the pid's count is incremented, false when the pid already holds its
 /// MLFQ_TREE_PER_PID_CAP share and the caller must drop the sample.
 /// Entries are pruned on eviction, not here: a pid at the cap keeps its
 /// entry until the window ages its samples out.
@@ -1040,7 +1085,7 @@ fn tree_distinct_pids(samples: &[TreeSample]) -> usize {
 ///
 /// The tree is fit on the first 90% of the window and evaluated on the
 /// last 10%, so the reported MAE and the publish gate describe
-/// out-of-sample error. The EMA baseline is exact: each sample's
+/// out-of-sample error. The EMA baseline is exact. Each sample's
 /// prediction is the captured gauge `feats.ema` (the post-decay gauge at
 /// the capture, as emitted by the BPF side), so
 /// `mae_ema = mean(|feats.ema - label|)` on the same holdout slice and
@@ -1064,7 +1109,11 @@ fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
     let actuals: Vec<u64> = holdout.iter().map(|s| s.label_ns).collect();
     let preds: Vec<u64> = holdout
         .iter()
-        .map(|s| mlfq_tree::predict(&tree, &s.feats))
+        .map(|s| {
+            /* The packed sample is copied out before the walk takes a reference. */
+            let feats = s.feats;
+            mlfq_tree::predict(&tree, &feats)
+        })
         .collect();
     let mae_tree = mlfq_tree::mae(&preds, &actuals);
     let mae_ema = holdout
@@ -1087,7 +1136,7 @@ fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
 
 /// Spawn the training worker and return its job and result channels.
 ///
-/// The worker owns no scheduler state: it receives a snapshot of the
+/// The worker owns no scheduler state. It receives a snapshot of the
 /// window (the window is only mutated by the ingest on the main thread,
 /// so handing over a snapshot cannot race with the ingest), fits the tree
 /// and computes the holdout metrics, and sends the result back. The
@@ -1149,7 +1198,7 @@ fn main() -> Result<()> {
             simplelog::ColorChoice::Auto,
         )?;
 
-        // The SMT annotation is appended when the host exposes it; an
+        // The SMT annotation is appended when the host exposes it. An
         // unreadable knob omits the suffix rather than guessing.
         let smt_suffix = match topology::smt_enabled() {
             Some(true) => " SMT on",
@@ -1219,7 +1268,7 @@ mod math_test {
         if let Ok(cc) = std::env::var("CC") {
             return cc;
         }
-        // CI ships clang-19; prefer it, then fall back to the system compiler.
+        // CI ships clang-19. Prefer it, then fall back to the system compiler.
         for cand in ["clang", "cc", "gcc"] {
             if Command::new(cand).arg("--version").status().is_ok() {
                 return cand.to_string();
@@ -1270,6 +1319,7 @@ mod math_test {
     fn mk_sample(pid: u32, label_ns: u64) -> crate::mlfq_tree::TreeSample {
         crate::mlfq_tree::TreeSample {
             pid,
+            version: crate::mlfq_tree::MLFQ_TREE_SAMPLE_VERSION,
             queue: 1,
             feats: crate::mlfq_tree::TreeFeats::default(),
             label_ns,
@@ -1284,8 +1334,10 @@ mod math_test {
         let (train, holdout) = crate::split_holdout(&samples).unwrap();
         assert_eq!(train.len(), 90);
         assert_eq!(holdout.len(), 10);
-        assert_eq!(train[0].label_ns, 0);
-        assert_eq!(holdout[0].label_ns, 90);
+        let first_train = train[0].label_ns;
+        let first_holdout = holdout[0].label_ns;
+        assert_eq!(first_train, 0);
+        assert_eq!(first_holdout, 90);
 
         // The 20-sample minimum splits 18 + 2.
         let (train, holdout) = crate::split_holdout(&samples[..20]).unwrap();

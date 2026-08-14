@@ -419,10 +419,10 @@ static void test_demote_hysteresis(void)
 {
 	struct task_ctx t = { .queue = 1, .ema = 500000 };
 
-	mlfq_demote_on_reenq(&t, 2000000, 0);
+	mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
 	TEST_OK(t.reenq_cnt == 1 && t.queue == 1,
 		"untrained: single run-out with ema > T_L does not demote Q1->Q2");
-	mlfq_demote_on_reenq(&t, 2000000, 0);
+	mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
 	TEST_OK(t.reenq_cnt == 2 && t.queue == 1,
 		"untrained: two run-outs with ema below T_H do not demote Q1->Q2");
 
@@ -430,10 +430,10 @@ static void test_demote_hysteresis(void)
 	t.ema = 3000000;	/* > T_H */
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000, 0);
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
 		"untrained: seven run-outs with ema > T_H do not demote Q1->Q2");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, 0) &&
+	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0) &&
 		t.queue == 2 && t.reenq_cnt == 0,
 		"untrained: eight run-outs demote Q1->Q2 and reset reenq_cnt");
 
@@ -441,10 +441,10 @@ static void test_demote_hysteresis(void)
 	t.ema = 3000000;	/* > T_H */
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000, 0);
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 2,
 		"untrained: seven run-outs with ema > T_H do not demote Q2->Q3");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, 0) &&
+	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0) &&
 		t.queue == 3 && t.reenq_cnt == 0,
 		"untrained: eight run-outs demote Q2->Q3 and reset reenq_cnt");
 
@@ -457,7 +457,8 @@ static void test_demote_hysteresis(void)
 	t.ema = 3000000;	/* > T_H, but pred is the gate now */
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 8; i++)
-		mlfq_demote_on_reenq(&t, 2000000, 1000000);	/* < T_BOUND */
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
+				     1000000);	/* < T_BOUND */
 	TEST_OK(t.queue == 1 && t.reenq_cnt == 8,
 		"trained: a sub-band prediction never demotes, even with ema > T_H");
 
@@ -465,10 +466,12 @@ static void test_demote_hysteresis(void)
 	t.ema = 0;		/* gauge idle, pred is the gate now */
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS);
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
+				     MLFQ_TREE_T_BOUND_NS);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
 		"trained: seven Q3-bound predictions do not demote Q1->Q2");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS) &&
+	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
+				     MLFQ_TREE_T_BOUND_NS) &&
 		t.queue == 2 && t.reenq_cnt == 0,
 		"trained: eight Q3-bound predictions demote Q1->Q2");
 
@@ -477,7 +480,8 @@ static void test_demote_hysteresis(void)
 	t.ema = 3000000;
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 8; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS);
+		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
+				     MLFQ_TREE_T_BOUND_NS);
 	TEST_OK(t.queue == 3,
 		"trained: Q3 is never demoted by the exhaustion gate");
 }
@@ -613,7 +617,7 @@ static void test_boost_eligible(void)
 		"sleep exactly at the window is eligible");
 }
 
-/* --- MLFQ regression tree -------------------------------------------- */
+/* MLFQ regression tree tests. */
 
 static void tree_store_reset(struct mlfq_tree_store *store)
 {
@@ -635,17 +639,27 @@ static void tree_node(struct mlfq_tree_store *store, u32 idx, u8 feature,
 
 static void test_mlfq_tree_layout(void)
 {
-	TEST_OK(sizeof(struct mlfq_tree_feats) == 32,
-		"tree feats is 32 bytes");
+	TEST_OK(sizeof(struct mlfq_tree_feats) == 48,
+		"tree feats is 48 bytes");
 	TEST_OK(sizeof(struct mlfq_tree_node) == 24,
 		"tree node is 24 bytes");
-	TEST_OK(sizeof(struct mlfq_tree_sample) == 48,
-		"tree sample is 48 bytes");
+	TEST_OK(sizeof(struct mlfq_tree_sample) == 68,
+		"tree sample is 68 bytes");
 	TEST_OK(offsetof(struct mlfq_tree_sample, pid) == 0 &&
 		offsetof(struct mlfq_tree_sample, queue) == 4 &&
 		offsetof(struct mlfq_tree_sample, feats) == 8 &&
-		offsetof(struct mlfq_tree_sample, label_ns) == 40,
-		"tree sample offsets match the shared ABI");
+		offsetof(struct mlfq_tree_sample, label_ns) == 56 &&
+		offsetof(struct mlfq_tree_sample, version) == 64,
+		"tree sample offsets match the shared ABI, version at 64");
+	TEST_OK(offsetof(struct mlfq_tree_feats, prev_burst_ns) == 0 &&
+		offsetof(struct mlfq_tree_feats, sleep_ns) == 8 &&
+		offsetof(struct mlfq_tree_feats, ema) == 16 &&
+		offsetof(struct mlfq_tree_feats, io_wait) == 24 &&
+		offsetof(struct mlfq_tree_feats, wake_cnt) == 28 &&
+		offsetof(struct mlfq_tree_feats, wake_lat_us) == 32 &&
+		offsetof(struct mlfq_tree_feats, queue_wait_us) == 36 &&
+		offsetof(struct mlfq_tree_feats, sq_ema) == 40,
+		"tree feats offsets match the shared ABI, service fields appended");
 	TEST_OK(offsetof(struct mlfq_tree_node, threshold) == 0 &&
 		offsetof(struct mlfq_tree_node, left) == 8 &&
 		offsetof(struct mlfq_tree_node, right) == 12 &&
@@ -655,8 +669,17 @@ static void test_mlfq_tree_layout(void)
 	TEST_OK(sizeof(struct mlfq_tree_store) ==
 		MLFQ_TREE_MAX_NODES * sizeof(struct mlfq_tree_node),
 		"tree store is one 2048-node buffer (the map value type)");
-	TEST_OK(sizeof(struct task_ctx) == 144,
-		"task_ctx grows to 144 bytes with the per-task limiter and the pending queue snapshot");
+	TEST_OK(sizeof(struct task_ctx) == 184,
+		"task_ctx grows to 184 bytes with the enqueue-to-run measurement block and the grown feature vector");
+	TEST_OK(offsetof(struct task_ctx, enq_at) == 80 &&
+		offsetof(struct task_ctx, last_wake_lat_ns) == 88 &&
+		offsetof(struct task_ctx, last_q_wait_ns) == 92 &&
+		offsetof(struct task_ctx, sq_ema) == 96,
+		"task_ctx measurement block sits at 80/88/92/96 after the pad bytes");
+	TEST_OK(offsetof(struct task_ctx, pending_feats) == 120 &&
+		offsetof(struct task_ctx, pending_queue) == 168 &&
+		offsetof(struct task_ctx, pending_valid) == 176,
+		"task_ctx tree-sample block follows the measurement block");
 	TEST_OK(sizeof(struct mlfq_tree_ctrl) == 64 &&
 		offsetof(struct mlfq_tree_ctrl, meta) == 0 &&
 		offsetof(struct mlfq_tree_ctrl, sample_last_at) == 8,
@@ -664,10 +687,16 @@ static void test_mlfq_tree_layout(void)
 	TEST_OK(sizeof(struct mlfq_stats) % 64 == 0 &&
 		sizeof(struct mlfq_stats) == 256,
 		"mlfq_stats is padded to a 64-byte multiple (256 bytes)");
+	TEST_OK(sizeof(struct mlfq_sys_gauge) == 40 &&
+		sizeof(struct mlfq_adapt_state) == 48 &&
+		sizeof(struct mlfq_wakeup_counters) == 16,
+		"the sys gauge is 40 bytes, the adapt state 48 and the per-CPU wakeup counters 16");
 	TEST_OK(MLFQ_TREE_PER_TASK_LIMIT_NS == 10ULL * NSEC_PER_MSEC,
 		"per-task sample limit is 10ms");
 	TEST_OK(MLFQ_TREE_LABEL_MAX_NS == MLFQ_TREE_T_BOUND_NS * 64,
 		"label clamp is 64x the Q2/Q3 split bound (192ms)");
+	TEST_OK(MLFQ_TREE_SAMPLE_VERSION == 2,
+		"tree sample version tag is 2");
 }
 
 static void test_tree_meta_layout(void)
@@ -743,7 +772,7 @@ static void test_tree_predict_walk(void)
 	/*
 	 * Deeper than the bound: the walk is cut and the last reachable
 	 * node is returned as a leaf only when it really is one. The node
-	 * at depth 12 here is internal, so the prediction is 0 -- a child
+	 * at depth 12 here is internal, so the prediction is 0. A child
 	 * index must never leak out as a burst.
 	 */
 	tree_store_reset(&store);
@@ -848,30 +877,53 @@ static void test_tree_map_queue(void)
 
 	/* pred < T_INT raises to Q1 regardless of the current queue. */
 	for (q = 1; q <= MLFQ_NR_QUEUES; q++)
-		TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS - 1, q) == 1,
+		TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS - 1, q,
+					    MLFQ_TREE_T_INT_NS,
+					    MLFQ_TREE_T_BOUND_NS) == 1,
 			"Q1-band prediction raises queue %u to 1", q);
 
 	/* pred in [T_INT, T_BOUND): Q3 -> Q2, Q1/Q2 stay. */
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 1) == 1 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 1) == 1,
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 1,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 1 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 1,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 1,
 		"Q2-band prediction leaves Q1 alone");
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 2) == 2 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 2) == 2,
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 2,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 2 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 2,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 2,
 		"Q2-band prediction leaves Q2 alone");
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 3) == 2 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 3) == 2,
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 3,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 2 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 3,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 2,
 		"Q2-band prediction raises Q3 to Q2");
 
-	/* pred >= T_BOUND leaves the queue unchanged: no wakeup demotion. */
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 1) == 1 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 2) == 2 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 3) == 3,
+	/* pred >= T_BOUND leaves the queue unchanged. No wakeup demotion. */
+	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 1,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 1 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 2,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 2 &&
+		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 3,
+				    MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 3,
 		"Q3-band prediction never changes the queue");
 
 	/* Untrained (pred 0) leaves the queue unchanged. */
-	TEST_OK(mlfq_tree_map_queue(0, 1) == 1 &&
-		mlfq_tree_map_queue(0, 2) == 2 &&
-		mlfq_tree_map_queue(0, 3) == 3,
+	TEST_OK(mlfq_tree_map_queue(0, 1, MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 1 &&
+		mlfq_tree_map_queue(0, 2, MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 2 &&
+		mlfq_tree_map_queue(0, 3, MLFQ_TREE_T_INT_NS,
+				    MLFQ_TREE_T_BOUND_NS) == 3,
 		"untrained prediction never changes the queue");
 }
 
@@ -891,7 +943,7 @@ static void test_mlfq_check_tree_predicates(void)
 		"the feature id masks to 0..7 before the bound check");
 }
 
-/* --- Runnable accounting contract -------------------------------------- */
+/* Runnable accounting contract. */
 
 static void rn_state_reset(void)
 {
@@ -922,7 +974,7 @@ static u32 rn_queue_sum(void)
 }
 
 /*
- * Fresh enter: an unowned task (wakeup, fork, class-switch-in) is
+ * Fresh enter. An unowned task (wakeup, fork, class-switch-in) is
  * counted once at the destination LLC and queue, and the ownership
  * record is set. A second task on the same LLC counts independently.
  */
@@ -944,7 +996,7 @@ static void test_runnable_enter_fresh(void)
 }
 
 /*
- * Continuation enters: the task is already counted, so the call only
+ * Continuation enters. The task is already counted, so the call only
  * moves its ownership. The table drives one task through the moves and
  * checks the gauge deltas and the invariant that the total counted
  * stays 1: only a changed LLC or queue moves a unit between indexes.
@@ -991,8 +1043,8 @@ static void test_runnable_enter_continuation_table(void)
 }
 
 /*
- * A same-LLC, same-queue continuation is the common run-out re-enqueue:
- * a strict no-op on both gauges and on the ownership record.
+ * A same-LLC, same-queue continuation is the common run-out re-enqueue.
+ * It is a strict no-op on both gauges and on the ownership record.
  */
 static void test_runnable_continuation_noop(void)
 {
@@ -1072,7 +1124,7 @@ static void test_runnable_global_park_cycle(void)
 /*
  * The sentinel-LLC no-op: when the caller has no valid domain (LLC
  * awareness disabled, nr_llcs == 0, the mlfq_llc_of_cpu() sentinel),
- * the whole call is a no-op -- no gauge moves and no ownership record
+ * the whole call is a no-op. No gauge moves and no ownership record
  * is written, so an unpopulated machine stays exactly at current
  * behavior.
  */
@@ -1086,14 +1138,14 @@ static void test_runnable_sentinel_llc_noop(void)
 		t.last_llc == MLFQ_LLC_UNOWNED && t.last_qid == 0,
 		"sentinel LLC is a no-op on gauges and ownership");
 
-	/* The guard is per-call, not sticky: a valid domain still works. */
+	/* The guard is per-call, not sticky. A valid domain still works. */
 	mlfq_runnable_enter(&t, 1, 0);
 	TEST_OK(mlfq_llc_runnable[0] == 1 && t.last_llc == 0,
 		"a valid domain after a sentinel call counts normally");
 }
 
 /*
- * The queue-index guard is defense in depth: an out-of-range queue id
+ * The queue-index guard is defense in depth. An out-of-range queue id
  * never moves the queue gauge (the LLC gauge still counts the episode;
  * callers always pass 1..3).
  */
@@ -1131,7 +1183,7 @@ static void test_runnable_layout(void)
 
 /*
  * The steering selection (mlfq_steer_pick_llc), driven table-style
- * over the pure min-selection pass: empty, single, waker-excluded,
+ * over the pure min-selection pass. Empty, single, waker-excluded,
  * least-loaded, tie-break, all-idle-zero, and the nr_llcs bound on the
  * candidate set.
  */
@@ -1153,7 +1205,7 @@ static void test_steer_pick_llc(void)
 	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 2, 1, 0) == 0,
 		"steer: a single eligible domain is chosen");
 
-	/* Waker-excluded: only the waker's own domain is idle-populated. */
+	/* Waker-excluded. Only the waker's own domain is idle-populated. */
 	idle[0] = 0;
 	idle[1] = 1;
 	runnable[1] = 3;
@@ -1183,7 +1235,7 @@ static void test_steer_pick_llc(void)
 	runnable[1] = 2;
 	runnable[2] = 5;
 
-	/* All-idle-zero: no domain has an idle CPU -> sentinel. */
+	/* All-idle-zero. No domain has an idle CPU -> sentinel. */
 	memset(idle, 0, sizeof(idle));
 	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 0) == MLFQ_MAX_LLCS,
 		"steer: no idle-populated domain yields the sentinel");
@@ -1252,7 +1304,7 @@ static void test_steer_loop_bound(void)
 		picks[2] == 2 && picks[3] == 1,
 		"steer: picks descend the load order, waker's domain excluded");
 
-	/* Fewer eligible domains than the cap: the loop stops early. */
+	/* Fewer eligible domains than the cap. The loop stops early. */
 	memset(runnable, 0, sizeof(runnable));
 	memset(idle, 0, sizeof(idle));
 	idle[2] = 1;
@@ -1274,6 +1326,331 @@ static void test_steer_loop_bound(void)
 		"steer: the loop stops early when no eligible domain remains");
 }
 
+/* System wakeup gauges. */
+
+static void test_sys_lat_gauge(void)
+{
+	u64 now = 100000000000ULL;	/* 100 s of a boot clock */
+	u64 half = MLFQ_SYS_GAUGE_HALF_LIFE_NS;
+	u64 max = MLFQ_SYS_LAT_MAX_NS;
+
+	TEST_OK(mlfq_sys_lat_update(0, 0, now, max, half, max, MLFQ_ALPHA) ==
+		max,
+		"lat gauge: a single ceiling sample saturates the gauge");
+	TEST_OK(mlfq_sys_lat_update(max, now, now, 1000000, half, max,
+				    MLFQ_ALPHA) == max,
+		"lat gauge: the gauge never exceeds its ceiling");
+	TEST_OK(mlfq_sys_lat_update(max, now, now + 64 * half, 0, half, max,
+				    MLFQ_ALPHA) == 0,
+		"lat gauge: 64 half-lives of idle decay the gauge to zero");
+	TEST_OK(mlfq_sys_lat_update(max, now + 1000, now, 0, half, max,
+				    MLFQ_ALPHA) == max,
+		"lat gauge: a future sample stamp (clock wrap) yields no decay");
+	TEST_OK(mlfq_sys_lat_update(0, now, now + half, 1000000, half, max,
+				    MLFQ_ALPHA) == 12000000,
+		"lat gauge: 1ms sample after one idle half-life climbs to 12ms");
+}
+
+static void test_sys_rate_step(void)
+{
+	u64 one_s = 1000000000ULL;
+
+	TEST_OK(mlfq_sys_rate_step(0, 0, one_s) == 0,
+		"rate step: zero arrivals fold to zero");
+	TEST_OK(mlfq_sys_rate_step(0, 2000, one_s) == 256000,
+		"rate step: 2000/s over one half-life folds to half the rate");
+	TEST_OK(mlfq_sys_rate_step(256000, 2000, one_s) == 384000,
+		"rate step: the EMA converges toward the instantaneous rate");
+	TEST_OK(mlfq_sys_rate_step(0, 10000000, one_s) == 128000000,
+		"rate step: the instantaneous rate clamps at MLFQ_SYS_RATE_MAX");
+	TEST_OK(mlfq_sys_rate_step(0, 2000, one_s / 10) == 256000,
+		"rate step: a sub-window elapsed clamps up to the cadence");
+	TEST_OK(mlfq_sys_rate_step(0, 2000, 120 * one_s) == 8448,
+		"rate step: a multi-minute elapsed clamps down to 60s");
+}
+
+/* Threshold adaptation. */
+
+static void test_adapt_shift_target(void)
+{
+	u64 target = MLFQ_ADAPT_TARGET_LAT_NS;
+
+	TEST_OK(mlfq_adapt_shift_target(target, 0) == 0,
+		"shift target: a gauge at the target yields shift 0");
+	TEST_OK(mlfq_adapt_shift_target(2 * target, 0) ==
+		(s64)MLFQ_ADAPT_MAX_SHIFT,
+		"shift target: a full-range error saturates at +MAX_SHIFT");
+	TEST_OK(mlfq_adapt_shift_target(0, 0) ==
+		-(s64)MLFQ_ADAPT_MAX_SHIFT,
+		"shift target: an idle gauge saturates at -MAX_SHIFT");
+	TEST_OK(mlfq_adapt_shift_target(target + target / 2, 0) == 64,
+		"shift target: half a target of error moves a quarter shift");
+	TEST_OK(mlfq_adapt_shift_target(target / 2, 0) == -64,
+		"shift target: half a target of deficit moves -quarter");
+	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS,
+					MLFQ_ADAPT_RATE_GATE_HIGH + 1) ==
+		(s64)MLFQ_ADAPT_RATE_GATE_SHIFT,
+		"shift target: the rate storm gate caps the positive shift");
+	TEST_OK(mlfq_adapt_shift_target(0, MLFQ_ADAPT_RATE_GATE_HIGH + 1) ==
+		-(s64)MLFQ_ADAPT_MAX_SHIFT,
+		"shift target: the rate storm gate never touches negative shifts");
+	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS,
+					MLFQ_ADAPT_RATE_GATE_HIGH) ==
+		(s64)MLFQ_ADAPT_MAX_SHIFT,
+		"shift target: the rate gate needs a strictly high rate");
+}
+
+static void test_adapt_slew(void)
+{
+	s64 s = 0;
+	int steps = 0;
+
+	TEST_OK(mlfq_adapt_slew(0, (s64)MLFQ_ADAPT_MAX_SHIFT) ==
+		(s64)MLFQ_ADAPT_MAX_STEP,
+		"slew: a step is capped at MLFQ_ADAPT_MAX_STEP");
+	TEST_OK(mlfq_adapt_slew(100, 0) == 75,
+		"slew: the step caps in the negative direction too");
+	TEST_OK(mlfq_adapt_slew(0, 10) == 10,
+		"slew: a target within one step lands on it");
+	TEST_OK(mlfq_adapt_slew(-100, 100) == -75,
+		"slew: a full-range retarget moves one step");
+
+	while (s < (s64)MLFQ_ADAPT_MAX_SHIFT && steps < 100) {
+		s = mlfq_adapt_slew(s, (s64)MLFQ_ADAPT_MAX_SHIFT);
+		steps++;
+	}
+	TEST_OK(s == (s64)MLFQ_ADAPT_MAX_SHIFT && steps == 6,
+		"slew: a full swing from zero converges in six steps");
+}
+
+static void test_adapt_band(void)
+{
+	TEST_OK(mlfq_adapt_band(MLFQ_T_L_NS, 0, MLFQ_ADAPT_T_L_FLOOR_NS,
+				MLFQ_ADAPT_T_L_CEIL_NS) == MLFQ_T_L_NS,
+		"band: shift 0 yields exactly the base");
+	TEST_OK(mlfq_adapt_band(MLFQ_T_L_NS, 128, MLFQ_ADAPT_T_L_FLOOR_NS,
+				MLFQ_ADAPT_T_L_CEIL_NS) == 375000,
+		"band: +50%% shift scales the base up");
+	TEST_OK(mlfq_adapt_band(MLFQ_T_H_NS, -128, MLFQ_ADAPT_T_H_FLOOR_NS,
+				MLFQ_ADAPT_T_H_CEIL_NS) == 1200000,
+		"band: -50%% shift scales the base down to the T_H floor");
+	TEST_OK(mlfq_adapt_band(100000, -128, 150000, 500000) == 150000,
+		"band: the floor clamps the effective value");
+	TEST_OK(mlfq_adapt_band(400000, 128, 150000, 500000) == 500000,
+		"band: the ceiling clamps the effective value");
+}
+
+static void test_adapt_guard(void)
+{
+	u64 target = MLFQ_ADAPT_TARGET_LAT_NS;
+	u64 max = MLFQ_ADAPT_GUARD_MAX_NS;
+
+	TEST_OK(mlfq_adapt_guard(target) == 0,
+		"guard: a gauge at the target keeps the guard at zero");
+	TEST_OK(mlfq_adapt_guard(MLFQ_SYS_LAT_MAX_NS) == 0,
+		"guard: latency pressure keeps the guard at zero");
+	TEST_OK(mlfq_adapt_guard(0) == max,
+		"guard: an idle gauge yields the maximum guard");
+	TEST_OK(mlfq_adapt_guard(target / 2) == max / 2,
+		"guard: a half-target gauge yields a half guard");
+	TEST_OK(mlfq_adapt_guard(0) > mlfq_adapt_guard(target / 4) &&
+		mlfq_adapt_guard(target / 4) > mlfq_adapt_guard(target / 2) &&
+		mlfq_adapt_guard(target / 2) > mlfq_adapt_guard(target * 3 / 4),
+		"guard: the guard decreases monotonically with the gauge");
+}
+
+/*
+ * The disjoint floor/ceiling ranges prove the queue semantics can never
+ * invert: for every shift in the whole reachable range, T_L stays below
+ * T_H and T_INT below T_BOUND, each band stays within its hard bounds
+ * and the guard within its own. The harness drives the full range, not
+ * a sample, so the proof is exhaustive over the reachable shift state.
+ */
+static void test_adapt_bands_all_shifts(void)
+{
+	s64 s;
+
+	for (s = -(s64)MLFQ_ADAPT_MAX_SHIFT;
+	     s <= (s64)MLFQ_ADAPT_MAX_SHIFT; s++) {
+		u64 t_l = mlfq_adapt_band(MLFQ_T_L_NS, s,
+					  MLFQ_ADAPT_T_L_FLOOR_NS,
+					  MLFQ_ADAPT_T_L_CEIL_NS);
+		u64 t_h = mlfq_adapt_band(MLFQ_T_H_NS, s,
+					  MLFQ_ADAPT_T_H_FLOOR_NS,
+					  MLFQ_ADAPT_T_H_CEIL_NS);
+		u64 t_int = mlfq_adapt_band(MLFQ_TREE_T_INT_NS, s,
+					    MLFQ_ADAPT_T_INT_FLOOR_NS,
+					    MLFQ_ADAPT_T_INT_CEIL_NS);
+		u64 t_bnd = mlfq_adapt_band(MLFQ_TREE_T_BOUND_NS, s,
+					    MLFQ_ADAPT_T_BND_FLOOR_NS,
+					    MLFQ_ADAPT_T_BND_CEIL_NS);
+		u64 guard = mlfq_adapt_guard(0);
+
+		TEST_OK(t_l < t_h && t_int < t_bnd &&
+			mlfq_check_bands(t_l, t_h, t_int, t_bnd) &&
+			guard <= MLFQ_ADAPT_GUARD_MAX_NS,
+			"bands stay ordered and bounded at shift %lld",
+			(long long)s);
+	}
+
+	/* Band separation holds with margin at every shift. */
+	TEST_OK(MLFQ_ADAPT_T_H_CEIL_NS - MLFQ_ADAPT_T_L_FLOOR_NS >= 700000 &&
+		MLFQ_ADAPT_T_BND_CEIL_NS - MLFQ_ADAPT_T_INT_FLOOR_NS >= 200000,
+		"band separation floors keep the bands apart");
+	TEST_OK(MLFQ_TREE_LABEL_MAX_NS >= 40 * MLFQ_ADAPT_T_BND_CEIL_NS,
+		"the label clamp stays at least 40x the highest effective T_BOUND");
+}
+
+/*
+ * The disabled state reproduces the fixed thresholds by construction:
+ * the init copy seeds the effective values with the rodata bases and a
+ * zero shift, so every effective band equals its base and the guard
+ * equals the fixed minimum residency. The adaptation step is the only
+ * writer that could move them, and it is gated off.
+ */
+static void test_adapt_disabled_equals_base(void)
+{
+	TEST_OK(mlfq_adapt_band(MLFQ_T_L_NS, 0, MLFQ_ADAPT_T_L_FLOOR_NS,
+				MLFQ_ADAPT_T_L_CEIL_NS) == MLFQ_T_L_NS &&
+		mlfq_adapt_band(MLFQ_T_H_NS, 0, MLFQ_ADAPT_T_H_FLOOR_NS,
+				MLFQ_ADAPT_T_H_CEIL_NS) == MLFQ_T_H_NS &&
+		mlfq_adapt_band(MLFQ_TREE_T_INT_NS, 0,
+				MLFQ_ADAPT_T_INT_FLOOR_NS,
+				MLFQ_ADAPT_T_INT_CEIL_NS) == MLFQ_TREE_T_INT_NS &&
+		mlfq_adapt_band(MLFQ_TREE_T_BOUND_NS, 0,
+				MLFQ_ADAPT_T_BND_FLOOR_NS,
+				MLFQ_ADAPT_T_BND_CEIL_NS) == MLFQ_TREE_T_BOUND_NS,
+		"disabled: shift 0 maps every effective band to its base");
+	TEST_OK(MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS == 0,
+		"disabled: the guard base keeps the unconditional interactive preemption");
+	TEST_OK(mlfq_check_bands(MLFQ_T_L_NS, MLFQ_T_H_NS,
+				 MLFQ_TREE_T_INT_NS, MLFQ_TREE_T_BOUND_NS),
+		"disabled: the base band pair satisfies the band-order invariants");
+}
+
+/*
+ * The rate-fold overflow contract of intf.h. The count argument to
+ * mlfq_sys_rate_step is a u32, so the fold must stay correct and in
+ * bounds on both sides of the u32 range. A count near 0xFFFFFFFF folds
+ * to a rate far above MLFQ_SYS_RATE_MAX and clamps to it, and a small
+ * count folds to a small in-bounds rate. The u64 overflow bound rests
+ * on 2^32 * 1e9 ~= 4.3e18 staying inside u64. The per-CPU wakeup
+ * counters are u64 (mlfq_wakeup_counters in intf.h), so the practical
+ * wrap is gone and the fold arithmetic itself is still exercised here.
+ */
+static void test_adapt_rate_step_wrap(void)
+{
+	u64 one_s = NSEC_PER_SEC;
+	u64 ema;
+
+	/*
+	 * The overflow bound itself: the largest possible counter (2^32 - 1)
+	 * times the 1 s window must not wrap u64. If the product wrapped,
+	 * dividing by the window would not recover the counter.
+	 */
+	TEST_OK(0xFFFFFFFFULL * NSEC_PER_SEC / NSEC_PER_SEC == 0xFFFFFFFFULL,
+		"rate wrap: the max counter by 1s product stays inside u64");
+
+	/*
+	 * Pre-wrap edge: a counter near 0xFFFFFFFF folded over a 1 s window
+	 * has an instantaneous rate far above MLFQ_SYS_RATE_MAX, so the
+	 * fold clamps it to the ceiling. With one half-life elapsed the
+	 * clamped fold lands on half the ceiling in fixed point.
+	 */
+	ema = mlfq_sys_rate_step(0, (u32)0xFFFFFF00, one_s);
+	TEST_OK(ema == (MLFQ_SYS_RATE_MAX << FP_SHIFT) / 2,
+		"rate wrap: a near-wrap counter clamps at MLFQ_SYS_RATE_MAX");
+	TEST_OK(ema <= (MLFQ_SYS_RATE_MAX << FP_SHIFT),
+		"rate wrap: the pre-wrap EMA fold stays in bounds");
+
+	/*
+	 * Post-wrap edge: the counter has wrapped and reads small, so the
+	 * fold yields a small in-bounds rate and the EMA decays toward it
+	 * while staying in bounds.
+	 */
+	ema = mlfq_sys_rate_step(ema, 5, one_s);
+	TEST_OK(ema == (MLFQ_SYS_RATE_MAX << FP_SHIFT) / 4 + 5 * (FP_ONE / 2),
+		"rate wrap: a wrapped counter folds to a small rate");
+	TEST_OK(ema <= (MLFQ_SYS_RATE_MAX << FP_SHIFT),
+		"rate wrap: the post-wrap EMA fold stays in bounds");
+}
+
+/*
+ * Exact fixed-point assertions against the real formulas, the exact
+ * counterparts of the trend tests above: the shift target is exactly 0
+ * on both sides of the 1 ms target, the guard is exactly 0 at the
+ * target and above, the rate gate is strictly greater than 200000 << 8
+ * and caps the positive target at +FP_ONE/4, the slew step clamps
+ * exactly at +-MLFQ_ADAPT_MAX_STEP, and the guard is exactly 250 us at
+ * lat toward 0.
+ */
+static void test_adapt_boundary_exacts(void)
+{
+	u64 target = MLFQ_ADAPT_TARGET_LAT_NS;
+	u64 gate = 200000ULL << FP_SHIFT;
+	s64 s;
+	int steps;
+
+	/* The shift target is exactly 0 at lat == 1 ms on both sides. */
+	TEST_OK(mlfq_adapt_shift_target(target, 0) == 0 &&
+		mlfq_adapt_shift_target(target - 1, 0) == 0 &&
+		mlfq_adapt_shift_target(target + 1, 0) == 0,
+		"boundary: the shift target is exactly 0 on both sides of 1 ms");
+
+	/* The guard is exactly 0 at lat == target. */
+	TEST_OK(mlfq_adapt_guard(target) == 0,
+		"boundary: the guard is exactly 0 at lat == target");
+
+	/*
+	 * The rate gate is strict: at exactly 200000 << 8 it does not
+	 * gate, one above caps the positive target at +FP_ONE/4, and one
+	 * below leaves it uncapped.
+	 */
+	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS, gate) ==
+		(s64)MLFQ_ADAPT_MAX_SHIFT,
+		"boundary: the rate gate at exactly 200000 << 8 does not gate");
+	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS, gate + 1) ==
+		(s64)MLFQ_ADAPT_RATE_GATE_SHIFT,
+		"boundary: one above the gate caps the target at +FP_ONE/4");
+	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS, gate - 1) ==
+		(s64)MLFQ_ADAPT_MAX_SHIFT,
+		"boundary: one below the gate leaves the target uncapped");
+
+	/* The slew step clamps exactly at +-MLFQ_ADAPT_MAX_STEP. */
+	TEST_OK(mlfq_adapt_slew(0, (s64)MLFQ_ADAPT_MAX_SHIFT) ==
+		(s64)MLFQ_ADAPT_MAX_STEP &&
+		mlfq_adapt_slew(0, -(s64)MLFQ_ADAPT_MAX_SHIFT) ==
+		-(s64)MLFQ_ADAPT_MAX_STEP,
+		"boundary: the slew step clamps exactly at +-MLFQ_ADAPT_MAX_STEP");
+
+	/*
+	 * Full-range convergence, verified against the real formula. The
+	 * ideal-rate bound is ceil(0.5 / 0.1) = 5 steps; the fixed-point
+	 * step (FP_ONE / 10 truncates 25.6 to 25) needs one more, so the
+	 * exact count is computed from the constants, and the loop must
+	 * land exactly on the target.
+	 */
+	s = 0;
+	steps = 0;
+	while (s < (s64)MLFQ_ADAPT_MAX_SHIFT && steps < 100) {
+		s = mlfq_adapt_slew(s, (s64)MLFQ_ADAPT_MAX_SHIFT);
+		steps++;
+	}
+	TEST_OK(steps == (MLFQ_ADAPT_MAX_SHIFT + MLFQ_ADAPT_MAX_STEP - 1) /
+				MLFQ_ADAPT_MAX_STEP &&
+		s == (s64)MLFQ_ADAPT_MAX_SHIFT,
+		"boundary: a full swing converges in the computed step count");
+	TEST_OK(steps >= 5,
+		"boundary: a full swing needs at least the five-step bound");
+
+	/* The guard edges: 250 us at lat toward 0, 0 at lat >= target. */
+	TEST_OK(mlfq_adapt_guard(0) == MLFQ_ADAPT_GUARD_MAX_NS,
+		"boundary: the guard is the full 250 us at lat toward 0");
+	TEST_OK(mlfq_adapt_guard(target + 1) == 0 &&
+		mlfq_adapt_guard(2 * target) == 0,
+		"boundary: the guard is 0 at lat >= target");
+}
+
 int main(void)
 {
 	test_calc_delta_fair();
@@ -1285,6 +1662,16 @@ int main(void)
 	test_clock_advance();
 	test_ema_climb();
 	test_ema_decay();
+	test_sys_lat_gauge();
+	test_sys_rate_step();
+	test_adapt_shift_target();
+	test_adapt_slew();
+	test_adapt_band();
+	test_adapt_guard();
+	test_adapt_bands_all_shifts();
+	test_adapt_disabled_equals_base();
+	test_adapt_rate_step_wrap();
+	test_adapt_boundary_exacts();
 	test_queue_mapping();
 	test_promote_hysteresis();
 	test_demote_hysteresis();

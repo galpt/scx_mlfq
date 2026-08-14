@@ -15,13 +15,13 @@
 //!
 //! Two phases:
 //!
-//! 1. `init_topology()` - before `scx_ops_load!()`: discovers the
+//! 1. `init_topology()` runs before `scx_ops_load!()`. It discovers the
 //!    topology, computes the plans, and writes the rodata globals (rodata
 //!    is frozen at load).
-//! 2. `write_primary_bitmap()` / `write_llc_bitmaps()` - after
-//!    `scx_ops_load!()`: writes the CPU-membership bitmaps directly into
-//!    the ARRAY maps (`mlfq_primary_bitmap`, `mlfq_llc_bitmaps`) that the
-//!    CPU-selection path reads.
+//! 2. `write_primary_bitmap()` and `write_llc_bitmaps()` run after
+//!    `scx_ops_load!()`. They write the CPU-membership bitmaps directly
+//!    into the ARRAY maps (`mlfq_primary_bitmap`, `mlfq_llc_bitmaps`) that
+//!    the CPU-selection path reads.
 //!
 //! All discovery is best-effort: a placement hint must never abort the
 //! scheduler, so any failure leaves the bitmaps empty and the scheduler
@@ -182,12 +182,12 @@ pub struct SiblingPlan {
 /// Plan the SMT sibling table from a synthetic `(cpu, core)` map.
 ///
 /// Each CPU's entry is the lowest-id *other* CPU sharing its physical
-/// core (the `core_id` from `scx_utils::Cpu`); a core with a single CPU
+/// core (the `core_id` from `scx_utils::Cpu`). A core with a single CPU
 /// maps that CPU to itself, the "no sibling" sentinel the BPF side
 /// treats as "no preference". `smt_on` is set when any entry is a
 /// non-self sibling. For >2-way SMT only the lowest-id sibling is
-/// reported -- a preference, not a full pairing -- and the input order
-/// does not matter (the plan groups by core first).
+/// reported. This is a preference, not a full pairing, and the input
+/// order does not matter (the plan groups by core first).
 pub fn plan_sibling_table(cpu_to_core: &[(u32, u32)]) -> SiblingPlan {
     let mut plan = SiblingPlan {
         smt_on: false,
@@ -288,7 +288,7 @@ fn llc_size_bytes(cache_path: &Path) -> Option<u64> {
 
 /// Pick the LLC domain with the strictly-largest cache size.
 ///
-/// The Q1 placement bias needs a single unambiguous winner: with fewer
+/// The Q1 placement bias needs a single unambiguous winner. With fewer
 /// than two domains, or two or more domains tied for the largest size
 /// (including the all-zeros case of a fully failed discovery), there is
 /// no capacity win to exploit and the feature stays off (`None`).
@@ -630,7 +630,7 @@ fn llc_cpu_list_for(cpus: &[u32]) -> mlfq_llc_cpu_list {
 /// Pack a CPU list into the `mlfq_llc_cpu_list` map value type.
 ///
 /// The caller passes only lists that fit `MLFQ_MAX_LLC_CPUS` (an
-/// oversized domain gets an empty list, not a truncated one); the
+/// oversized domain gets an empty list, not a truncated one). The
 /// take() below is defense in depth. Out-of-range CPUs are skipped
 /// (matching the plan and the BPF-side guards), and the count records
 /// only the entries actually stored.

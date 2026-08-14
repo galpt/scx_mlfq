@@ -8,7 +8,7 @@
 //! Loopback web UI: live scheduler metrics as a small HTTP server.
 //!
 //! The server binds `[::1]:50005` first and falls back to
-//! `127.0.0.1:50005`; when both TCP binds fail (for example when the
+//! `127.0.0.1:50005`. When both TCP binds fail (for example when the
 //! loader sandbox denies inet sockets), the same routes are served over
 //! the unix socket `/tmp/scx_mlfq.sock` with a minimal hand-rolled
 //! HTTP/1.1 responder. The socket is created mode 0600, so only root
@@ -29,8 +29,9 @@
 //! `restore_loader_sandbox` and the pure classification helpers below.
 //!
 //! The metrics pipeline is push-based: the run loop sends one `WebMetrics`
-//! snapshot per iteration over a small bounded channel (capacity 16;
-//! `try_send`, so a full buffer drops a frame instead of stalling the
+//! snapshot per iteration over a small bounded channel (capacity 16).
+//! `try_send` drops a frame when the buffer is full, instead of
+//! stalling the
 //! scheduler or growing the buffer), and this thread keeps the newest
 //! snapshot behind a mutex for the HTTP handlers. The thread exits when
 //! the shared shutdown flag is set.
@@ -155,10 +156,10 @@ fn unix_handle_client(
 
 /// The exact bytes the scheduler owns for its runtime (per-boot)
 /// network-sandbox unblock. Mirrors the installer's `/etc` drop-in
-/// shape — an `[Service]` section whose empty assignments reset the
+/// shape. An `[Service]` section whose empty assignments reset the
 /// loader's `RestrictAddressFamilies=`/`SocketBindDeny=` for the next
-/// start — but carries the scheduler's own marker, so the restore path
-/// can prove a file is ours byte-for-byte before removing it.
+/// start carries the scheduler's own marker, so the restore path can
+/// prove a file is ours byte-for-byte before removing it.
 fn runtime_dropin_content() -> String {
     "# scx_mlfq Web UI: runtime unblock of the loader network sandbox.\n\
      # Owned by the scx_mlfq scheduler; removed on exit.\n\
@@ -177,7 +178,7 @@ fn dropin_matches(content: &str) -> bool {
 }
 
 /// Classify a TCP bind failure. Only a seccomp-style errno means the
-/// loader sandbox is in effect; a taken port (EADDRINUSE) is a plain
+/// loader sandbox is in effect. A taken port (EADDRINUSE) is a plain
 /// "something else owns the port" and must never trigger the runtime
 /// unblock, and an unclassified error is conservatively treated as not
 /// a sandbox failure.
@@ -191,7 +192,7 @@ fn sandbox_failure(err: &std::io::Error) -> bool {
 /// Recover the errno-bearing `io::Error` behind the boxed error tiny_http
 /// reports for a failed `Server::http` bind. tiny_http surfaces the
 /// `TcpListener::bind` `io::Error` itself (its `?` boxes it directly), so
-/// the top-level downcast is the real path; the source walk guards
+/// the top-level downcast is the real path. The source walk guards
 /// against a future wrapper. `io::Error`'s `source()` skips a custom
 /// payload (the payload is the error, not its cause), so an errno hidden
 /// under a wrapper is still found when the wrapper exposes it through its
@@ -301,8 +302,8 @@ fn try_unblock_loader_sandbox() -> bool {
 }
 
 /// Restore the loader's network sandbox after a run that wrote the
-/// runtime unblock. Called once from `main` after the run loop ends;
-/// idempotent (safe to call twice).
+/// runtime unblock. Called once from `main` after the run loop ends.
+/// Idempotent (safe to call twice).
 ///
 /// Only the byte-identical file this process wrote is ever removed: a
 /// foreign or user-edited drop-in is logged and left untouched. `/run`
@@ -476,9 +477,9 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         // keeps available. Before the fallback, classify the last bind
         // error: only a seccomp-style errno (a sandbox denial, not a
         // busy port) earns the runtime unblock for the NEXT scheduler
-        // start. This run stays on the unix socket — the seccomp filter
-        // is per-process and inherited, so it cannot be lifted in place
-        // — and the drop-in takes effect when the loader next starts the
+        // start. This run stays on the unix socket. The seccomp filter
+        // is per-process and inherited, so it cannot be lifted in place,
+        // and the drop-in takes effect when the loader next starts the
         // unit.
         let sandboxed = bind_err
             .as_deref()
@@ -527,10 +528,10 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         );
 
         if let Err(e) = listener.set_nonblocking(true) {
-            // Nonblocking accept is required by the poll loop below;
-            // without it the thread could not observe the shutdown flag
-            // while idle. Log and exit the serving thread gracefully:
-            // the UI simply shows disconnected.
+            // Nonblocking accept is required by the poll loop below.
+            // Without it the thread could not observe the shutdown flag
+            // while idle. Log and exit the serving thread gracefully.
+            // The UI simply shows disconnected.
             log::error!("Web UI: failed to set the unix socket nonblocking: {e}");
             log::warn!("Web UI disabled. Use --no-webui to silence.");
             return;
@@ -556,7 +557,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
                 Err(e) => {
                     // A transient accept failure (for example a file
                     // descriptor shortage) must not end the dashboard
-                    // for the rest of the run; the loop retries at a
+                    // for the rest of the run. The loop retries at a
                     // bounded rate and only the shutdown flag exits it.
                     log::warn!("Web UI: unix-socket accept failed: {e}");
                     std::thread::sleep(Duration::from_millis(100));

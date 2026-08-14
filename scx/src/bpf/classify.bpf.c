@@ -2,14 +2,14 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Classification: tree inference, EMA gauge, queue mapping, hysteresis.
+ * Classification, tree inference, EMA gauge, queue mapping and hysteresis.
  *
  * The tree predicts the next burst from the captured features and maps
- * the prediction to the queues; the EMA gauge remains a feature and the
+ * the prediction to the queues. The EMA gauge remains a feature and the
  * untrained fallback. The gauge is a continuous interactivity measure
- * mapped onto the three queues: it climbs per run segment in stopping()
- * and decays per sleep at wakeup; see mlfq_ema_climb()/mlfq_ema_decay()
- * in intf.h. Queue changes are asymmetric: the wakeup path is
+ * mapped onto the three queues. It climbs per run segment in stopping()
+ * and decays per sleep at wakeup. See mlfq_ema_climb()/mlfq_ema_decay()
+ * in intf.h. Queue changes are asymmetric. The wakeup path is
  * promotion-only (the tree raises the queue, and the short-sleep and
  * band hysteresis promote), while demotions flow through the run-out
  * gate in enqueue.bpf.c, whose consecutive-exhaustion counters
@@ -41,7 +41,7 @@
 static __always_inline bool mlfq_demotion_blocked(const struct task_struct *p)
 {
 #if MLFQ_HAVE_TASK_UCLAMP_MIN
-	/* UCLAMP_MIN > 0 marks a latency-sensitive task; keep its queue. */
+	/* UCLAMP_MIN > 0 marks a latency-sensitive task. Keep its queue. */
 	return BPF_CORE_READ(p, uclamp_req[0].value) > 0;
 #else
 	(void)p;
@@ -106,20 +106,20 @@ static __always_inline void mlfq_ema_climb_task(struct task_ctx *tctx,
  * @tctx: The task context.
  * @now: Current time (scx_bpf_now()).
  *
- * Applies, in order: EMA decay over the sleep, the tree inference on the
- * captured features, the rate-limited short-sleep IPC boost, the
+ * Applies, in order, the EMA decay over the sleep, the tree inference on
+ * the captured features, the rate-limited short-sleep IPC boost, the
  * band-hysteresis promotion and, on the untrained fallback only, the
- * long-sleep base-mapping boost. Updates the promotion, boost and tree
+ * long-sleep base-mapping boost. It updates the promotion, boost and tree
  * stats.
  *
- * The tree mapping is promotion-only (mlfq_tree_map_queue): the tree is
+ * The tree mapping is promotion-only (mlfq_tree_map_queue). The tree is
  * authoritative for raising the queue at the wakeup, and demotions are
  * the run-out gate's job, so a single wakeup prediction can never demote
  * a task and bypass the exhaustion hysteresis. The tree inference is a
- * pure conditional at the top of the mapping: while untrained (pred ==
- * 0) the classification below runs on the EMA gauge alone, and the boost and
- * the hysteresis are unconditional in both paths, so the tree can never
- * take away the latency guarantees.
+ * pure conditional at the top of the mapping. While untrained (pred ==
+ * 0) the classification below runs on the EMA gauge alone, and the boost
+ * and the hysteresis are unconditional in both paths, so the tree can
+ * never take away the latency guarantees.
  */
 static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 						 struct task_ctx *tctx, u64 now)
@@ -149,15 +149,15 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * The queue is snapshotted at the same instant, so the emitted
 	 * sample's queue field is the capture-time queue, not the queue
 	 * later placement decisions (aging, a subsequent classification)
-	 * leave behind. The prediction also doubles as the trained gate
-	 * -- the walk returns 0 while untrained -- so the fallback is a
-	 * pure conditional on it.
+	 * leave behind. The prediction also doubles as the trained gate.
+	 * The walk returns 0 while untrained, so the fallback is a pure
+	 * conditional on it.
 	 *
 	 * SCHED_IDLE tasks are policy-pinned to Q3 and the tree never
 	 * classifies them, so their samples would only pollute the
-	 * training; the capture is skipped, any pending sample is dropped
+	 * training. The capture is skipped, any pending sample is dropped
 	 * and pred stays 0, which is the untrained mapping below. The
-	 * skip is policy service, not fallback service: a SCHED_IDLE
+	 * skip is policy service, not fallback service. A SCHED_IDLE
 	 * classification is never counted against tree_fallback, even
 	 * while the tree is untrained.
 	 */
@@ -170,6 +170,17 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 		tctx->pending_feats.ema = tctx->ema;
 		tctx->pending_feats.io_wait = io_wait;
 		tctx->pending_feats.wake_cnt = tctx->wake_cnt;
+		/*
+		 * The service features are the measured values of the
+		 * previous episode (the last wakeup latency, the last
+		 * queue wait and the service-quality EMA), captured as
+		 * emitted data.
+		 */
+		tctx->pending_feats.wake_lat_us =
+			tctx->last_wake_lat_ns / NSEC_PER_USEC;
+		tctx->pending_feats.queue_wait_us =
+			tctx->last_q_wait_ns / NSEC_PER_USEC;
+		tctx->pending_feats.sq_ema = tctx->sq_ema;
 		tctx->pending_queue = tctx->queue;
 		tctx->pending_valid = 1;
 
@@ -178,18 +189,21 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 
 	if (pred) {
 		/*
-		 * Promotion-only mapping: the tree is authoritative for
-		 * promotions at the wakeup, and demotions flow through
+		 * The mapping is promotion-only. The tree is authoritative
+		 * for promotions at the wakeup, and demotions flow through
 		 * the run-out gate (mlfq_demote_on_reenq) with its
 		 * consecutive-exhaustion hysteresis, so a single wakeup
 		 * prediction can never demote a task. This is the
 		 * classic MLFQ asymmetry. tree_disagree compares the
 		 * mapping result against the EMA base band.
 		 */
-		tctx->queue = mlfq_tree_map_queue(pred, tctx->queue);
+		tctx->queue = mlfq_tree_map_queue(pred, tctx->queue,
+						  mlfq_adapt_state.t_int_eff_ns,
+						  mlfq_adapt_state.t_bnd_eff_ns);
 		__sync_fetch_and_add(&mlfq_stats.tree_inference, 1);
-		base_q = mlfq_queue_from_ema(tctx->ema, mlfq_t_l_ns,
-					     mlfq_t_h_ns);
+		base_q = mlfq_queue_from_ema(tctx->ema,
+					     mlfq_adapt_state.t_l_eff_ns,
+					     mlfq_adapt_state.t_h_eff_ns);
 		if (tctx->queue != base_q)
 			__sync_fetch_and_add(&mlfq_stats.tree_disagree, 1);
 	} else if (p->policy != MLFQ_SCHED_IDLE) {
@@ -202,18 +216,18 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	}
 
 	/*
-	 * IPC boost: a wakeup from I/O or a short sleep is treated as
+	 * The IPC boost. A wakeup from I/O or a short sleep is treated as
 	 * interactive and placed in Q1, rate-limited per task (the
 	 * stand-in for the kernel's futex/IPC wakeup fast paths). The
 	 * rate limit is part of mlfq_ss_boost_pending(), which the CPU
 	 * selection also consults so the two paths agree on whether the
 	 * wakeup will be treated as interactive. The boost is
-	 * unconditional -- it runs after the tree mapping in both paths,
+	 * unconditional. It runs after the tree mapping in both paths,
 	 * so the tree can never take the latency guarantee away.
 	 *
 	 * SCHED_IDLE tasks are forced to Q3 by mlfq_apply_sched_idle, so
 	 * a boost would burn the rate-limit budget and push the counter
-	 * up to no effect; it is gated on the task policy.
+	 * up to no effect. It is gated on the task policy.
 	 */
 	if (p->policy != MLFQ_SCHED_IDLE &&
 	    mlfq_ss_boost_pending(tctx, sleep_ns, io_wait, now,
@@ -223,20 +237,23 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 		__sync_fetch_and_add(&mlfq_stats.short_sleep_boosts, 1);
 	}
 
-	if (mlfq_promote_on_wakeup(tctx, sleep_ns, mlfq_t_l_ns, mlfq_t_h_ns,
+	if (mlfq_promote_on_wakeup(tctx, sleep_ns,
+				   mlfq_adapt_state.t_l_eff_ns,
+				   mlfq_adapt_state.t_h_eff_ns,
 				   mlfq_hysteresis_sleep_ns))
 		__sync_fetch_and_add(&mlfq_stats.promotions, 1);
 
 	/*
-	 * A long sleep collapses the gauge; re-adopt the base mapping so
+	 * A long sleep collapses the gauge. Re-adopt the base mapping so
 	 * an interactive task cannot be stuck in Q3. This is the
-	 * untrained fallback: a trained tree already saw the long sleep
+	 * untrained fallback. A trained tree already saw the long sleep
 	 * in its sleep_ns feature, so the remap would be redundant and
 	 * would fight the tree mapping.
 	 */
 	if (!pred && sleep_ns > mlfq_long_sleep_ns) {
-		base_q = mlfq_queue_from_ema(tctx->ema, mlfq_t_l_ns,
-					     mlfq_t_h_ns);
+		base_q = mlfq_queue_from_ema(tctx->ema,
+					     mlfq_adapt_state.t_l_eff_ns,
+					     mlfq_adapt_state.t_h_eff_ns);
 		if (base_q < tctx->queue) {
 			tctx->queue = base_q;
 			__sync_fetch_and_add(&mlfq_stats.promotions, 1);
@@ -269,17 +286,17 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 	 * the sleep length is zero and the task is not in iowait.
 	 *
 	 * The run-out capture (sleep=0, io=0) intentionally re-arms the
-	 * pending sample with the run-out state: that state is the
+	 * pending sample with the run-out state. That state is the
 	 * correct feature vector for the run-out inference point. The
 	 * wakeup-armed samples survive for tasks that block within a
-	 * slice -- a task that sleeps mid-slice keeps the wakeup capture
+	 * slice. A task that sleeps mid-slice keeps the wakeup capture
 	 * for its emission, and only a run-out re-enqueue overwrites the
 	 * pending block. The queue is snapshotted with the features, as
 	 * on the wakeup path.
 	 *
 	 * SCHED_IDLE tasks are pinned to Q3 and never demoted, so their
 	 * captures are skipped like the wakeup path's, and the skip is
-	 * policy service, not fallback service: it is not counted
+	 * policy service, not fallback service. It is not counted
 	 * against tree_fallback either.
 	 */
 	if (p->policy == MLFQ_SCHED_IDLE) {
@@ -291,6 +308,11 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 		tctx->pending_feats.ema = tctx->ema;
 		tctx->pending_feats.io_wait = 0;
 		tctx->pending_feats.wake_cnt = tctx->wake_cnt;
+		tctx->pending_feats.wake_lat_us =
+			tctx->last_wake_lat_ns / NSEC_PER_USEC;
+		tctx->pending_feats.queue_wait_us =
+			tctx->last_q_wait_ns / NSEC_PER_USEC;
+		tctx->pending_feats.sq_ema = tctx->sq_ema;
 		tctx->pending_queue = tctx->queue;
 		tctx->pending_valid = 1;
 
@@ -305,6 +327,7 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 
 	if (mlfq_demotion_blocked(p))
 		return;
-	if (mlfq_demote_on_reenq(tctx, mlfq_t_h_ns, pred))
+	if (mlfq_demote_on_reenq(tctx, mlfq_adapt_state.t_h_eff_ns,
+				 mlfq_adapt_state.t_bnd_eff_ns, pred))
 		__sync_fetch_and_add(&mlfq_stats.demotions, 1);
 }

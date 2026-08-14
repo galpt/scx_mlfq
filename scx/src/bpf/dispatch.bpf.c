@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * Dispatch: queue service with quotas and cross-CPU stealing, included by
+ * Dispatch, the queue service with quotas and cross-CPU stealing, is included by
  * main.bpf.c via #include.
  *
  * The kernel serves SCX_DSQ_LOCAL before ops.dispatch() (the dispatch
@@ -15,14 +15,14 @@
  * or a scan, and the kernel re-validates affinity on the move. When the
  * own queue does not fill its quota, the remaining slots steal from
  * remote CPUs' same-queue DSQs in two tiers. Tier A scans the consuming
- * CPU's own LLC domain first -- a flat, compile-time-bounded window over
+ * CPU's own LLC domain first. A flat, compile-time-bounded window over
  * the per-LLC CPU list (mlfq_llc_cpus, looked up once per dispatch call
  * and immutable after load), gated by a cheap nr_queued check before
- * each peek -- so stolen work stays inside the waker's cache domain.
+ * each peek, keeps stolen work inside the consuming CPU's cache domain.
  * Only when Tier A finds nothing does Tier B scan the cross-LLC rotating
  * window of remote CPUs, now skipping the same-LLC candidates Tier A
  * already probed. On a single-LLC machine the own-LLC list is the whole
- * machine, so Tier A covers it and Tier B never runs: the candidate set,
+ * machine, so Tier A covers it and Tier B never runs. The candidate set,
  * the rotation and the deadline-major choice reproduce the pre-LLC
  * behavior. With LLC awareness unpopulated (map lookup failed or
  * mlfq_nr_llcs == 0) Tier A is skipped and Tier B degrades to today's
@@ -46,25 +46,25 @@
  * the kernel does not keep prev automatically, so when prev is still
  * queued and all three of the CPU's queue DSQs are empty, the keep path
  * grants prev a fresh slice and returns, without inserting prev into the
- * local DSQ; balance_one()'s post-dispatch keep (prev_on_rq && slice)
+ * local DSQ. balance_one()'s post-dispatch keep (prev_on_rq && slice)
  * then runs the task without a context switch. The grant alone is the
- * whole keep: a resident local-DSQ entry would shadow the queue DSQs on
+ * whole keep. A resident local-DSQ entry would shadow the queue DSQs on
  * every later dispatch cycle (ext.c takes the local DSQ before
  * ops.dispatch()) because a kept prev is never popped
  * (put_prev_set_next_task() early-returns on next == prev), refilling the
  * task at the 20 ms SCX_SLICE_DFL granularity and freezing
  * running()/stopping() accounting until the next real context switch.
  * Before keeping, the three queue heads of one remote CPU (the rotating
- * scan candidate) are probed: a CPU whose own queues are empty should
+ * scan candidate) are probed. A CPU whose own queues are empty should
  * still pull the most-owed remote task instead of running the previous
  * task for a full slice. Resolving the keep up front reads the queue
  * state once, before the slot loops churn it, and keeps the loop bodies
  * to a single job each.
  *
- * Realtime-takeover interaction: stealing from an occupied CPU's queue
- * DSQs stays legal -- the steal scan is the second evacuation channel
- * for tasks stranded by a takeover -- and no path dispatches TO an
- * occupied CPU's local DSQ: dispatch runs only on CPUs the kernel hands
+ * Realtime-takeover interaction. Stealing from an occupied CPU's queue
+ * DSQs stays legal. The steal scan is the second evacuation channel
+ * for tasks stranded by a takeover, and no path dispatches to an
+ * occupied CPU's local DSQ. Dispatch runs only on CPUs the kernel hands
  * to sched_ext, and the class-pick loop reaches sched_ext only when no
  * higher-priority class has a runnable task.
  */
@@ -106,16 +106,16 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * mlfq_dispatch_queue - Serve one queue for up to @quota slots.
  * @cpu: CPU running dispatch.
  * @qid: Queue being served (1..3), a constant at each call site.
- * @quota: Number of slots granted to this queue; zero yields no slots.
+ * @quota: Number of slots granted to this queue. Zero yields no slots.
  * @cpu_state: Per-CPU state of @cpu, may be NULL.
  * @nr_cpus: Snapshot of nr_cpu_ids.
  * @own_llc_list: The consuming CPU's own-LLC CPU list, hoisted once per
- *	dispatch call and immutable after load; NULL when LLC awareness is
+ *	dispatch call and immutable after load. NULL when LLC awareness is
  *	unpopulated for this CPU, which skips Tier A. The Tier-A window
  *	base is derived from it inside the null-checked branch (see the
  *	prologue).
  * @own_llc: The consuming CPU's LLC domain id, valid (below
- *	MLFQ_MAX_LLCS) exactly when @own_llc_list is non-NULL; the
+ *	MLFQ_MAX_LLCS) exactly when @own_llc_list is non-NULL. The
  *	validated same-domain filter for Tier B.
  *
  * Each slot serves the queue's own head first: scx_bpf_dsq_move_to_local()
@@ -123,25 +123,25 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * DSQ's list in deadline order, scx_dsq_priq_less) and re-validates
  * affinity on the move, so no peek or scan is needed for the local work.
  * Only when the own head is gone does the slot steal, in two tiers.
- * Tier A scans a flat MLFQ_LLC_SCAN_MAX window over @own_llc_list -- the
- * consuming CPU's cache domain -- so same-LLC work is pulled before any
+ * Tier A scans a flat MLFQ_LLC_SCAN_MAX window over @own_llc_list, the
+ * consuming CPU's cache domain, so same-LLC work is pulled before any
  * cross-LLC probe. Tier B, reached only when Tier A found nothing and
  * only when a cross-LLC candidate set exists (the whole-machine
  * single-LLC case was covered by Tier A), scans the rotating window of
  * remote CPUs' same-queue DSQs and skips the same-LLC candidates Tier A
  * already probed. Each candidate of both tiers is gated on nr_queued
  * before its peek, and the earliest eligible deadline among the peeked
- * heads is moved once per slot; on machines smaller than the scan cap
+ * heads is moved once per slot. On machines smaller than the scan cap
  * the window covers every remote CPU.
  *
  * With the own head drained, there is no local deadline to protect, so
- * the steal takes the earliest eligible remote head freely; the own-first
+ * the steal takes the earliest eligible remote head freely. The own-first
  * order still guarantees that every local head is served before any
  * remote one within the quota, and the tier order guarantees that a
- * same-LLC head always beats a cross-LLC head regardless of deadline --
- * the intended cache-warmth policy.
+ * same-LLC head always beats a cross-LLC head regardless of deadline.
+ * This is the intended cache-warmth policy.
  *
- * The single slot loop also keeps the verifier's exploration bounded: a
+ * The single slot loop also keeps the verifier's exploration bounded. A
  * second loop whose bound depends on how many moves the first one made
  * cannot converge within the kernel's jump-sequence limit.
  *
@@ -167,13 +167,13 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 	 * non-null cpus[] base in every path. The populated-domain branch
 	 * below replaces it with the consuming CPU's own-LLC base, taken
 	 * from the null-checked own_llc_list. Keeping the base non-null
-	 * everywhere is what lets the slot loop index it directly:
+	 * everywhere is what lets the slot loop index it directly.
 	 * clang's loop-invariant code motion would otherwise hoist the
 	 * &list->cpus[] address computation above the null check, and the
 	 * BPF verifier rejects pointer arithmetic on a possibly-null map
 	 * value ("map_value_or_null").
 	 *
-	 * The gate is the populated-state test: a NULL list (LLC
+	 * The gate is the populated-state test. A NULL list (LLC
 	 * awareness disabled or the CPU unmapped), a zero nr (an
 	 * oversized domain the front-end left empty), or an out-of-range
 	 * domain id keeps tier_a_nr at zero, the tier stays dead, and the
@@ -200,9 +200,9 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		/*
 		 * Own head first: move_to_local pops the min-deadline head
 		 * of the own DSQ and returns false when the DSQ is empty
-		 * or nothing can run on this CPU, which then falls through
-		 * to the steal scan. The move is same-LLC by construction:
-		 * the source DSQ is owned by this consuming CPU, so the
+		 * or nothing can run on this CPU, which then proceeds
+		 * to the steal scan. The move is same-LLC by construction.
+		 * The source DSQ is owned by this consuming CPU, so the
 		 * task's LLC ownership record is unchanged and no
 		 * runnable-accounting adjustment is needed (the ownership
 		 * adjust only fires at the steal below, where the source
@@ -214,21 +214,21 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		}
 
 		/*
-		 * Tier A: same-LLC steal. The flat window over the
+		 * Tier A, the same-LLC steal. The flat window over the
 		 * consuming CPU's own-LLC list keeps stolen work inside
 		 * the cache domain; the window starts at the same rotating
 		 * offset as Tier B so the drift is shared and the rotation
 		 * stays fair. The candidate index wraps with a
-		 * compile-time-constant modulo (MLFQ_LLC_SCAN_MAX): the
+		 * compile-time-constant modulo (MLFQ_LLC_SCAN_MAX). The
 		 * verifier only bounds a division/modulo result when the
 		 * divisor is a constant, and list->nr is runtime, so a
 		 * modulo by nr would leave the index unbounded and the
 		 * cpus[] access unverifiable. The window covers the whole
 		 * populated list because the front-end never publishes a
-		 * longer one: MLFQ_MAX_LLC_CPUS equals the window width,
+		 * longer one. MLFQ_MAX_LLC_CPUS equals the window width,
 		 * so a populated domain has at most MLFQ_LLC_SCAN_MAX CPUs
 		 * and the constant-modulo window is exactly the design's
-		 * rotating (off + i) % nr window over the domain; the wrap
+		 * rotating (off + i) % nr window over the domain. The wrap
 		 * order rotates the start, and the idx >= nr guard skips
 		 * the list padding beyond the populated count (the zeroed
 		 * tail of the map value). The window base and the entry
@@ -269,15 +269,15 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		}
 
 		/*
-		 * Tier B: cross-LLC steal, only when Tier A found nothing
+		 * Tier B, the cross-LLC steal, runs only when Tier A found nothing
 		 * and only when a cross-LLC candidate set exists. On a
 		 * single-LLC machine Tier A scanned the whole machine, so
-		 * this tier must not run. When Tier A could not run at all
-		 * -- LLC awareness unpopulated, the own list empty (an
-		 * oversized domain whose list the front-end left at
-		 * nr == 0), or the consuming CPU unmapped -- tier_a_ran
-		 * stays false, the same-LLC skip below is dead, and this
-		 * tier is today's plain rotating window: the full window
+		 * this tier must not run. When Tier A could not run at all, because
+		 * LLC awareness is unpopulated, the own list is empty (an oversized
+		 * domain whose list the front-end left at nr == 0), or the consuming
+		 * CPU is unmapped. tier_a_ran stays false, the same-LLC skip below
+		 * is dead, and this tier is today's plain rotating window. The full
+		 * window
 		 * covers the domain, oversized or not, and the unpopulated
 		 * state reproduces the pre-LLC behavior exactly. The skip
 		 * compares raw mlfq_cpu_llc values, so an unmapped
@@ -293,14 +293,14 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 					continue;
 				/*
 				 * The index is masked to the array bound for
-				 * the verifier: the modulo only proves
+				 * the verifier. The modulo only proves
 				 * cand < nr_cpus, and nr_cpus is a runtime
 				 * value whose upper bound the verifier
 				 * cannot derive (the ALU32 modulo also
 				 * leaves the register's high bits
 				 * unbounded), so the mlfq_cpu_llc[] access
 				 * needs the explicit mask. Identity at
-				 * runtime: init() rejects machines above
+				 * runtime. init() rejects machines above
 				 * MLFQ_MAX_CPUS, so cand < nr_cpus <=
 				 * MLFQ_MAX_CPUS and the mask never wraps
 				 * a valid candidate.
@@ -333,7 +333,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			}
 		}
 
-		/* nothing eligible anywhere: this queue has no work */
+		/* Nothing eligible anywhere. This queue has no work. */
 		if (!best)
 			break;
 
@@ -351,11 +351,11 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			 * its LLC ownership moved to this CPU's domain.
 			 * The helper's continuation path does the
 			 * old-1/new+1 when the domain differs (the
-			 * cross-LLC steal) and nothing when it does not;
-			 * the queue cannot change at a dispatch move.
+			 * cross-LLC steal) and nothing when it does not.
+			 * The queue cannot change at a dispatch move.
 			 *
 			 * The ownership adjust is approximate under
-			 * concurrency: @best is the DSQ head at peek time,
+			 * concurrency. @best is the DSQ head at peek time,
 			 * but consume_dispatch_q() pops the first head
 			 * ELIGIBLE at move time under the DSQ lock, and a
 			 * concurrent dispatcher or a cpuset change between
@@ -379,7 +379,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 				 * mlfq_llc_of_cpu() domains valid). With it,
 				 * a same-domain steal lands in
 				 * steals_same_llc and a cross-domain one in
-				 * steals_cross_llc; on a single-LLC machine
+				 * steals_cross_llc. On a single-LLC machine
 				 * every steal is same-domain by construction
 				 * (Tier A only, Tier B dead), and on an
 				 * LLC-disabled machine the split counters
@@ -410,6 +410,9 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	u64 nr_cpus = nr_cpu_ids;
 	u32 remaining = mlfq_dispatch_max_batch;
 	u64 op_lat_start = scx_bpf_now();
+
+	/* Rate-limited adaptation step, before any state is touched. */
+	mlfq_maybe_adapt_step(op_lat_start);
 
 	if (nr_cpus == 0) {
 		mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH, op_lat_start);
@@ -453,7 +456,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * and with SCX_OPS_ENQ_LAST set the kernel does not keep prev
 	 * automatically (ext.c). So when @prev is still queued and all
 	 * three of the CPU's queue DSQs are empty, @prev is the only
-	 * runnable work this CPU can take; the alternative is switching to
+	 * runnable work this CPU can take. The alternative is switching to
 	 * idle with runnable work, which leaves the CPU parked until an
 	 * external wakeup. Replenishing the queue slice alone makes
 	 * balance_one()'s post-dispatch keep (prev_on_rq &&
@@ -462,29 +465,30 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * @prev into the local DSQ. A resident local-DSQ entry would shadow
 	 * the queue DSQs on every later dispatch cycle (ext.c takes the
 	 * local DSQ before ops.dispatch()), because a kept prev is never
-	 * popped (put_prev_set_next_task() early-returns on next == prev);
-	 * the task would instead be served off that entry, refilled at the
+	 * popped (put_prev_set_next_task() early-returns on next == prev).
+	 * The task would instead be served off that entry, refilled at the
 	 * 20 ms SCX_SLICE_DFL granularity, with running()/stopping()
 	 * accounting frozen until the next real context switch. With no
 	 * DSQ entry, the next real context switch re-enqueues @prev
-	 * through put_prev_task_scx() (slice-exhausted: ops.enqueue() with
-	 * flags == 0; slice-left: SCX_ENQ_HEAD local insert), so queue
+	 * through put_prev_task_scx(), with ops.enqueue() and flags == 0 on
+	 * slice exhaustion and the SCX_ENQ_HEAD local insert when slice
+	 * remains, so queue
 	 * placement and accounting resume naturally.
 	 *
-	 * The keep is an accounting freeze: while it repeats, no context
+	 * The keep is an accounting freeze. While it repeats, no context
 	 * switch happens, so vruntime, the queue clock, the EMA gauges and
 	 * the tree features see none of the real time that passes. The
 	 * freeze is bounded by competition arrival or by @prev sleeping
 	 * (the gate requires all three queue DSQs empty, so any enqueue
 	 * ends it at the next dispatch), and the next real placement
 	 * re-anchors under the lag clamp, so the bounded-lag safety
-	 * property is unaffected; the cost is that a solo task's
+	 * property is unaffected. The cost is that a solo task's
 	 * classification gauges under-count its run until the freeze ends.
 	 *
 	 * Before keeping, the three queue DSQ heads of one remote CPU (the
 	 * rotating scan candidate) are probed: a CPU whose own queues are
 	 * empty should still pull the most-owed remote task instead of
-	 * running the previous task for a full slice; the probe is gated
+	 * running the previous task for a full slice. The probe is gated
 	 * on nr_queued and is three lockless peeks.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
@@ -503,8 +507,8 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 
 				if (nr_cpus > 1) {
 					/*
-					 * Probe the rotating scan candidate;
-					 * on a one-CPU machine there is no
+					 * Probe the rotating scan candidate.
+					 * On a one-CPU machine there is no
 					 * remote CPU to probe.
 					 */
 					cand = cpu_state ?
@@ -517,20 +521,32 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 				}
 				if (!remote_work) {
 					scx_bpf_task_set_slice(prev, slice);
+					/*
+					 * The keep grant runs @prev for a
+					 * fresh slice without a context
+					 * switch, so no ops.running() fires.
+					 * Clear the enqueue stamp of the
+					 * run-out re-enqueue, or the next
+					 * measurement would charge the whole
+					 * keep to the wait. Policy is
+					 * untouched; only the measurement
+					 * state is cleared.
+					 */
+					tctx->enq_at = 0;
 					__sync_fetch_and_add(
 						&mlfq_stats.keep_running, 1);
 					mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH,
 							  op_lat_start);
 					return;
 				}
-				/* remote work: the slot loops steal */
+				/* Remote work present. The slot loops steal. */
 			}
 		}
 	}
 
 	/*
 	 * Q1 then Q2 then Q3, each bounded by the dispatch batch. The
-	 * quotas need no clamping: init() rejects configurations with
+	 * quotas need no clamping. init() rejects configurations with
 	 * Q1+Q2 >= dispatch_max_batch, so each fixed quota always fits in
 	 * the batch remainder, and a zero remainder yields an empty slot
 	 * loop.

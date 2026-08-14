@@ -4,20 +4,19 @@
  *
  * Task lifecycle, included by main.bpf.c via #include.
  *
- * init_task/enable initialize the task context; running() records the
- * running task's queue, pid, deadline and run start, the
- * wakeup-preemption inputs; stopping() charges vruntime and the EMA
- * gauge for the run segment and
- * advances the owning queue's virtual clock with the virtual time just
- * charged; update_idle() maintains the scheduler's idle-CPU count and
- * per-CPU idle timestamps; exit_task() deletes the task storage;
- * cpu_release() re-enqueues local-DSQ leftovers when a CPU leaves the
- * scheduler.
+ * init_task and enable initialize the task context. running() records
+ * the running task's queue, pid, deadline and run start, the
+ * wakeup-preemption inputs. stopping() charges vruntime and the EMA
+ * gauge for the run segment and advances the owning queue's virtual
+ * clock with the virtual time just charged. update_idle() maintains
+ * the scheduler's idle-CPU count and per-CPU idle timestamps.
+ * exit_task() deletes the task storage. cpu_release() re-enqueues
+ * local-DSQ leftovers when a CPU leaves the scheduler.
  *
- * Runnable accounting: the per-LLC/per-queue gauges are entered
+ * Runnable accounting. The per-LLC/per-queue gauges are entered
  * at the enqueue inserts (enqueue.bpf.c) and released exactly once per
  * leave-runnable event by ops.quiescent (see below), which the kernel
- * fires on every dequeue_task_scx(); the global-park ownership
+ * fires on every dequeue_task_scx(). The global-park ownership
  * acquisition is observed at ops.running().
  */
 
@@ -37,13 +36,21 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 	tctx->flags = MLFQ_TF_FIRST_RUN;
 	tctx->wake_cpu_state = 0;
 	/*
-	 * The runnable-ownership record starts unowned: a fresh task is
+	 * The runnable-ownership record starts unowned. A fresh task is
 	 * not counted in the per-LLC/per-queue gauges until its first
 	 * tracked enqueue, and the accounting helpers key their
 	 * "not counted" branch on last_llc == MLFQ_LLC_UNOWNED.
 	 */
 	tctx->last_llc = MLFQ_LLC_UNOWNED;
 	tctx->last_qid = 0;
+	/*
+	 * The enqueue-to-run measurement block starts empty. No episode
+	 * is in flight and no latency has been measured.
+	 */
+	tctx->enq_at = 0;
+	tctx->last_wake_lat_ns = 0;
+	tctx->last_q_wait_ns = 0;
+	tctx->sq_ema = 0;
 	mlfq_reset_classification(tctx);
 }
 
@@ -64,7 +71,7 @@ void BPF_STRUCT_OPS(mlfq_enable, struct task_struct *p)
 {
 	struct task_ctx *tctx;
 
-	/* init_task() is called for every task first; be defensive here. */
+	/* init_task() is called for every task first. Be defensive here. */
 	tctx = mlfq_lookup_task_ctx(p);
 	if (!tctx)
 		return;
@@ -105,14 +112,14 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 
 	/*
 	 * Runnable-ownership acquisition for global-parked tasks. The
-	 * kernel consumes SCX_DSQ_GLOBAL into a local DSQ on
-	 * the CPU the task lands on, invisible to this BPF program, so
-	 * the ownership cannot be acquired at the enqueue (the pinned
-	 * path releases any prior ownership there); it is observed here
-	 * instead. A task arriving on a CPU with no recorded ownership
-	 * was parked globally and starts its counted episode now; a task
-	 * that was already counted at its tracked enqueue is left alone.
-	 * The llc_of_cpu() sentinel makes the call a no-op when LLC
+	 * kernel consumes SCX_DSQ_GLOBAL into a local DSQ on the CPU the
+	 * task lands on, invisible to this BPF program, so the ownership
+	 * cannot be acquired at the enqueue (the pinned path releases any
+	 * prior ownership there). It is observed here instead. A task
+	 * arriving on a CPU with no recorded ownership was parked
+	 * globally and starts its counted episode now. A task that was
+	 * already counted at its tracked enqueue is left alone. The
+	 * llc_of_cpu() sentinel makes the call a no-op when LLC
 	 * awareness is disabled.
 	 */
 	if (tctx->last_llc == MLFQ_LLC_UNOWNED)
@@ -121,6 +128,41 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 
 	tctx->last_run_at = now;
 	tctx->flags &= ~MLFQ_TF_FIRST_RUN;
+
+	/*
+	 * Enqueue-to-run measurement. The enqueue stamp (enq_at) marks
+	 * the episode start. The wait since it is the episode's queue
+	 * wait, and on a wakeup episode (MLFQ_TF_ENQ_WAKEUP, set only by
+	 * the wakeup insert paths) it is the wakeup-to-run latency, which
+	 * feeds the per-task service-quality EMA and the system
+	 * wakeup-latency gauge. A stale or future stamp (the u64 clock
+	 * wrapped) yields no measurement. This is conservative and never
+	 * a huge spurious value, and a wait beyond u32 saturates the
+	 * stored nsecs so the microsecond features cannot truncate.
+	 */
+	if (tctx->enq_at && !mlfq_time_before(now, tctx->enq_at)) {
+		u64 wait = now - tctx->enq_at;
+
+		if (wait > 0xFFFFFFFFULL)
+			wait = 0xFFFFFFFFULL;
+		tctx->last_q_wait_ns = (u32)wait;
+		if (tctx->flags & MLFQ_TF_ENQ_WAKEUP) {
+			tctx->last_wake_lat_ns = (u32)wait;
+			tctx->sq_ema = mlfq_ema_climb(tctx->sq_ema, wait,
+						      MLFQ_SQ_EMA_MAX_NS,
+						      mlfq_alpha);
+			mlfq_sys_gauge.lat_ema =
+				mlfq_sys_lat_update(mlfq_sys_gauge.lat_ema,
+						    mlfq_sys_gauge.gauge_at,
+						    now, wait,
+						    MLFQ_SYS_GAUGE_HALF_LIFE_NS,
+						    MLFQ_SYS_LAT_MAX_NS,
+						    mlfq_alpha);
+			mlfq_sys_gauge.gauge_at = now;
+		}
+	}
+	tctx->enq_at = 0;
+	tctx->flags &= ~MLFQ_TF_ENQ_WAKEUP;
 
 	__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
 
@@ -153,6 +195,9 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	struct queue_ctx *q;
 	u64 now, delta = 0;
 	u64 op_lat_start = scx_bpf_now();
+
+	/* Rate-limited adaptation step, before any state is touched. */
+	mlfq_maybe_adapt_step(op_lat_start);
 
 	tctx = mlfq_lookup_task_ctx(p);
 	if (!tctx) {
@@ -193,10 +238,10 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		}
 		/*
 		 * Advance the owning queue's virtual clock with the
-		 * virtual time just charged: the clock follows the
+		 * virtual time just charged. The clock follows the
 		 * service given to the queue, and placement anchors new
 		 * arrivals to it. The queue lookup can fail when the task's
-		 * queue state was not carried over, which is tolerated: the
+		 * queue state was not carried over, which is tolerated. The
 		 * clock only needs to be near the service point and the
 		 * placement clamp bounds the staleness.
 		 */
@@ -208,25 +253,24 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		tctx->prev_burst_ns = delta;
 
 		/*
-		 * Emit the pending training sample: the features and the
+		 * Emit the pending training sample. The features and the
 		 * queue were captured at the classification enqueue and
 		 * the label is this run segment, so the tuple is
 		 * internally consistent (the queue is emitted from
 		 * the capture snapshot, pending_queue, not from the
 		 * current queue, which later placement decisions such as
 		 * aging may have changed). Only a complete run segment
-		 * becomes a sample: a preempted segment is truncated at
+		 * becomes a sample. A preempted segment is truncated at
 		 * the takeover and would label the predictor with a
 		 * partial burst, so the emission is gated on !runnable.
-		 * This also keeps the preemption path minimal -- vruntime
-		 * charge, clock advance, EMA and stats only. The label is
-		 * clamped to MLFQ_TREE_LABEL_MAX_NS: the prediction only
+		 * This also keeps the preemption path minimal. The label is
+		 * clamped to MLFQ_TREE_LABEL_MAX_NS. The prediction only
 		 * needs the queue band, and the clamp bounds the
 		 * exact-integer range the daemon's f64 SSE sees. The
 		 * emission is rate limited by the compare-and-swap
 		 * single-winner pattern (as in mlfq_queue_advance_clock)
 		 * against the global limiter, and gated per task by the
-		 * last_sample_at spacing: only the winner of the swap
+		 * last_sample_at spacing. Only the winner of the swap
 		 * emits, and a lost swap or a closed rate-limit window
 		 * simply skips the sample, which is a sampling throttle
 		 * rather than a correctness constraint. The sample is
@@ -251,6 +295,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 							     1);
 				} else {
 					m->pid = p->pid;
+					m->version = MLFQ_TREE_SAMPLE_VERSION;
 					m->queue = tctx->pending_queue;
 					m->feats = tctx->pending_feats;
 					m->label_ns = delta < MLFQ_TREE_LABEL_MAX_NS ?
@@ -276,8 +321,8 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	}
 
 	/*
-	 * A pending sample without a run segment can never be completed:
-	 * a zero-length run carries no label. Drop the capture so a later
+	 * A pending sample without a run segment can never be completed.
+	 * A zero-length run carries no label. Drop the capture so a later
 	 * classification re-arms the pending block instead of emitting a
 	 * stale feature vector with a mismatched label.
 	 */
@@ -301,7 +346,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		cpu->run_start_at = 0;
 	}
 
-	/* Diagnostic runnable count; guard against wrap-around. */
+	/* Diagnostic runnable count. Guard against wrap-around. */
 	if (__sync_fetch_and_sub(&mlfq_stats.on_cpu, 1) == 0)
 		__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
 
@@ -309,15 +354,15 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 }
 
 /*
- * Leave-runnable accounting: the single release of the per-LLC and
- * per-queue ownership. The kernel calls
+ * Leave-runnable accounting. This is the single release of the per-LLC
+ * and per-queue ownership. The kernel calls
  * ops.quiescent on every dequeue_task_scx() (ext.c in 6.18 and 7.2,
  * identical semantics), regardless of the task's ops_state, gated only
- * on !task_on_rq_migrating -- which sched-ext tasks structurally never
+ * on !task_on_rq_migrating, which sched-ext tasks structurally never
  * hit, because transfers mark MIGRATING and exclude dequeue. The
  * callback therefore fires exactly once per task leaving the runnable
  * set, whether it leaves from a queue DSQ (sleep, exit, property or
- * class change) or from running (sleep); ops.dequeue is NOT a usable
+ * class change) or from running (sleep). ops.dequeue is NOT a usable
  * exit signal for this accounting because it fires only while ops_state
  * is QUEUED, which the dispatch moves leave set for same-rq moves and
  * clear for remote transfers. A release of a task with no recorded
@@ -337,17 +382,17 @@ void BPF_STRUCT_OPS(mlfq_quiescent, struct task_struct *p, u64 deq_flags)
 /*
  * Idle-state tracking. The kernel invokes this on every idle transition
  * of a CPU when the scheduler keeps the kernel's built-in idle tracking
- * (the KEEP_BUILTIN_IDLE flag); the callback is left unregistered when
+ * (the KEEP_BUILTIN_IDLE flag). The callback is left unregistered when
  * the flag is unavailable, and mlfq_idle_tracking gates the consumer.
  * The count mirrors the number of currently idle CPUs, so the CPU
  * selection can skip its idle scans entirely when the system is
  * saturated, which is the common case for a wake-all storm. idle_since
  * records when the CPU went idle (0 = not idle, or never observed).
- * The per-LLC mirror (mlfq_llc_idle) is the steering gate: it tells
+ * The per-LLC mirror (mlfq_llc_idle) is the steering gate. It tells
  * which LLC domains still have an idle CPU. The gate is the
  * nr_llcs-validated rodata mapping (plus the MLFQ_MAX_LLCS hard array
- * bound, so a front-end bug cannot index the bss array out of bounds);
- * an unpopulated domain map leaves the per-LLC counter untouched.
+ * bound, so a front-end bug cannot index the bss array out of bounds).
+ * An unpopulated domain map leaves the per-LLC counter untouched.
  */
 void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 {
@@ -367,7 +412,7 @@ void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 
 		/*
 		 * The per-LLC RMW is bounded by the hard array bound as
-		 * well as the populated-domain count: mlfq_llc_idle has
+		 * well as the populated-domain count. mlfq_llc_idle has
 		 * MLFQ_MAX_LLCS entries, so a front-end bug writing
 		 * mlfq_nr_llcs above 32 must not index it out of bounds.
 		 * An unmapped CPU reads the MLFQ_MAX_LLCS sentinel (the
@@ -395,13 +440,14 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
 }
 
 /*
- * CPU release (hotplug offline, exit drain, higher-priority class take-over):
- * push any leftover local-DSQ tasks back through ops.enqueue() so they
- * re-enter the queue DSQs instead of being stranded on the released CPU.
- * Normally a no-op: by discipline the local DSQ depth is at most one task,
+ * CPU release, on hotplug offline, exit drain and higher-priority class
+ * takeover, pushes any leftover local-DSQ tasks back through
+ * ops.enqueue() so they re-enter the queue DSQs instead of being
+ * stranded on the released CPU.
+ * Normally a no-op. By discipline the local DSQ depth is at most one task,
  * and a queued leftover is exactly the runnable task the CPU is leaving
  * behind. The re-enqueued leftovers land in the releasing CPU's queue
- * DSQs and are served by other CPUs' steal scans; the kernel's reenqueue
+ * DSQs and are served by other CPUs' steal scans. The kernel's reenqueue
  * guard and the stall watchdog cap the pathological loop.
  * scx_bpf_reenqueue_local() is restricted to this callback (ext.c).
  *
@@ -409,7 +455,7 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
  * (scx_bpf_reenqueue_local___v2, v6.19+), the sched_switch hook in
  * rtdl.bpf.c evacuates the local DSQ on a higher-priority-class
  * takeover, so this callback has nothing left to drain there and stays
- * out of the way; on 6.18 it is the only local-DSQ evacuation path and
+ * out of the way. On 6.18 it is the only local-DSQ evacuation path and
  * does the drain. The gate is the compat layer's ksym probe on the v2
  * kfunc, dead-folded to the drain on 6.18. The ops slot is registered on
  * every kernel (the ops initializer cannot fold the probe), so on newer

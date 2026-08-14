@@ -10,7 +10,7 @@
 //! `Metrics` corresponds to the BPF-side `struct mlfq_stats`: the type is
 //! defined in `src/bpf/intf.h` and the `volatile` instance lives in
 //! `src/bpf/main.bpf.c`, plus a userspace uptime gauge. Field names match
-//! the BPF struct 1:1; the `top` stats op reports deltas over the poll
+//! the BPF struct 1:1. The `top` stats op reports deltas over the poll
 //! interval.
 
 use std::io::Write;
@@ -58,10 +58,10 @@ pub struct Metrics {
     pub steals: u64,
     /*
      * The dispatch steal is split by cache domain (see the two-tier
-     * steal scan): the same-LLC tier moves work inside a domain, the
+     * steal scan). The same-LLC tier moves work inside a domain, the
      * cross-LLC tier moves it between domains. steals == steals_same_llc +
      * steals_cross_llc whenever the LLC data is populated (mlfq_nr_llcs
-     * > 0); a machine with LLC awareness disabled leaves the split
+     * > 0). A machine with LLC awareness disabled leaves the split
      * counters at 0 and all moves count as `steals`.
      */
     #[stat(desc = "Dispatch moves from remote queue DSQs within the same LLC")]
@@ -122,6 +122,36 @@ pub struct Metrics {
     pub tree_mae_tree_us: u64,
     #[stat(desc = "Exact EMA-baseline MAE in microseconds on the same held-out slice")]
     pub tree_mae_ema_us: u64,
+    /* Pearson correlation of the committed model's burst predictions
+     * with the labels on its held-out slice, scaled by 1000. Web UI
+     * only, so it carries no stat description. */
+    pub tree_corr_milli: i64,
+    /*
+     * System wakeup gauges and the effective adaptation state. The
+     * gauges and the effective values are instantaneous pass-throughs
+     * (the top op reports them as-is, like uptime_ns). The two counters
+     * are interval deltas like the placement counters.
+     */
+    #[stat(desc = "System wakeup-latency gauge (1s half-life EMA), microseconds")]
+    pub sys_lat_ema_us: u64,
+    #[stat(desc = "System wakeup-rate gauge (1s half-life EMA), fixed point; >> 8 = wakeups/s")]
+    pub sys_rate_ema: u64,
+    #[stat(desc = "Effective EMA Q1/Q2 band edge, microseconds")]
+    pub t_l_eff_us: u64,
+    #[stat(desc = "Effective EMA Q2/Q3 band edge, microseconds")]
+    pub t_h_eff_us: u64,
+    #[stat(desc = "Effective tree Q1/Q2 band edge, microseconds")]
+    pub t_int_eff_us: u64,
+    #[stat(desc = "Effective tree Q2/Q3 band edge, microseconds")]
+    pub t_bnd_eff_us: u64,
+    #[stat(desc = "Effective same-queue preemption residency guard, microseconds")]
+    pub guard_eff_us: u64,
+    #[stat(desc = "Adaptation shift, fixed point (FP_ONE = 1.0)")]
+    pub adapt_shift: i64,
+    #[stat(desc = "Wakeup arrivals (interval delta)")]
+    pub wakeup_total: u64,
+    #[stat(desc = "Adaptation steps run (interval delta)")]
+    pub adapt_steps: u64,
 }
 
 /// One entry of the web UI's per-CPU card grid.
@@ -181,7 +211,7 @@ const OP_LAT_EDGES_US: [u64; 7] = [
 ];
 
 /// Format one op's eight bucket counts with their microsecond edges as
-/// "low-high=count" pairs; a histogram shorter than eight buckets (the
+/// "low-high=count" pairs. A histogram shorter than eight buckets (the
 /// untracked default) formats as "n/a".
 fn fmt_op_lat(op: &[u64]) -> String {
     if op.len() < 8 {
@@ -249,11 +279,26 @@ impl Metrics {
             fmt_op_lat(self.op_lat.get(16..24).unwrap_or(&[])),
             fmt_op_lat(self.op_lat.get(24..32).unwrap_or(&[])),
         )?;
+        writeln!(
+            w,
+            "[{}] adapt: lat_ema={}us rate_ema={}w/s shift={}% T_L_eff={}us T_H_eff={}us T_INT_eff={}us T_BND_eff={}us guard_eff={}us wakeups={} steps={}",
+            crate::SCHEDULER_NAME,
+            self.sys_lat_ema_us,
+            self.sys_rate_ema >> crate::bpf_intf::mlfq_consts_FP_SHIFT,
+            self.adapt_shift * 100 / crate::bpf_intf::mlfq_consts_FP_ONE as i64,
+            self.t_l_eff_us,
+            self.t_h_eff_us,
+            self.t_int_eff_us,
+            self.t_bnd_eff_us,
+            self.guard_eff_us,
+            self.wakeup_total,
+            self.adapt_steps,
+        )?;
         Ok(())
     }
 
-    /// Interval delta: counters are wrapping deltas over the poll interval;
-    /// gauges (`on_cpu`, `uptime_ns`, the tree model metadata) pass through
+    /// Interval delta. Counters are wrapping deltas over the poll interval.
+    /// Gauges (`on_cpu`, `uptime_ns`, the tree model metadata) pass through
     /// as instantaneous values.
     pub fn delta(&self, rhs: &Self) -> Self {
         Self {
@@ -310,11 +355,23 @@ impl Metrics {
             tree_model_nodes: self.tree_model_nodes,
             tree_mae_tree_us: self.tree_mae_tree_us,
             tree_mae_ema_us: self.tree_mae_ema_us,
+            tree_corr_milli: self.tree_corr_milli,
+            /* Gauges pass through; the adaptation counters are deltas. */
+            sys_lat_ema_us: self.sys_lat_ema_us,
+            sys_rate_ema: self.sys_rate_ema,
+            t_l_eff_us: self.t_l_eff_us,
+            t_h_eff_us: self.t_h_eff_us,
+            t_int_eff_us: self.t_int_eff_us,
+            t_bnd_eff_us: self.t_bnd_eff_us,
+            guard_eff_us: self.guard_eff_us,
+            adapt_shift: self.adapt_shift,
+            wakeup_total: self.wakeup_total.wrapping_sub(rhs.wakeup_total),
+            adapt_steps: self.adapt_steps.wrapping_sub(rhs.adapt_steps),
         }
     }
 }
 
-/// Stats server definition: a single `top` op reporting interval deltas.
+/// The stats server definition. A single `top` op reporting interval deltas.
 pub fn server_data() -> StatsServerData<(), Metrics> {
     let open: Box<dyn StatsOpener<(), Metrics>> = Box::new(move |(req_ch, res_ch)| {
         req_ch.send(())?;
@@ -336,8 +393,9 @@ pub fn server_data() -> StatsServerData<(), Metrics> {
         .add_ops("top", StatsOps { open, close: None })
 }
 
-/// Monitor loop: periodically poll the stats server and print a one-line
-/// summary. Runs in its own thread (see `main.rs`); exits on shutdown.
+/// The monitor loop. It periodically polls the stats server and prints a
+/// one-line summary. It runs in its own thread (see `main.rs`) and exits
+/// on shutdown.
 pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
     scx_utils::monitor_stats::<Metrics>(
         &[],

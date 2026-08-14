@@ -54,8 +54,9 @@ pub const DEFAULT_MIN_REL_VAR_REDUCTION: f64 = 1e-3;
 /// Per-task feature vector, the mirror of `struct mlfq_tree_feats`.
 ///
 /// Field order is part of the shared ABI with the BPF sample struct and
-/// the emitted `mlfq_tree_sample` layout: `prev_burst_ns`, `sleep_ns`,
-/// `ema`, `io_wait`, `wake_cnt`.
+/// the emitted `mlfq_tree_sample` layout. `prev_burst_ns`, `sleep_ns`,
+/// `ema`, `io_wait`, `wake_cnt`, then the measured service fields
+/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct TreeFeats {
@@ -69,14 +70,26 @@ pub struct TreeFeats {
     pub io_wait: u32,
     /// Consecutive short-sleep wakeups.
     pub wake_cnt: u32,
+    /// Last wakeup-to-run latency of the task, in microseconds.
+    pub wake_lat_us: u32,
+    /// Last enqueue-to-run wait of the task, in microseconds.
+    pub queue_wait_us: u32,
+    /// Per-task service-quality EMA (nsecs), saturating.
+    pub sq_ema: u64,
 }
 
 /// One training sample, the mirror of `struct mlfq_tree_sample`.
 ///
 /// `label_ns` is the run segment that followed the feature capture; the
-/// tree regresses it against `feats`.
+/// tree regresses it against `feats`. `version` carries
+/// `MLFQ_TREE_SAMPLE_VERSION` and is checked by the daemon's parse, so
+/// a record from an out-of-tree producer fails the check instead of
+/// being misread. The BPF struct is `packed, aligned(4)` to keep the
+/// record at 68 bytes, so this mirror is packed identically; every
+/// field sits at its naturally aligned offset, and the daemon reads the
+/// record with `read_unaligned`.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct TreeSample {
     /// Emitting task.
     pub pid: u32,
@@ -86,6 +99,8 @@ pub struct TreeSample {
     pub feats: TreeFeats,
     /// Run segment that followed, in nsecs (the label).
     pub label_ns: u64,
+    /// Sample-record layout version (`MLFQ_TREE_SAMPLE_VERSION`).
+    pub version: u32,
 }
 
 /// One tree node, the byte-for-byte mirror of `struct mlfq_tree_node`.
@@ -122,7 +137,9 @@ pub struct SerializedTree {
 }
 
 /// Feature value for a feature id, matching the BPF walk's `feat[8]` slot
-/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`).
+/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..4 are the fit
+/// features, ids 5..6 the measured service fields (populated but inert,
+/// the fitter caps the split range at 5), id 7 the zeroed slot.
 fn feat_value(f: TreeFeats, id: u8) -> u64 {
     match id {
         0 => f.prev_burst_ns,
@@ -130,6 +147,8 @@ fn feat_value(f: TreeFeats, id: u8) -> u64 {
         2 => f.ema,
         3 => f.io_wait as u64,
         4 => f.wake_cnt as u64,
+        5 => f.wake_lat_us as u64,
+        6 => f.queue_wait_us as u64,
         _ => 0,
     }
 }
@@ -145,25 +164,49 @@ fn midpoint(v: u64, w: u64) -> u64 {
     v + (w - v) / 2
 }
 
-/// Sum and sum-of-squares of a node's labels, in f64 for the variance math.
-fn label_totals(samples: &[TreeSample]) -> (f64, f64) {
-    samples.iter().fold((0.0, 0.0), |(sum, sum_sq), s| {
-        let y = s.label_ns as f64;
-        (sum + y, sum_sq + y * y)
-    })
+/// A training sample paired with its recency weight, the unit the fit
+/// carries through the node partitions.
+type WeightedSample = (TreeSample, f64);
+
+/// Recency weight of each training sample, by its age in the window.
+///
+/// age_i = n - i (i = 0 is the oldest sample, n the window length) and
+/// the half-life is half the window: w_i = 2^(-age_i / (n / 2)). The
+/// newest sample weighs ~1 and the oldest exactly 2^-2 = 0.25, so the
+/// fit concentrates on the recent regime without dropping the older
+/// data entirely and no weight can underflow. Each weight is one
+/// `powf`, so there is no error accumulation across samples.
+fn sample_weights(n: usize) -> Vec<f64> {
+    let half_life = n as f64 / 2.0;
+    (0..n)
+        .map(|i| 2.0f64.powf(-((n - i) as f64) / half_life))
+        .collect()
+}
+
+/// Sum of weights, weighted sum and weighted sum-of-squares of a node's
+/// labels, in f64 for the variance math. Each sample carries its
+/// recency weight alongside it.
+fn label_totals(samples: &[WeightedSample]) -> (f64, f64, f64) {
+    samples
+        .iter()
+        .fold((0.0, 0.0, 0.0), |(sw, swy, swy2), (s, w)| {
+            let y = s.label_ns as f64;
+            (sw + w, swy + w * y, swy2 + w * y * y)
+        })
 }
 
 /// Partition a node's samples by a split, mirroring the walk's `<=`
-/// routing: `feat_value <= threshold` goes left.
+/// routing. `feat_value <= threshold` goes left. The recency weights
+/// ride along with their samples.
 fn partition(
-    samples: &[TreeSample],
+    samples: &[WeightedSample],
     feature: u8,
     threshold: u64,
-) -> (Vec<TreeSample>, Vec<TreeSample>) {
+) -> (Vec<WeightedSample>, Vec<WeightedSample>) {
     let mut left = Vec::with_capacity(samples.len());
     let mut right = Vec::with_capacity(samples.len());
     for s in samples {
-        if feat_value(s.feats, feature) <= threshold {
+        if feat_value(s.0.feats, feature) <= threshold {
             left.push(*s);
         } else {
             right.push(*s);
@@ -184,52 +227,58 @@ fn leaf_prediction(mean_ns: u64) -> u32 {
 /// Search the best binary split for a node's samples.
 ///
 /// For each feature, the samples are sorted by the feature value and the
-/// midpoints between distinct values are swept in order; the left group
-/// accumulates the label sum and sum-of-squares so the SSE of both groups
-/// is O(1) per candidate. Both groups must meet `min_samples_leaf` and the
-/// split must remove at least `min_rel_var_reduction * sse`. The first
-/// maximum-reduction split wins, so ties resolve to the smallest
-/// threshold that reaches the reduction.
+/// midpoints between distinct values are swept in order. The left group
+/// accumulates the weighted label sum and sum-of-squares so the weighted
+/// SSE of both groups is O(1) per candidate. Both groups must meet
+/// `min_samples_leaf` (a sample count, unchanged by the recency
+/// weighting) and the split must remove at least
+/// `min_rel_var_reduction * sse`. The first maximum-reduction split
+/// wins, so ties resolve to the smallest threshold that reaches the
+/// reduction.
 ///
 /// Returns `(feature, threshold)`.
 fn best_split(
-    samples: &[TreeSample],
+    samples: &[WeightedSample],
     min_samples_leaf: usize,
     sse: f64,
     min_rel_var_reduction: f64,
 ) -> Option<(u8, u64)> {
     let n = samples.len();
-    let (total_sum, total_sum_sq) = label_totals(samples);
+    let (total_w, total_wy, total_wy2) = label_totals(samples);
     let min_reduction = sse * min_rel_var_reduction;
     let mut best: Option<(u8, u64, f64)> = None;
 
     for feature in 0..MLFQ_TREE_NR_FEATURES {
-        let mut sorted: Vec<TreeSample> = samples.to_vec();
-        sorted.sort_by_key(|s| feat_value(s.feats, feature as u8));
+        let mut sorted: Vec<WeightedSample> = samples.to_vec();
+        sorted.sort_by_key(|(s, _)| feat_value(s.feats, feature as u8));
 
-        let mut sum_l = 0.0f64;
-        let mut sum_sq_l = 0.0f64;
+        let mut sw_l = 0.0f64;
+        let mut swy_l = 0.0f64;
+        let mut swy2_l = 0.0f64;
         let mut i = 0usize;
         while i < n {
-            let v = feat_value(sorted[i].feats, feature as u8);
+            let v = feat_value(sorted[i].0.feats, feature as u8);
             let mut j = i;
-            while j < n && feat_value(sorted[j].feats, feature as u8) == v {
-                let y = sorted[j].label_ns as f64;
-                sum_l += y;
-                sum_sq_l += y * y;
+            while j < n && feat_value(sorted[j].0.feats, feature as u8) == v {
+                let (s, w) = sorted[j];
+                let y = s.label_ns as f64;
+                sw_l += w;
+                swy_l += w * y;
+                swy2_l += w * y * y;
                 j += 1;
             }
 
-            /* Left group = all values <= v; a split needs a higher value. */
+            /* Left group = all values <= v. A split needs a higher value. */
             let n_l = j;
             let n_r = n - j;
             if n_l >= min_samples_leaf && n_r >= min_samples_leaf && j < n {
-                let v_next = feat_value(sorted[j].feats, feature as u8);
+                let v_next = feat_value(sorted[j].0.feats, feature as u8);
                 let threshold = midpoint(v, v_next);
-                let sse_l = sum_sq_l - sum_l * sum_l / n_l as f64;
-                let sum_r = total_sum - sum_l;
-                let sum_sq_r = total_sum_sq - sum_sq_l;
-                let sse_r = sum_sq_r - sum_r * sum_r / n_r as f64;
+                let sse_l = swy2_l - swy_l * swy_l / sw_l;
+                let sw_r = total_w - sw_l;
+                let swy_r = total_wy - swy_l;
+                let swy2_r = total_wy2 - swy2_l;
+                let sse_r = swy2_r - swy_r * swy_r / sw_r;
                 let reduction = sse - sse_l - sse_r;
 
                 if reduction > min_reduction {
@@ -254,24 +303,33 @@ fn best_split(
 /// The growth is breadth-first so the serialized node order is the
 /// level-order layout the store requires (parents before children, index
 /// 0 = root). Each node is created as a placeholder, queued, and filled
-/// when processed: a node that clears the growth limits becomes an
+/// when processed. A node that clears the growth limits becomes an
 /// internal node (two new children) and everything else becomes a leaf
-/// predicting the mean of its labels.
+/// predicting the weighted mean of its labels.
 ///
 /// Growth stops at `max_depth` edges, when either child would fall below
 /// `min_samples_leaf`, when the node budget `max_nodes` would be exceeded
 /// (every node in the tree, internal or leaf, counts), or when no split
 /// removes `min_rel_var_reduction` of the node's label variance.
 ///
-/// All arithmetic is f64 on the label sum and sum-of-squares. The labels
-/// are emitted by the BPF side clamped to `MLFQ_TREE_LABEL_MAX_NS` (see
+/// Every training sample is weighted by its recency in the window
+/// (`sample_weights`: 2^(-age/(n/2))), so the fit concentrates on the
+/// recent regime while the full window still provides the data quantity
+/// and the gates bound every publish. The weighting enters the fit as a
+/// weighted SSE. The leaf means and the variance-reduction ranking are
+/// weighted, and the `min_samples_leaf` cap still counts samples, not
+/// weight.
+///
+/// All arithmetic is f64 on the weighted label sums. The labels are
+/// emitted by the BPF side clamped to `MLFQ_TREE_LABEL_MAX_NS` (see
 /// `src/bpf/intf.h`), so the exact-integer range the SSE math sums is
 /// bounded: a label value of at most 192 ms squares to ~3.7e16, far
-/// below the f64 rounding error. The split ranking is therefore exact
-/// except for near-tied candidates containing extreme labels, where
-/// consecutive u64 values collapse in the f64 conversion and the
-/// tie-break is approximate; the daemon never sees such labels because
-/// of the emission clamp.
+/// below the f64 rounding error. The weights live in [0.25, 1], so the
+/// weighted sums stay within the same magnitude as the uniform fit and
+/// the split ranking is exact except for near-tied candidates containing
+/// extreme labels, where consecutive u64 values collapse in the f64
+/// conversion and the tie-break is approximate; the daemon never sees
+/// such labels because of the emission clamp.
 ///
 /// An empty `samples` slice or `max_nodes == 0` yields an empty tree,
 /// which `serialize_validate()` rejects; the daemon treats an empty tree
@@ -287,9 +345,11 @@ pub fn fit(
         return SerializedTree::default();
     }
 
+    let weights = sample_weights(samples.len());
+
     struct NodeSpec {
         idx: usize,
-        samples: Vec<TreeSample>,
+        samples: Vec<WeightedSample>,
         depth: usize,
     }
 
@@ -298,19 +358,28 @@ pub fn fit(
     nodes.push(TreeNode::default()); /* root placeholder */
     queue.push_back(NodeSpec {
         idx: 0,
-        samples: samples.to_vec(),
+        samples: samples.iter().copied().zip(weights).collect(),
         depth: 0,
     });
 
     while let Some(spec) = queue.pop_front() {
         let n = spec.samples.len();
-        let (sum, sum_sq) = label_totals(&spec.samples);
-        let sse = sum_sq - sum * sum / n as f64;
+        let (sw, swy, swy2) = label_totals(&spec.samples);
+        let sse = swy2 - swy * swy / sw;
 
         let splittable = spec.depth < max_depth
             && n >= 2 * min_samples_leaf
             && nodes.len() + 2 <= max_nodes
-            && sse > 0.0;
+            /*
+             * The SSE of a node with (near-)constant labels is dominated
+             * by floating-point cancellation noise, which is bounded by
+             * ~1e-13 of the squared-label magnitude. A node whose SSE
+             * sits below 1e-12 of its weighted sum-of-squares is treated
+             * as a leaf, so the splitter never chases rounding noise
+             * (a random split on a noise feature can only "reduce" that
+             * noise, and min_rel_var_reduction is far above this floor).
+             */
+            && sse > 1e-12 * swy2;
         let best = if splittable {
             best_split(&spec.samples, min_samples_leaf, sse, min_rel_var_reduction)
         } else {
@@ -346,7 +415,7 @@ pub fn fit(
             None => {
                 nodes[spec.idx] = TreeNode {
                     threshold: 0,
-                    left: leaf_prediction((sum / n as f64) as u64),
+                    left: leaf_prediction((swy / sw) as u64),
                     right: 0,
                     feature: 0,
                     pad: [0; 7],
@@ -372,7 +441,7 @@ pub fn fit(
 /// node is a leaf. A node deeper than `MLFQ_TREE_MAX_DEPTH` is therefore
 /// unreachable, and an internal node at depth `MLFQ_TREE_MAX_DEPTH`
 /// would only ever be read through the exhaustion fallback (predicting
-/// 0); both shapes are rejected, so a published tree's every reachable
+/// 0). Both shapes are rejected, so a published tree's every reachable
 /// prediction is a real leaf.
 pub fn serialize_validate(tree: &SerializedTree) -> Result<(), String> {
     let nr = tree.nodes.len();
@@ -385,7 +454,7 @@ pub fn serialize_validate(tree: &SerializedTree) -> Result<(), String> {
         ));
     }
 
-    /* BFS from the root: depth per node, rejecting the walk's cut shapes. */
+    /* BFS from the root. Depth per node, rejecting the walk's cut shapes. */
     let mut depth = vec![usize::MAX; nr];
     depth[0] = 0;
     let mut queue = VecDeque::from([0usize]);
@@ -420,7 +489,7 @@ pub fn serialize_validate(tree: &SerializedTree) -> Result<(), String> {
             }
             /*
              * Degenerate chains (left == right) are walked like any
-             * other edge; the index ordering above makes cycles
+             * other edge. The index ordering above makes cycles
              * impossible, so re-visiting a node only re-computes the
              * same depth.
              */
@@ -470,8 +539,8 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         feats.ema,
         feats.io_wait as u64,
         feats.wake_cnt as u64,
-        0,
-        0,
+        feats.wake_lat_us as u64,
+        feats.queue_wait_us as u64,
         0,
     ];
     let mask = MLFQ_TREE_MAX_NODES - 1;
@@ -494,8 +563,8 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         idx = next & mask;
     }
 
-    /* Depth exhausted: the last reachable node is the prediction only
-     * when it is a leaf; an internal node here would leak a child index
+    /* Depth exhausted. The last reachable node is the prediction only
+     * when it is a leaf. An internal node here would leak a child index
      * as a prediction, so it yields 0. */
     if idx >= tree.nodes.len() {
         return 0;
@@ -508,7 +577,7 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
     }
 }
 
-/// Publish quality gate: the tree replaces the previous model only when
+/// The publish quality gate. The tree replaces the previous model only when
 /// its holdout MAE beats the exact per-sample EMA baseline on the same
 /// holdout slice (strictly better or equal).
 ///
@@ -517,6 +586,20 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
 /// out and the previous model stays committed.
 pub fn should_publish(mae_tree: f64, mae_ema: f64) -> bool {
     mae_tree <= mae_ema
+}
+
+/// Record-layout version tag of the emitted training samples, from
+/// `enum mlfq_consts` in `src/bpf/intf.h`.
+pub const MLFQ_TREE_SAMPLE_VERSION: u32 = crate::bpf_intf::mlfq_consts_MLFQ_TREE_SAMPLE_VERSION;
+
+/// True when a parsed sample carries the current record-layout version.
+///
+/// The daemon and the BPF object compile from the same `intf.h`, so a
+/// mismatch is either an out-of-tree producer or a stale build; the
+/// check turns that into a loud drop at the parse instead of a silent
+/// misread of the feature fields.
+pub fn sample_version_matches(s: &TreeSample) -> bool {
+    s.version == MLFQ_TREE_SAMPLE_VERSION
 }
 
 /// Bit position of the active-buffer flag in the committed-tree meta
@@ -536,7 +619,7 @@ pub fn tree_meta(generation: u64, nr_nodes: usize, active: u64) -> u64 {
      * Mask the generation to its 32 meta bits before the shift. The
      * field is 32 bits wide and the wrap is unreachable (2^32 publishes
      * at the 60 s cadence is ~8200 years), so the mask is defensive
-     * hygiene: it pins the shift input to the field width, so the
+     * hygiene. It pins the shift input to the field width, so the
      * committed meta can never carry bits above the generation field
      * even if a caller passed an out-of-range value.
      */
@@ -622,6 +705,7 @@ mod tests {
     fn sample(pid: u32, sleep_ns: u64, label_ns: u64) -> TreeSample {
         TreeSample {
             pid,
+            version: MLFQ_TREE_SAMPLE_VERSION,
             queue: 1,
             feats: TreeFeats {
                 prev_burst_ns: 0,
@@ -629,6 +713,9 @@ mod tests {
                 ema: 0,
                 io_wait: 0,
                 wake_cnt: 0,
+                wake_lat_us: 0,
+                queue_wait_us: 0,
+                sq_ema: 0,
             },
             label_ns,
         }
@@ -643,8 +730,8 @@ mod tests {
             feats.ema,
             feats.io_wait as u64,
             feats.wake_cnt as u64,
-            0,
-            0,
+            feats.wake_lat_us as u64,
+            feats.queue_wait_us as u64,
             0,
         ];
         let mask = MLFQ_TREE_MAX_NODES - 1;
@@ -699,7 +786,8 @@ mod tests {
 
         // The leaf predictions must separate the classes.
         for s in &samples {
-            let pred = predict(&tree, &s.feats);
+            let feats = s.feats;
+            let pred = predict(&tree, &feats);
             if s.feats.sleep_ns < 1_000_000 {
                 assert!(
                     (90_000..=110_000).contains(&pred),
@@ -783,8 +871,9 @@ mod tests {
         // Every leaf receives at least min_samples_leaf training samples.
         let mut leaf_counts = std::collections::HashMap::new();
         for s in &samples {
+            let feats = s.feats;
             *leaf_counts
-                .entry(leaf_index(&tree, &s.feats))
+                .entry(leaf_index(&tree, &feats))
                 .or_insert(0usize) += 1;
         }
         assert!(!leaf_counts.is_empty(), "the tree must have leaves");
@@ -799,8 +888,9 @@ mod tests {
     #[test]
     fn serialize_walk_roundtrip() {
         // The walk over the serialized tree must return, for every
-        // training sample, the truncated mean of the labels routed to the
-        // sample's leaf: the sklearn-style expected value of the fit.
+        // training sample, the recency-weighted mean of the labels
+        // routed to the sample's leaf: the expected value of the
+        // weighted fit.
         let mut rng = Rng(0xABCDEF);
         let mut samples = Vec::new();
         for pid in 0..1024u32 {
@@ -815,25 +905,29 @@ mod tests {
         let tree = fit(&samples, 8, 4, 511, DEFAULT_MIN_REL_VAR_REDUCTION);
         serialize_validate(&tree).unwrap();
 
-        let mut leaf_samples: std::collections::HashMap<usize, Vec<TreeSample>> =
-            std::collections::HashMap::new();
-        for s in &samples {
-            leaf_samples
-                .entry(leaf_index(&tree, &s.feats))
-                .or_default()
-                .push(*s);
-        }
+        let n = samples.len();
+        let half_life = n as f64 / 2.0;
+        let weight_of = |i: usize| 2.0f64.powf(-((n - i) as f64) / half_life);
 
         for s in &samples {
-            let leaf = leaf_index(&tree, &s.feats);
-            let group = &leaf_samples[&leaf];
-            let mean = group.iter().map(|g| g.label_ns as f64).sum::<f64>() / group.len() as f64;
-            let expected = leaf_prediction(mean as u64) as u64;
+            let feats = s.feats; /* copy out of the packed sample */
+            let leaf = leaf_index(&tree, &feats);
+            let mut wsum = 0.0f64;
+            let mut wsum_y = 0.0f64;
+            for (j, t) in samples.iter().enumerate() {
+                let t_feats = t.feats;
+                if leaf_index(&tree, &t_feats) == leaf {
+                    wsum += weight_of(j);
+                    wsum_y += weight_of(j) * t.label_ns as f64;
+                }
+            }
+            let expected = leaf_prediction((wsum_y / wsum) as u64) as u64;
+            let pid = s.pid;
             assert_eq!(
-                predict(&tree, &s.feats),
+                predict(&tree, &feats),
                 expected,
                 "round-trip prediction for pid {} via leaf {leaf}",
-                s.pid
+                pid
             );
         }
     }
@@ -859,7 +953,13 @@ mod tests {
         serialize_validate(&tree).unwrap();
 
         let actuals: Vec<u64> = test.iter().map(|s| s.label_ns).collect();
-        let preds: Vec<u64> = test.iter().map(|s| predict(&tree, &s.feats)).collect();
+        let preds: Vec<u64> = test
+            .iter()
+            .map(|s| {
+                let feats = s.feats;
+                predict(&tree, &feats)
+            })
+            .collect();
         let mae_tree = mae(&preds, &actuals);
 
         let mean_label = train.iter().map(|s| s.label_ns as f64).sum::<f64>() / train.len() as f64;
@@ -918,13 +1018,15 @@ mod tests {
         assert_eq!(root.threshold, lo + (hi - lo) / 2);
 
         for s in &samples {
-            let pred = predict(&tree, &s.feats);
+            let feats = s.feats;
+            let pid = s.pid;
+            let pred = predict(&tree, &feats);
             let expected = if s.feats.sleep_ns == lo {
                 100_000
             } else {
                 10_000_000
             };
-            assert_eq!(pred, expected, "pid {}", s.pid);
+            assert_eq!(pred, expected, "pid {}", pid);
         }
 
         // Consecutive distinct values collapse to the lower one, which
@@ -933,8 +1035,10 @@ mod tests {
         let tree = fit(&samples, 4, 1, 31, DEFAULT_MIN_REL_VAR_REDUCTION);
         serialize_validate(&tree).unwrap();
         assert_eq!(tree.nodes[0].threshold, 100);
-        assert_eq!(predict(&tree, &samples[0].feats), 1_000);
-        assert_eq!(predict(&tree, &samples[1].feats), 9_000);
+        let f0 = samples[0].feats;
+        let f1 = samples[1].feats;
+        assert_eq!(predict(&tree, &f0), 1_000);
+        assert_eq!(predict(&tree, &f1), 9_000);
     }
 
     #[test]
@@ -1027,7 +1131,7 @@ mod tests {
     fn predict_depth_exhaustion_yields_zero_on_internal() {
         // A chain of MLFQ_TREE_MAX_DEPTH + 1 internal nodes: the walk
         // descends the first 12 edges and stops, and the node it lands
-        // on (depth 12) is internal, so the prediction must be 0 -- a
+        // on (depth 12) is internal, so the prediction must be 0. A
         // child index must never leak out as a burst.
         let mut tree = SerializedTree::default();
         for i in 0..=MLFQ_TREE_MAX_DEPTH {
@@ -1103,7 +1207,8 @@ mod tests {
         let tree = fit(&samples, 12, 2, 2048, 0.0);
         assert_eq!(tree.nodes.len(), 1, "a constant label set yields one leaf");
         assert_eq!(tree.nodes[0].right, 0);
-        assert_eq!(predict(&tree, &samples[0].feats), 123_456);
+        let feats = samples[0].feats;
+        assert_eq!(predict(&tree, &feats), 123_456);
         serialize_validate(&tree).unwrap();
     }
 
@@ -1203,8 +1308,8 @@ mod tests {
         // mirror, with identical expected outputs: a chain on
         // prev_burst_ns, mixed leaves, and a node whose raw feature id
         // is out of the populated range but masks in-bounds (0x84 ->
-        // 4 = wake_cnt). The tree is a walk spec, not a publish spec:
-        // the raw feature above 4 means serialize_validate rejects it,
+        // 4 = wake_cnt). The tree is a walk spec, not a publish spec.
+        // The raw feature above 4 means serialize_validate rejects it,
         // and published trees are validated before the walk sees them.
         let nodes = vec![
             TreeNode {
@@ -1276,9 +1381,8 @@ mod tests {
         let f = |prev: u64, sleep: u64, wake: u32| TreeFeats {
             prev_burst_ns: prev,
             sleep_ns: sleep,
-            ema: 0,
-            io_wait: 0,
             wake_cnt: wake,
+            ..TreeFeats::default()
         };
         assert_eq!(predict(&tree, &f(0, 400_000, 0)), 1_111_111);
         assert_eq!(predict(&tree, &f(0, 600_000, 0)), 2_222_222);
@@ -1301,7 +1405,8 @@ mod tests {
         assert_eq!(size_of::<TreeFeats>(), size_of::<mlfq_tree_feats>());
         assert_eq!(size_of::<TreeNode>(), size_of::<mlfq_tree_node>());
         assert_eq!(size_of::<TreeSample>(), size_of::<mlfq_tree_sample>());
-        assert_eq!(size_of::<TreeSample>(), 48);
+        assert_eq!(size_of::<TreeFeats>(), 48);
+        assert_eq!(size_of::<TreeSample>(), 68);
         assert_eq!(size_of::<TreeNode>(), 24);
 
         assert_eq!(
@@ -1321,6 +1426,21 @@ mod tests {
             offset_of!(TreeFeats, wake_cnt),
             offset_of!(mlfq_tree_feats, wake_cnt)
         );
+        assert_eq!(
+            offset_of!(TreeFeats, wake_lat_us),
+            offset_of!(mlfq_tree_feats, wake_lat_us)
+        );
+        assert_eq!(
+            offset_of!(TreeFeats, queue_wait_us),
+            offset_of!(mlfq_tree_feats, queue_wait_us)
+        );
+        assert_eq!(
+            offset_of!(TreeFeats, sq_ema),
+            offset_of!(mlfq_tree_feats, sq_ema)
+        );
+        assert_eq!(offset_of!(TreeFeats, wake_lat_us), 32);
+        assert_eq!(offset_of!(TreeFeats, queue_wait_us), 36);
+        assert_eq!(offset_of!(TreeFeats, sq_ema), 40);
 
         assert_eq!(
             offset_of!(TreeNode, threshold),
@@ -1355,6 +1475,58 @@ mod tests {
             offset_of!(TreeSample, label_ns),
             offset_of!(mlfq_tree_sample, label_ns)
         );
-        assert_eq!(offset_of!(TreeSample, label_ns), 40);
+        assert_eq!(
+            offset_of!(TreeSample, version),
+            offset_of!(mlfq_tree_sample, version)
+        );
+        assert_eq!(offset_of!(TreeSample, queue), 4);
+        assert_eq!(offset_of!(TreeSample, feats), 8);
+        assert_eq!(offset_of!(TreeSample, label_ns), 56);
+        assert_eq!(offset_of!(TreeSample, version), 64);
+    }
+
+    #[test]
+    fn sample_version_tag_is_checked() {
+        // The version tag distinguishes a current-format record from a
+        // foreign or stale one: the parse check accepts exactly the
+        // compiled-in version and nothing else.
+        let cur = TreeSample {
+            pid: 1,
+            version: MLFQ_TREE_SAMPLE_VERSION,
+            queue: 2,
+            feats: TreeFeats::default(),
+            label_ns: 0,
+        };
+        assert!(sample_version_matches(&cur));
+
+        let stale = TreeSample { version: 0, ..cur };
+        assert!(!sample_version_matches(&stale));
+        let future = TreeSample {
+            version: MLFQ_TREE_SAMPLE_VERSION + 1,
+            ..cur
+        };
+        assert!(!sample_version_matches(&future));
+    }
+
+    #[test]
+    fn recency_weights_pin_the_ends() {
+        // The recency weighting formula: the newest sample weighs ~1 and
+        // the oldest exactly 0.25, so the admitted window cannot
+        // underflow and the recent regime dominates the fit.
+        let n = 8;
+        let half_life = n as f64 / 2.0;
+        let w_newest = 2.0f64.powf(-1.0 / half_life);
+        let w_oldest = 2.0f64.powf(-(n as f64) / half_life);
+        assert!((w_oldest - 0.25).abs() < 1e-15);
+        assert!((w_newest - 1.0).abs() < 0.2);
+
+        let ws = sample_weights(n);
+        assert_eq!(ws.len(), n);
+        assert!((ws[0] - w_oldest).abs() < 1e-15);
+        assert!((ws[n - 1] - w_newest).abs() < 1e-15);
+        // Strictly increasing toward the newest.
+        for i in 0..n - 1 {
+            assert!(ws[i] < ws[i + 1]);
+        }
     }
 }
