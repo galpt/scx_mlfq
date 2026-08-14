@@ -89,7 +89,7 @@ Options.
 Examples.
 
 ```bash
-# Default: clone galpt/scx branch scx_mlfq and install everything
+# Default. Clone galpt/scx branch scx_mlfq and install everything
 sudo bash install_scx_mlfq.sh
 
 # Preview without touching the system
