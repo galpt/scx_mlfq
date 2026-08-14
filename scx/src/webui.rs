@@ -85,6 +85,8 @@ const EACCES: i32 = 13;
 static UNBLOCK_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// Latest metrics snapshot, kept behind a mutex for the HTTP handlers.
+/// The snapshot already carries the per-CPU current frequencies,
+/// refreshed in the run loop, so serving never touches sysfs.
 struct WebState {
     metrics: WebMetrics,
 }

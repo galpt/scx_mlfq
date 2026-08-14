@@ -255,7 +255,11 @@
         return;
       }
       container.innerHTML = perCpu.map(function(cpu) {
-        var freqMhz = Math.round((cpu.freq_khz || 0) / 1000);
+        var curMhz = Math.round((cpu.cur_freq_khz || 0) / 1000);
+        var maxMhz = Math.round((cpu.freq_khz || 0) / 1000);
+        var freqLabel = curMhz > 0
+          ? curMhz + ' of ' + maxMhz + ' MHz'
+          : maxMhz + ' MHz';
         var smtLabel = cpu.smt ? ' <span class="core-smt">SMT</span>' : '';
         var rtLabel = cpu.rt_occupied ? ' <span class="core-rt">RT</span>' : '';
         var qid = cpu.running_queue || 0;
@@ -263,7 +267,7 @@
         var qClass = qid > 0 ? 'core-queue' : 'core-queue idle';
         return '<div class="card core-card">' +
           '<div class="core-id">CPU ' + cpu.id + smtLabel + rtLabel + '</div>' +
-          '<div class="core-freq">' + freqMhz + ' MHz</div>' +
+          '<div class="core-freq">' + freqLabel + '</div>' +
           '<div class="core-llc">LLC ' + (cpu.llc_id || 0) + '</div>' +
           '<div class="' + qClass + '">' + qLabel + '</div>' +
           '</div>';

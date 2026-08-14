@@ -217,6 +217,14 @@ struct Scheduler<'a> {
     webui_tx: Option<crossbeam::channel::Sender<stats::WebMetrics>>,
     webui_join: Option<std::thread::JoinHandle<()>>,
     cpu_static: Vec<stats::PerCpuMetrics>,
+    /*
+     * Per-CPU current-frequency cache for the web UI, refreshed from
+     * sysfs at most once per second in the run loop. The values ride
+     * in the pushed snapshots, so a snapshot never reaches the UI with
+     * a zero current frequency because a refresh was throttled.
+     */
+    cur_freq_khz: Vec<u64>,
+    freq_read_at: Option<std::time::Instant>,
     started_at: std::time::Instant,
     /*
      * PM QoS idle-latency constraint on /dev/cpu_dma_latency, held for
@@ -471,6 +479,8 @@ impl<'a> Scheduler<'a> {
             webui_tx,
             webui_join,
             cpu_static,
+            cur_freq_khz: Vec::new(),
+            freq_read_at: None,
             started_at: std::time::Instant::now(),
             pm_qos_fd,
             rb_mgr,
@@ -553,13 +563,27 @@ impl<'a> Scheduler<'a> {
     /// Web-metrics snapshot. The raw scheduler counters plus the per-CPU
     /// state and the runnable gauges, pushed to the web UI every run-loop
     /// iteration. Gauges only, no interval deltas.
-    fn get_web_metrics(&self) -> stats::WebMetrics {
+    fn get_web_metrics(&mut self) -> stats::WebMetrics {
         let bss_data = self
             .skel
             .maps
             .bss_data
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
+
+        // Refresh the per-CPU current frequencies at most once per
+        // second, so the sysfs reads cannot grow with the push cadence.
+        let now = std::time::Instant::now();
+        if self
+            .freq_read_at
+            .is_none_or(|t| now.duration_since(t).as_secs() >= 1)
+        {
+            let nr = (bss_data.nr_cpu_ids as usize).min(MLFQ_MAX_CPUS);
+            self.cur_freq_khz = (0..nr)
+                .map(|cpu| topology::current_freq_khz(cpu as u32))
+                .collect();
+            self.freq_read_at = Some(now);
+        }
 
         // Merge the per-CPU dynamic state (running queue, running pid,
         // realtime occupancy) from the per-CPU maps into the once-per-
@@ -576,6 +600,7 @@ impl<'a> Scheduler<'a> {
         for (cpu, static_entry) in statics.iter().enumerate() {
             let mut entry = static_entry.clone().unwrap_or_default();
             entry.id = cpu as u32;
+            entry.cur_freq_khz = self.cur_freq_khz.get(cpu).copied().unwrap_or(0);
 
             let state = self.read_cpu_state(cpu);
             entry.running_queue = state.running_queue;
@@ -762,14 +787,16 @@ impl<'a> Scheduler<'a> {
                     // Push a web snapshot on the stats request too, so
                     // the UI cadence is the run-loop cadence, not the
                     // browser's 1 s poll.
+                    let web = self.get_web_metrics();
                     if let Some(ref tx) = self.webui_tx {
-                        let _ = tx.try_send(self.get_web_metrics());
+                        let _ = tx.try_send(web);
                     }
                     res_ch.send(self.get_metrics())?
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    let web = self.get_web_metrics();
                     if let Some(ref tx) = self.webui_tx {
-                        let _ = tx.try_send(self.get_web_metrics());
+                        let _ = tx.try_send(web);
                     }
                 }
                 Err(e) => Err(e)?,

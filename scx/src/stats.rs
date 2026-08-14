@@ -167,6 +167,10 @@ pub struct PerCpuMetrics {
     pub id: u32,
     /// Maximum operating frequency of the CPU, in kHz.
     pub freq_khz: u64,
+    /// Current operating frequency of the CPU, in kHz, refreshed from
+    /// sysfs at most once per second while the web UI serves stats. 0
+    /// when the cpufreq driver exposes no current frequency.
+    pub cur_freq_khz: u64,
     /// LLC domain id of the CPU (0 when the domain is unknown).
     pub llc_id: u32,
     /// True when the CPU is the non-primary thread of an SMT core, the

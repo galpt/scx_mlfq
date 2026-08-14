@@ -506,6 +506,7 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
             crate::stats::PerCpuMetrics {
                 id: *id as u32,
                 freq_khz: cpu.max_freq as u64,
+                cur_freq_khz: 0,
                 llc_id,
                 smt: core_min
                     .get(&(cpu.core_id as u32))
@@ -518,6 +519,19 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
             }
         })
         .collect()
+}
+
+/// Read a CPU's current operating frequency from sysfs, in kHz. The
+/// `scaling_cur_freq` file reflects the live frequency of the CPU,
+/// whatever the governor is doing; a missing or unreadable file (no
+/// cpufreq driver) yields 0.
+pub fn current_freq_khz(cpu: u32) -> u64 {
+    std::fs::read_to_string(format!(
+        "/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+    ))
+    .ok()
+    .and_then(|s| s.trim().parse().ok())
+    .unwrap_or(0)
 }
 
 /// Phase 2 (post-load): write the primary (big-core) membership bitmap.
