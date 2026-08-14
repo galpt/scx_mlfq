@@ -1388,20 +1388,18 @@ static void test_adapt_shift_target(void)
 	TEST_OK(mlfq_adapt_shift_target(2 * target, 0) ==
 		(s64)MLFQ_ADAPT_MAX_SHIFT,
 		"shift target: a full-range error saturates at +MAX_SHIFT");
-	TEST_OK(mlfq_adapt_shift_target(0, 0) ==
-		-(s64)MLFQ_ADAPT_MAX_SHIFT,
-		"shift target: an idle gauge saturates at -MAX_SHIFT");
+	TEST_OK(mlfq_adapt_shift_target(0, 0) == 0,
+		"shift target: an idle gauge leaves the bands at the base");
 	TEST_OK(mlfq_adapt_shift_target(target + target / 2, 0) == 64,
 		"shift target: half a target of error moves a quarter shift");
-	TEST_OK(mlfq_adapt_shift_target(target / 2, 0) == -64,
-		"shift target: half a target of deficit moves -quarter");
+	TEST_OK(mlfq_adapt_shift_target(target / 2, 0) == 0,
+		"shift target: half a target of deficit leaves the bands at the base");
 	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS,
 					MLFQ_ADAPT_RATE_GATE_HIGH + 1) ==
 		(s64)MLFQ_ADAPT_RATE_GATE_SHIFT,
 		"shift target: the rate storm gate caps the positive shift");
-	TEST_OK(mlfq_adapt_shift_target(0, MLFQ_ADAPT_RATE_GATE_HIGH + 1) ==
-		-(s64)MLFQ_ADAPT_MAX_SHIFT,
-		"shift target: the rate storm gate never touches negative shifts");
+	TEST_OK(mlfq_adapt_shift_target(0, MLFQ_ADAPT_RATE_GATE_HIGH + 1) == 0,
+		"shift target: the rate storm gate never lifts a zero target");
 	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS,
 					MLFQ_ADAPT_RATE_GATE_HIGH) ==
 		(s64)MLFQ_ADAPT_MAX_SHIFT,
@@ -1448,32 +1446,6 @@ static void test_adapt_band(void)
 		"band: the ceiling clamps the effective value");
 }
 
-static void test_adapt_guard(void)
-{
-	u64 target = MLFQ_ADAPT_TARGET_LAT_NS;
-	u64 max = MLFQ_ADAPT_GUARD_MAX_NS;
-
-	TEST_OK(mlfq_adapt_guard(target) == 0,
-		"guard: a gauge at the target keeps the guard at zero");
-	TEST_OK(mlfq_adapt_guard(MLFQ_SYS_LAT_MAX_NS) == 0,
-		"guard: latency pressure keeps the guard at zero");
-	TEST_OK(mlfq_adapt_guard(0) == max,
-		"guard: an idle gauge yields the maximum guard");
-	TEST_OK(mlfq_adapt_guard(target / 2) == max / 2,
-		"guard: a half-target gauge yields a half guard");
-	TEST_OK(mlfq_adapt_guard(0) > mlfq_adapt_guard(target / 4) &&
-		mlfq_adapt_guard(target / 4) > mlfq_adapt_guard(target / 2) &&
-		mlfq_adapt_guard(target / 2) > mlfq_adapt_guard(target * 3 / 4),
-		"guard: the guard decreases monotonically with the gauge");
-}
-
-/*
- * The disjoint floor/ceiling ranges prove the queue semantics can never
- * invert: for every shift in the whole reachable range, T_L stays below
- * T_H and T_INT below T_BOUND, each band stays within its hard bounds
- * and the guard within its own. The harness drives the full range, not
- * a sample, so the proof is exhaustive over the reachable shift state.
- */
 static void test_adapt_bands_all_shifts(void)
 {
 	s64 s;
@@ -1492,11 +1464,9 @@ static void test_adapt_bands_all_shifts(void)
 		u64 t_bnd = mlfq_adapt_band(MLFQ_TREE_T_BOUND_NS, s,
 					    MLFQ_ADAPT_T_BND_FLOOR_NS,
 					    MLFQ_ADAPT_T_BND_CEIL_NS);
-		u64 guard = mlfq_adapt_guard(0);
 
 		TEST_OK(t_l < t_h && t_int < t_bnd &&
-			mlfq_check_bands(t_l, t_h, t_int, t_bnd) &&
-			guard <= MLFQ_ADAPT_GUARD_MAX_NS,
+			mlfq_check_bands(t_l, t_h, t_int, t_bnd),
 			"bands stay ordered and bounded at shift %lld",
 			(long long)s);
 	}
@@ -1605,10 +1575,6 @@ static void test_adapt_boundary_exacts(void)
 		mlfq_adapt_shift_target(target + 1, 0) == 0,
 		"boundary: the shift target is exactly 0 on both sides of 1 ms");
 
-	/* The guard is exactly 0 at lat == target. */
-	TEST_OK(mlfq_adapt_guard(target) == 0,
-		"boundary: the guard is exactly 0 at lat == target");
-
 	/*
 	 * The rate gate is strict: at exactly 200000 << 8 it does not
 	 * gate, one above caps the positive target at +FP_ONE/4, and one
@@ -1651,12 +1617,6 @@ static void test_adapt_boundary_exacts(void)
 	TEST_OK(steps >= 5,
 		"boundary: a full swing needs at least the five-step bound");
 
-	/* The guard edges: 250 us at lat toward 0, 0 at lat >= target. */
-	TEST_OK(mlfq_adapt_guard(0) == MLFQ_ADAPT_GUARD_MAX_NS,
-		"boundary: the guard is the full 250 us at lat toward 0");
-	TEST_OK(mlfq_adapt_guard(target + 1) == 0 &&
-		mlfq_adapt_guard(2 * target) == 0,
-		"boundary: the guard is 0 at lat >= target");
 }
 
 int main(void)
@@ -1675,7 +1635,6 @@ int main(void)
 	test_adapt_shift_target();
 	test_adapt_slew();
 	test_adapt_band();
-	test_adapt_guard();
 	test_adapt_bands_all_shifts();
 	test_adapt_disabled_equals_base();
 	test_adapt_rate_step_wrap();

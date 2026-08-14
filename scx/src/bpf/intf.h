@@ -325,7 +325,12 @@ enum mlfq_consts {
 	 * boost; k = 0.5 maps a full-range gauge error to half the shift
 	 * range, and the slew caps a single step at 10% of the base, so a
 	 * full swing needs at least five steps and one bad sample can
-	 * never move the bands more than one step.
+	 * never move the bands more than one step. The shift only widens
+	 * the bands: a machine at or below the target latency keeps the
+	 * base bands, the measured-good configuration, and only a slower
+	 * machine widens them. The symmetric negative range was dropped
+	 * because narrowing the bands below the base measurably worsened
+	 * the wakeup-latency tail under load.
 	 */
 	MLFQ_ADAPT_MIN_INTERVAL_NS	= (1ULL * NSEC_PER_SEC),
 	MLFQ_ADAPT_TARGET_LAT_NS	= (1ULL * NSEC_PER_MSEC),
@@ -351,16 +356,6 @@ enum mlfq_consts {
 	MLFQ_ADAPT_T_INT_CEIL_NS	= (1600ULL * NSEC_PER_USEC),
 	MLFQ_ADAPT_T_BND_FLOOR_NS	= (1800ULL * NSEC_PER_USEC),
 	MLFQ_ADAPT_T_BND_CEIL_NS	= (4800ULL * NSEC_PER_USEC),
-
-	/*
-	 * Ceiling of the effective same-queue preemption residency guard,
-	 * in nsecs. The guard is the throughput channel of the
-	 * adaptation: it stays at zero under latency pressure (the
-	 * interactive Q1->Q1 preemption remains unconditional) and rises
-	 * to at most 250 us under throughput pressure. A quarter of the
-	 * Q1 slice, so preemption is never effectively disabled.
-	 */
-	MLFQ_ADAPT_GUARD_MAX_NS		= (250ULL * NSEC_PER_USEC),
 
 	/*
 	 * Wakeup-rate storm gate. When the system wakeup-rate gauge
@@ -854,8 +849,9 @@ struct mlfq_wakeup_counters {
  * state, which zero thresholds would map every task to Q1, can never be
  * observed). shift_fp is the slew-limited common relative shift of both
  * band pairs, in FP_SHIFT fixed point; the t_*_eff_ns fields are the
- * clamped effective band edges; guard_eff_ns is the effective same-queue
- * preemption residency guard. 48 bytes.
+ * clamped effective band edges; guard_eff_ns is the same-queue
+ * preemption residency guard, fixed at the base constant (the
+ * adaptation no longer moves it). 48 bytes.
  */
 struct mlfq_adapt_state {
 	s64 shift_fp;		/* slew-limited relative shift, FP */
@@ -1434,11 +1430,13 @@ static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
  *
  * The proportional control law of the adaptation is this.
  *
- *   shift = clamp((lat - target) * K / target, -MAX_SHIFT, +MAX_SHIFT)
+ *   shift = clamp((lat - target) * K / target, 0, +MAX_SHIFT)
  *
  * with K = FP_ONE/2, so a full-range gauge error moves the target by
- * half the shift range. The wakeup-rate storm gate caps the positive
- * target at +FP_ONE/4 when the rate gauge exceeds
+ * half the shift range. The shift only widens the bands, for the
+ * reason given at the control-law constants: a machine at or below
+ * the target latency keeps the base bands. The wakeup-rate storm gate
+ * caps the positive target at +FP_ONE/4 when the rate gauge exceeds
  * MLFQ_ADAPT_RATE_GATE_HIGH: under a wakeup storm the bands must not
  * chase the latency error as far as in the normal regime.
  *
@@ -1447,7 +1445,7 @@ static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
  * below the clamp range before the clamp applies.
  *
  * Return: The slew target, FP_SHIFT fixed point, in
- * [-MLFQ_ADAPT_MAX_SHIFT, +MLFQ_ADAPT_MAX_SHIFT].
+ * [0, +MLFQ_ADAPT_MAX_SHIFT].
  */
 static __always_inline s64 mlfq_adapt_shift_target(u64 lat_ema, u64 rate_ema)
 {
@@ -1456,18 +1454,16 @@ static __always_inline s64 mlfq_adapt_shift_target(u64 lat_ema, u64 rate_ema)
 	s64 target;
 
 	/*
-	 * BPF has no signed division, so the magnitude is scaled in u64
-	 * and the sign reapplied after the clamps. The error is at most
-	 * 15 ms and K is 128, so the product is ~1.9e9, inside u64.
+	 * BPF has no signed division, so the magnitude is scaled in u64.
+	 * A gauge at or below the target widens nothing; the error is at
+	 * most 15 ms and K is 128, so the product is ~1.9e9, inside u64.
 	 */
-	mag = err < 0 ? (u64)(-err) : (u64)err;
+	mag = err < 0 ? 0 : (u64)err;
 	scaled = mag * MLFQ_ADAPT_K / MLFQ_ADAPT_TARGET_LAT_NS;
-	target = err < 0 ? -(s64)scaled : (s64)scaled;
+	target = (s64)scaled;
 
 	if (target > (s64)MLFQ_ADAPT_MAX_SHIFT)
 		target = (s64)MLFQ_ADAPT_MAX_SHIFT;
-	if (target < -(s64)MLFQ_ADAPT_MAX_SHIFT)
-		target = -(s64)MLFQ_ADAPT_MAX_SHIFT;
 	if (rate_ema > MLFQ_ADAPT_RATE_GATE_HIGH &&
 	    target > (s64)MLFQ_ADAPT_RATE_GATE_SHIFT)
 		target = (s64)MLFQ_ADAPT_RATE_GATE_SHIFT;
@@ -1542,34 +1538,6 @@ static __always_inline u64 mlfq_adapt_band(u64 base, s64 shift_fp,
 	if (v > (s64)ceil)
 		v = (s64)ceil;
 	return (u64)v;
-}
-
-/**
- * mlfq_adapt_guard - Effective same-queue preemption residency guard.
- * @lat_ema: The wakeup-latency gauge, nsecs.
- *
- * guard = GUARD_MAX * (target - lat) / target for lat < target, 0
- * otherwise. The fraction is at most 1 (lat >= 0), so the guard never
- * exceeds MLFQ_ADAPT_GUARD_MAX_NS and needs no upper clamp. The guard
- * is the throughput channel of the adaptation. Under latency pressure
- * it stays at zero, keeping the interactive Q1->Q1 preemption
- * unconditional (the fixed default), and under throughput pressure it
- * rises to at most MLFQ_ADAPT_GUARD_MAX_NS. It is recomputed, never
- * integrated, so it is bounded and hysteresis-free.
- *
- * Overflow: the product is at most 250 us * 1 ms = 2.5e11, inside u64.
- *
- * Return: The effective guard, in nsecs.
- */
-static __always_inline u64 mlfq_adapt_guard(u64 lat_ema)
-{
-	u64 v;
-
-	if (lat_ema >= MLFQ_ADAPT_TARGET_LAT_NS)
-		return 0;
-	v = MLFQ_ADAPT_GUARD_MAX_NS *
-	    (MLFQ_ADAPT_TARGET_LAT_NS - lat_ema) / MLFQ_ADAPT_TARGET_LAT_NS;
-	return v;
 }
 
 /**

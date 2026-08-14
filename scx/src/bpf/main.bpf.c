@@ -377,7 +377,6 @@ static __always_inline void mlfq_adapt_step(u64 now, u64 elapsed)
 	mlfq_adapt_state.t_bnd_eff_ns = mlfq_adapt_band(
 		mlfq_tree_t_bound_ns, mlfq_adapt_state.shift_fp,
 		MLFQ_ADAPT_T_BND_FLOOR_NS, MLFQ_ADAPT_T_BND_CEIL_NS);
-	mlfq_adapt_state.guard_eff_ns = mlfq_adapt_guard(mlfq_sys_gauge.lat_ema);
 
 #if MLFQ_CHECK
 	if (!mlfq_check_bands(mlfq_adapt_state.t_l_eff_ns,
