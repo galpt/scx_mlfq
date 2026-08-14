@@ -33,7 +33,7 @@ Realtime tasks take a CPU over when they become runnable, since the kernel resol
 
 ## Measuring Wakeup Latency
 
-To measure the wakeup latency the scheduler delivers with cyclictest, pin the measurement threads to dedicated CPUs with `-a`, use the monotonic clock (`-c 0`), a realtime priority (`-p 99`), and the performance governor, and move the device IRQs off the measured CPUs. For percentiles, run schbench with two message threads (`-m 2`) on an otherwise quiet machine. The kernel defers timers within a task's timer slack, so cyclictest reports bound the scheduler's contribution rather than a hardware-accurate measurement.
+To measure the wakeup latency the scheduler delivers with cyclictest, pin the measurement threads to dedicated CPUs with `-a`, use the monotonic clock (`-c 0`), a realtime priority (`-p 99`), and the performance governor, and move the device IRQs off the measured CPUs. For percentiles, run schbench with two message threads (`-m 2`) on an otherwise quiet machine. `clock_nanosleep` passes the task's timer slack to the timer as an expiry range, so the kernel may defer the wakeup by up to the slack, 50 us by default. The measured value therefore includes the deferral, the interrupt path and the scheduler's wakeup latency, so cyclictest reports a conservative upper bound on the scheduler's contribution, not the scheduler's latency alone.
 
 ## Production Ready?
 
