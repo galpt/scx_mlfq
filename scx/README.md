@@ -10,7 +10,7 @@ The scheduler also implements wakeup boosts, run-out demotion, aging, a guarante
 
 ## Configuration
 
-The scheduler is deliberately knob-free. The scheduling constants are compile-time values in `src/bpf/intf.h`, and no command-line option changes the scheduling behavior, so only `--no-webui` changes the runtime footprint. The adaptive band tuning behind the compile-time constant `adapt_enabled` ships false, so the wakeup-rate gauge and the shift read zero under the shipped default while the latency gauge stays live, and there is no command-line or configuration exposure. At startup a topology banner reports the CPU count, the big-core split, the LLC domains, the SMT state and whether one LLC domain is strictly the largest. The run also holds a 10 us PM QoS constraint on `/dev/cpu_dma_latency`, the maximum tolerated idle-exit latency.
+The scheduler is deliberately knob-free. The scheduling constants are compile-time values in `src/bpf/intf.h`, and no command-line option changes the scheduling behavior, so only `--no-webui` changes the runtime footprint. The adaptive band tuning behind the compile-time constant `adapt_enabled` ships enabled. The wakeup-latency gauge reads the machine's average wakeup latency, and the wakeup-rate gauge and the band shift are live, with no command-line or configuration exposure. At startup a topology banner reports the CPU count, the big-core split, the LLC domains, the SMT state and whether one LLC domain is strictly the largest. The run also holds a 10 us PM QoS constraint on `/dev/cpu_dma_latency`, the maximum tolerated idle-exit latency.
 
 ## Web UI
 

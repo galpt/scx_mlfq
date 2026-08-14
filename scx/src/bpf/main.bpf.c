@@ -167,7 +167,7 @@ volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 * 1024 * 1024);
+	__uint(max_entries, MLFQ_SAMPLE_RING_BYTES);
 } mlfq_samples SEC(".maps");
 
 /*
@@ -247,7 +247,7 @@ const volatile u64 mlfq_tree_t_bound_ns = MLFQ_TREE_T_BOUND_NS;
  * (mlfq_init copies the rodata bases into the effective bss state), and
  * the classification consumes exactly the fixed thresholds.
  */
-const volatile bool mlfq_adapt_enabled = false;
+const volatile bool mlfq_adapt_enabled = true;
 const volatile u32 mlfq_q1_quota = MLFQ_Q1_QUOTA;
 const volatile u32 mlfq_q2_quota = MLFQ_Q2_QUOTA;
 const volatile u32 mlfq_dispatch_max_batch = MLFQ_DISPATCH_MAX_BATCH;
@@ -397,25 +397,25 @@ static __always_inline void mlfq_adapt_step(u64 now, u64 elapsed)
  * mlfq_maybe_adapt_step - Rate-limited adaptation step entry point.
  * @now: Current time.
  *
- * Runs the adaptation step at most once per MLFQ_ADAPT_MIN_INTERVAL_NS,
- * gated by the compare-and-swap single-winner pattern. The first caller
- * past the cadence wins the step and the rest fall through, so the step
- * is never run twice for one window even under load on every CPU. The
+ * Runs at most once per MLFQ_ADAPT_MIN_INTERVAL_NS, gated by the
+ * compare-and-swap single-winner pattern. The first caller past the
+ * cadence wins the step and the rest fall through, so the step is
+ * never run twice for one window even under load on every CPU. The
  * gate is checked from both callbacks that fire under load regardless
  * of direction (stopping and dispatch). On an idle system neither
- * fires, the gauges decay toward zero and the effective values hold
+ * fires, the gauges hold their values and the effective values stay
  * until the first switch steps them.
  *
- * With the adaptation disabled the step is skipped entirely. The
+ * The winner folds the accumulated wakeup waits into the latency
+ * gauge before anything else, so the gauge stays live even with the
+ * adaptation disabled. The rate fold and the shift step run only when
+ * enabled. With the default off, the rate EMA stays frozen, the
  * effective values stay at the init-time bases and the classification
  * consumes exactly the fixed thresholds.
  */
 static __always_inline void mlfq_maybe_adapt_step(u64 now)
 {
 	u64 last, elapsed;
-
-	if (!mlfq_adapt_enabled)
-		return;
 
 	last = mlfq_sys_gauge.step_at;
 	if (mlfq_time_before(now, last + MLFQ_ADAPT_MIN_INTERVAL_NS))
@@ -426,6 +426,15 @@ static __always_inline void mlfq_maybe_adapt_step(u64 now)
 
 	/* The winner measures the fold window against the pre-swap stamp. */
 	elapsed = mlfq_time_before(now, last) ? 0 : now - last;
+	mlfq_sys_gauge.lat_ema = mlfq_sys_lat_fold(
+		mlfq_sys_gauge.lat_ema, mlfq_sys_gauge.wait_total,
+		mlfq_sys_gauge.wait_count, elapsed,
+		MLFQ_SYS_GAUGE_HALF_LIFE_NS, MLFQ_SYS_LAT_MAX_NS);
+	mlfq_sys_gauge.wait_total = 0;
+	mlfq_sys_gauge.wait_count = 0;
+
+	if (!mlfq_adapt_enabled)
+		return;
 	mlfq_adapt_step(now, elapsed);
 }
 
@@ -644,5 +653,5 @@ SCX_OPS_DEFINE(mlfq_ops,
 		* stalled queue within the kernel's maximum detection
 		* latency.
 		*/
-	       .timeout_ms		= 30000,
+	       .timeout_ms		= MLFQ_OPS_TIMEOUT_MS,
 	       .name			= "mlfq");

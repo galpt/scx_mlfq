@@ -151,14 +151,8 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 			tctx->sq_ema = mlfq_ema_climb(tctx->sq_ema, wait,
 						      MLFQ_SQ_EMA_MAX_NS,
 						      mlfq_alpha);
-			mlfq_sys_gauge.lat_ema =
-				mlfq_sys_lat_update(mlfq_sys_gauge.lat_ema,
-						    mlfq_sys_gauge.gauge_at,
-						    now, wait,
-						    MLFQ_SYS_GAUGE_HALF_LIFE_NS,
-						    MLFQ_SYS_LAT_MAX_NS,
-						    mlfq_alpha);
-			mlfq_sys_gauge.gauge_at = now;
+			mlfq_sys_gauge.wait_total += wait;
+			mlfq_sys_gauge.wait_count++;
 		}
 	}
 	tctx->enq_at = 0;

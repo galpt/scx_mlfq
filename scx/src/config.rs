@@ -170,7 +170,7 @@ impl Default for Config {
             rtdl_drain_interval_ns: RTDL_DRAIN_INTERVAL_NS,
             tree_t_int_ns: TREE_T_INT_NS,
             tree_t_bound_ns: TREE_T_BOUND_NS,
-            adapt_enabled: false,
+            adapt_enabled: true,
         }
     }
 }
@@ -646,7 +646,7 @@ mod tests {
         );
         assert_eq!(cfg.tree_t_int_ns, mlfq_consts_MLFQ_TREE_T_INT_NS as u64);
         assert_eq!(cfg.tree_t_bound_ns, mlfq_consts_MLFQ_TREE_T_BOUND_NS as u64);
-        assert!(!cfg.adapt_enabled, "the adaptation ships disabled");
+        assert!(cfg.adapt_enabled, "the adaptation ships enabled");
     }
 
     #[test]
@@ -770,7 +770,7 @@ mod tests {
             .unwrap();
         assert!(cfg.adapt_enabled);
         let cfg = ConfigBuilder::default().build().unwrap();
-        assert!(!cfg.adapt_enabled);
+        assert!(cfg.adapt_enabled);
     }
 
     #[test]
@@ -783,6 +783,6 @@ mod tests {
         assert!(s.contains("rtdl_drain_interval=1000us"));
         assert!(s.contains("quotas: Q1=4 Q2=8 max_batch=32"));
         assert!(s.contains("tree_bands: T_INT=1000us T_BOUND=3000us"));
-        assert!(s.contains("adapt_enabled=false"));
+        assert!(s.contains("adapt_enabled=true"));
     }
 }

@@ -196,6 +196,18 @@
   <script>
     const el = (id) => document.getElementById(id);
 
+    // Fixed-point layout of the BPF gauges (FP_SHIFT in intf.h).
+    const FP_SHIFT = 8;
+    const FP_ONE = 1 << FP_SHIFT;
+    // A published-model correlation above this threshold counts as the
+    // model tracking the workload. The scheduler publishes only models
+    // that beat the EMA baseline on the held-out slice, so the
+    // threshold separates a meaningful fit from a weak one.
+    const SUMMARY_GOOD_CORR = 0.3;
+    // Latency bucket edges in microseconds, mirroring the MLFQ_OP_LAT_*
+    // constants in src/bpf/intf.h. Eight buckets from these seven edges.
+    const OP_LAT_EDGES_US = [2, 5, 10, 20, 50, 100, 250];
+
     function clamp(v) { return v < 0 ? 0 : v; }
 
     function fmt(n) {
@@ -224,7 +236,7 @@
     // the stats module's compact form. Bucket edges are the MLFQ_OP_LAT_*
     // constants in src/bpf/intf.h, in microseconds.
     function fmtOpLat(op) {
-      var edges = [2, 5, 10, 20, 50, 100, 250];
+      var edges = OP_LAT_EDGES_US;
       if (!op || op.length < 8) return 'n/a';
       var parts = [];
       parts.push('0-' + edges[0] + '=' + op[0]);
@@ -261,14 +273,14 @@
     // Summary prose, built from the live stats with the scheduler's
     // published rules: the committed model is the one that beat the EMA
     // baseline on its held-out slice, and its Pearson correlation with
-    // the measured bursts is the fit number. The wakeup-rate gauge reads
-    // zero in the default configuration, where the adaptive rate
-    // sampling is compiled out, so the sentence follows the data. A
-    // model that has not been published yet gets the still-learning
-    // wording instead.
+    // the measured bursts is the fit number. The wakeup-rate gauge
+    // reads zero only in the first second after attach, before the
+    // first adaptation fold, so the sentence follows the data. A model
+    // that has not been published yet gets the still-learning wording
+    // instead.
     function buildSummary(s) {
       var lat = Math.round(s.sys_lat_ema_us || 0);
-      var rate = (s.sys_rate_ema || 0) >> 8;
+      var rate = (s.sys_rate_ema || 0) >> FP_SHIFT;
       var maeTree = Math.round(s.tree_mae_tree_us || 0);
       var maeEma = Math.round(s.tree_mae_ema_us || 0);
       var corr = (s.tree_corr_milli || 0) / 1000;
@@ -280,13 +292,13 @@
           'As you can see from the wakeup-latency gauge, it shows ' + lat + ' us. ' +
           'Based on the internal rules of this scheduler, a model is published only when it beats the EMA baseline on its held-out slice, and this shows that MLFQ is adapting correctly to your workload.';
       } else {
-        tldr = corr > 0.3
+        tldr = corr > SUMMARY_GOOD_CORR
           ? 'MLFQ is working as expected and is adapting correctly to your workload.'
           : 'MLFQ is working as expected and is still adapting to your workload.';
         explanation = 'As you can see from the wakeup-latency gauge, it shows ' + lat + ' us. ' +
           (rate > 0
             ? 'The wakeup-rate gauge shows ' + fmt(rate) + ' per second, '
-            : 'The wakeup-rate gauge reads zero in the default configuration, ') +
+            : 'The wakeup-rate gauge is still warming up, ') +
           'and the classification model reports a mean absolute error of ' + maeTree + ' us, against ' + maeEma + ' us for the EMA gauge. ' +
           'Based on the internal rules of this scheduler, the final result is a model correlation of ' + corr.toFixed(2) + ', and this shows that MLFQ is correctly adapting to your workload.';
       }
@@ -335,13 +347,13 @@
       // (FP_SHIFT 8), the shift is fixed point too and shown as a percent
       // of the base band width.
       el('wakeup-lat').textContent = fmt(s.sys_lat_ema_us || 0);
-      el('wakeup-rate').textContent = fmt((s.sys_rate_ema || 0) >> 8);
+      el('wakeup-rate').textContent = fmt((s.sys_rate_ema || 0) >> FP_SHIFT);
       el('t-l-eff').textContent = fmt(s.t_l_eff_us || 0);
       el('t-h-eff').textContent = fmt(s.t_h_eff_us || 0);
       el('t-int-eff').textContent = fmt(s.t_int_eff_us || 0);
       el('t-bnd-eff').textContent = fmt(s.t_bnd_eff_us || 0);
       el('guard-eff').textContent = fmt(s.guard_eff_us || 0);
-      var shiftPct = ((s.adapt_shift || 0) * 100 / 256);
+      var shiftPct = ((s.adapt_shift || 0) * 100 / FP_ONE);
       el('adapt-shift').textContent = shiftPct.toFixed(1);
 
       // Per-LLC runnable occupancy. One chip per domain with tracked

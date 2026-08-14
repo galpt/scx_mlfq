@@ -687,10 +687,10 @@ static void test_mlfq_tree_layout(void)
 	TEST_OK(sizeof(struct mlfq_stats) % 64 == 0 &&
 		sizeof(struct mlfq_stats) == 256,
 		"mlfq_stats is padded to a 64-byte multiple (256 bytes)");
-	TEST_OK(sizeof(struct mlfq_sys_gauge) == 40 &&
+	TEST_OK(sizeof(struct mlfq_sys_gauge) == 48 &&
 		sizeof(struct mlfq_adapt_state) == 48 &&
 		sizeof(struct mlfq_wakeup_counters) == 16,
-		"the sys gauge is 40 bytes, the adapt state 48 and the per-CPU wakeup counters 16");
+		"the sys gauge is 48 bytes, the adapt state 48 and the per-CPU wakeup counters 16");
 	TEST_OK(MLFQ_TREE_PER_TASK_LIMIT_NS == 10ULL * NSEC_PER_MSEC,
 		"per-task sample limit is 10ms");
 	TEST_OK(MLFQ_TREE_LABEL_MAX_NS == MLFQ_TREE_T_BOUND_NS * 64,
@@ -1328,27 +1328,35 @@ static void test_steer_loop_bound(void)
 
 /* System wakeup gauges. */
 
-static void test_sys_lat_gauge(void)
+static void test_sys_lat_fold(void)
 {
-	u64 now = 100000000000ULL;	/* 100 s of a boot clock */
 	u64 half = MLFQ_SYS_GAUGE_HALF_LIFE_NS;
 	u64 max = MLFQ_SYS_LAT_MAX_NS;
+	u64 ema, i;
 
-	TEST_OK(mlfq_sys_lat_update(0, 0, now, max, half, max, MLFQ_ALPHA) ==
-		max,
-		"lat gauge: a single ceiling sample saturates the gauge");
-	TEST_OK(mlfq_sys_lat_update(max, now, now, 1000000, half, max,
-				    MLFQ_ALPHA) == max,
-		"lat gauge: the gauge never exceeds its ceiling");
-	TEST_OK(mlfq_sys_lat_update(max, now, now + 64 * half, 0, half, max,
-				    MLFQ_ALPHA) == 0,
-		"lat gauge: 64 half-lives of idle decay the gauge to zero");
-	TEST_OK(mlfq_sys_lat_update(max, now + 1000, now, 0, half, max,
-				    MLFQ_ALPHA) == max,
-		"lat gauge: a future sample stamp (clock wrap) yields no decay");
-	TEST_OK(mlfq_sys_lat_update(0, now, now + half, 1000000, half, max,
-				    MLFQ_ALPHA) == 12000000,
-		"lat gauge: 1ms sample after one idle half-life climbs to 12ms");
+	TEST_OK(mlfq_sys_lat_fold(500000, 1000000, 0, half, half, max) ==
+		500000,
+		"lat fold: no episodes leave the gauge untouched");
+	TEST_OK(mlfq_sys_lat_fold(0, 20000, 1, 64 * half, half, max) == 20000,
+		"lat fold: a sample after a long gap replaces the gauge");
+	TEST_OK(mlfq_sys_lat_fold(0, 2 * max, 1, 64 * half, half, max) == max,
+		"lat fold: an average beyond the ceiling clamps to it");
+	TEST_OK(mlfq_sys_lat_fold(max, max, 1, 0, half, max) == max,
+		"lat fold: the gauge never exceeds its ceiling");
+	TEST_OK(mlfq_sys_lat_fold(max, max, 1, 64 * half, 0, max) == max,
+		"lat fold: a zero half-life replaces the gauge with the average");
+	TEST_OK(mlfq_sys_lat_fold(0, 20000, 1, half, half, max) == 10000,
+		"lat fold: one half-life moves the gauge halfway to the sample");
+	TEST_OK(mlfq_sys_lat_fold(123456, 20000, 1, 0, half, max) == 123456,
+		"lat fold: a zero elapsed (clock wrap) leaves the gauge untouched");
+	TEST_OK(mlfq_sys_lat_fold(40000, 200000, 10, half, half, max) ==
+		mlfq_sys_lat_fold(40000, 2000000, 100, half, half, max),
+		"lat fold: the same average at any episode count folds the same");
+	ema = 0;
+	for (i = 0; i < 20; i++)
+		ema = mlfq_sys_lat_fold(ema, 20000, 1, half, half, max);
+	TEST_OK(ema >= 19999 && ema <= 20000,
+		"lat fold: a constant wait converges to within one ns of itself");
 }
 
 static void test_sys_rate_step(void)
@@ -1662,7 +1670,7 @@ int main(void)
 	test_clock_advance();
 	test_ema_climb();
 	test_ema_decay();
-	test_sys_lat_gauge();
+	test_sys_lat_fold();
 	test_sys_rate_step();
 	test_adapt_shift_target();
 	test_adapt_slew();

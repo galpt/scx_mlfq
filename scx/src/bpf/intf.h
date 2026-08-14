@@ -94,14 +94,18 @@ enum mlfq_consts {
 	MLFQ_T_H_NS			= (2ULL * NSEC_PER_MSEC),
 
 	/*
-	 * Ceiling of the per-task service-quality EMA and of the system
-	 * wakeup-latency gauge, in nsecs. A task that waits 100 ms in a
-	 * queue under overload saturates both at 16 ms: that is the
-	 * "latency pressure" signal the adaptation reacts to, and the
-	 * bounded ceiling keeps every downstream gauge and threshold in a
-	 * small, overflow-free range.
+	 * Ceiling of the per-task service-quality EMA, in nsecs. A task
+	 * that waits 100 ms in a queue under overload saturates at 16 ms,
+	 * the "latency pressure" signal of the per-task gauge.
 	 */
 	MLFQ_SQ_EMA_MAX_NS		= (16ULL * NSEC_PER_MSEC),
+
+	/*
+	 * Ceiling of the system wakeup-latency gauge, in nsecs. The
+	 * gauge reads the machine's average wakeup latency, and the
+	 * ceiling keeps every downstream threshold and product in a
+	 * small, overflow-free range.
+	 */
 	MLFQ_SYS_LAT_MAX_NS		= (16ULL * NSEC_PER_MSEC),
 
 	/* EMA decay half-life. */
@@ -286,6 +290,21 @@ enum mlfq_consts {
 	MLFQ_TREE_T_BOUND_NS		= (3ULL * NSEC_PER_MSEC), /* Q2/Q3 split */
 
 	/*
+	 * Size of the training-sample ring buffer, in bytes. One
+	 * megabyte holds roughly fifteen thousand sample records, a
+	 * multiple of the per-minute sample budget, so the daemon drain
+	 * cadence never finds the ring full.
+	 */
+	MLFQ_SAMPLE_RING_BYTES		= (1 * 1024 * 1024),
+
+	/*
+	 * The ops watchdog timeout, in milliseconds. The kernel's
+	 * maximum detection latency for a stalled scheduler; the
+	 * scheduler exits and the kernel reverts to CFS when it fires.
+	 */
+	MLFQ_OPS_TIMEOUT_MS		= 30000,
+
+	/*
 	 * Version tag of the emitted training-sample record layout. The
 	 * ring-buffer records are parsed by the daemon with a
 	 * byte-for-byte struct mirror compiled from this same header, and
@@ -407,6 +426,16 @@ enum mlfq_task_flags {
 	 */
 	MLFQ_TF_ENQ_WAKEUP		= 1U << 1,
 };
+
+/*
+ * Upper bound of the rate-fold window, the longest idle gap a fold may
+ * smooth over before the instantaneous rate is judged against a full
+ * minute. A multi-minute gap (the boot, a long idle stretch before the
+ * first step) must not inflate the rate beyond what one busy minute
+ * would produce. A macro, not an enum member, because the value exceeds
+ * the enum's int range and would widen the bindgen-mirrored type.
+ */
+#define MLFQ_SYS_RATE_WINDOW_MAX_NS	(60ULL * NSEC_PER_SEC)
 
 /*
  * MLFQ regression tree. The tree predicts the next CPU burst in nsecs
@@ -776,26 +805,27 @@ struct mlfq_stats {
 
 /*
  * System-level wakeup gauges, the inputs of the threshold adaptation.
- * lat_ema is a wakeup-latency EMA with its own 1 s half-life (climbed
- * at every measured wakeup episode, decayed by the wall time since the
- * last sample). rate_ema is a wakeup-rate EMA in FP_SHIFT fixed point,
- * folded once per adaptation step. step_at gates the adaptation cadence
- * (the compare-and-swap single-winner step of the adaptation layer).
- * gauge_at is the wall time of the last latency-gauge sample. The
+ * lat_ema is the average wakeup latency of the machine, an EMA over
+ * the per-window average wait, so its equilibrium does not depend on
+ * the wakeup rate. rate_ema is a wakeup-rate EMA in FP_SHIFT fixed
+ * point, folded once per adaptation step. step_at gates the adaptation
+ * cadence (the compare-and-swap single-winner step of the adaptation
+ * layer). wait_total and wait_count accumulate the episode waits
+ * between folds, and the fold derives the average from them. The
  * wakeup arrival counters live in the per-CPU map mlfq_wakeup_stats
  * (see mlfq_wakeup_counters below), not here, so the wakeup path never
  * touches this line. Each CPU owns its own map slot and the u64 totals
  * cannot wrap. The rate fold consumes the per-CPU window slots once
- * per step. While the adaptation is disabled the fold never runs and
- * the rate EMA stays frozen, but the lifetime totals still grow on
- * every wakeup and are summed at stats read (the observation-only
- * contract). 40 bytes.
+ * per step. The latency fold runs at the cadence even with the
+ * adaptation disabled, so the latency gauge stays live, while the rate
+ * fold stays gated and the rate EMA stays frozen. 48 bytes.
  */
 struct mlfq_sys_gauge {
-	u64 lat_ema;		/* wakeup-latency EMA, ns, [0, SYS_LAT_MAX] */
+	u64 lat_ema;		/* average wakeup latency, ns, [0, SYS_LAT_MAX] */
 	u64 rate_ema;		/* wakeup rate, wakeups/s in FP_SHIFT fixed point */
-	u64 gauge_at;		/* scx_bpf_now() of the last latency-gauge sample */
 	u64 step_at;		/* scx_bpf_now() of the last adaptation step */
+	u64 wait_total;		/* wakeup waits accumulated since the last fold */
+	u64 wait_count;		/* wakeup episodes since the last fold */
 	u32 adapt_steps;	/* lifetime adaptation steps */
 	u32 pad;
 };
@@ -1303,32 +1333,50 @@ static __always_inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
 }
 
 /**
- * mlfq_sys_lat_update - Update the system wakeup-latency gauge.
- * @lat_ema: The gauge, wakeup-latency EMA in nsecs.
- * @gauge_at: scx_bpf_now() of the last gauge sample (0 = never).
- * @now: Current time.
- * @wait: The measured wakeup-to-run latency, nsecs.
- * @half_life: Decay half-life (MLFQ_SYS_GAUGE_HALF_LIFE_NS).
+ * mlfq_sys_lat_fold - Fold the accumulated wakeup waits into the gauge.
+ * @lat_ema: The gauge, average wakeup latency in nsecs.
+ * @wait_total: Sum of the episode waits since the last fold.
+ * @wait_count: Number of episodes since the last fold.
+ * @elapsed: Wall time since the last fold, in nsecs.
+ * @half_life: Gauge half-life (MLFQ_SYS_GAUGE_HALF_LIFE_NS).
  * @max_ns: Gauge ceiling (MLFQ_SYS_LAT_MAX_NS).
- * @alpha: Climb aggressiveness (MLFQ_ALPHA).
  *
- * The wall time since the last sample decays the gauge (the seconds-
- * scale time constant), then the fresh wait climbs it. A stale or
- * future timestamp yields a zero elapsed time, so a clock wrap cannot
- * inject a spurious decay. The climb is the same saturating shape as
- * the per-task gauge, bounded at @max_ns by construction.
+ * The gauge is a first-order low-pass filter over the per-window
+ * average wakeup wait, the wait_sum and nr_wakeups pattern of fair.c.
+ * Episodes accumulate their wait, the fold derives the average, and
+ * the gauge moves toward the average by the decayed fraction of the
+ * gap. The time constant is the wall-clock half-life, so the
+ * equilibrium is the average wait regardless of the episode rate, and
+ * a busy desktop and a quiet server with the same per-episode wait
+ * settle on the same gauge value. A fold with no episodes leaves the
+ * gauge untouched, and the result is capped at the ceiling. A clock
+ * wrap that makes the elapsed compute to zero also leaves the gauge
+ * untouched, and the caller still resets the totals, the same
+ * convention as the rate fold.
+ *
+ * Overflow: wait_count is bounded by the episodes of one window (the
+ * caller resets the totals at every fold) and wait_total by the
+ * count times max_ns, both far inside u64.
  *
  * Return: The updated gauge.
  */
-static __always_inline u64 mlfq_sys_lat_update(u64 lat_ema, u64 gauge_at,
-					       u64 now, u64 wait,
-					       u64 half_life, u64 max_ns,
-					       u64 alpha)
+static __always_inline u64 mlfq_sys_lat_fold(u64 lat_ema, u64 wait_total,
+					     u64 wait_count, u64 elapsed,
+					     u64 half_life, u64 max_ns)
 {
-	u64 elapsed = mlfq_time_before(now, gauge_at) ? 0 : now - gauge_at;
+	u64 avg, factor, decayed, rise, v;
 
-	lat_ema = mlfq_ema_decay(lat_ema, elapsed, half_life);
-	return mlfq_ema_climb(lat_ema, wait, max_ns, alpha);
+	if (wait_count == 0)
+		return lat_ema;
+
+	avg = wait_total / wait_count;
+	if (avg > max_ns)
+		avg = max_ns;
+	factor = mlfq_ema_decay(FP_ONE, elapsed, half_life);
+	decayed = mlfq_ema_decay(lat_ema, elapsed, half_life);
+	rise = avg * (FP_ONE - factor) / FP_ONE;
+	v = decayed + rise;
+	return v > max_ns ? max_ns : v;
 }
 
 /**
@@ -1340,7 +1388,7 @@ static __always_inline u64 mlfq_sys_lat_update(u64 lat_ema, u64 gauge_at,
  * The instantaneous rate is the arrival count over the elapsed window,
  * clamped to MLFQ_SYS_RATE_MAX, and the EMA folds it at the same 1 s
  * half-life as the latency gauge. The elapsed window is clamped to
- * [MLFQ_ADAPT_MIN_INTERVAL_NS, 60 s]. The compare-and-swap gate lets
+ * [MLFQ_ADAPT_MIN_INTERVAL_NS, MLFQ_SYS_RATE_WINDOW_MAX_NS]. The compare-and-swap gate lets
  * the winner through only when at least a full interval has passed
  * since the last step, so a sub-second window is reachable only on the
  * u64 clock wrap path, where the elapsed computes to about zero. The
@@ -1364,8 +1412,8 @@ static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
 
 	if (elapsed < MLFQ_ADAPT_MIN_INTERVAL_NS)
 		elapsed = MLFQ_ADAPT_MIN_INTERVAL_NS;
-	if (elapsed > (60ULL * NSEC_PER_SEC))
-		elapsed = 60ULL * NSEC_PER_SEC;
+	if (elapsed > MLFQ_SYS_RATE_WINDOW_MAX_NS)
+		elapsed = MLFQ_SYS_RATE_WINDOW_MAX_NS;
 
 	rate_i = (u64)wakeup_cnt * NSEC_PER_SEC / elapsed;
 	if (rate_i > MLFQ_SYS_RATE_MAX)
