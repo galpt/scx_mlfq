@@ -169,7 +169,8 @@ pub struct PerCpuMetrics {
     pub freq_khz: u64,
     /// LLC domain id of the CPU (0 when the domain is unknown).
     pub llc_id: u32,
-    /// True when the CPU shares its core with a sibling thread.
+    /// True when the CPU is the non-primary thread of an SMT core, the
+    /// virtual sibling. Display-only, see `topology::web_cpu_static`.
     pub smt: bool,
     /// Queue of the currently running task (0 = idle, 1..3).
     pub running_queue: i32,

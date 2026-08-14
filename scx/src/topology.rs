@@ -471,14 +471,24 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
         .collect();
     let llcs = plan_llcs(&cpu_to_llc, &primaries, MAX_LLCS);
 
-    // SMT is the sibling table's test (sibling[i] != i): the same
-    // per-core pairing the wakeup-preference path consumes.
+    // The SMT badge marks the non-primary thread of a core: the lowest
+    // id in the core is the primary, the same anchor convention the
+    // sibling table uses for the wakeup-preference path, and every
+    // other thread of the core is its virtual sibling. The badge is
+    // display-only; the scheduling path reads the sibling table, not
+    // this flag.
     let cpu_to_core: Vec<(u32, u32)> = topo
         .all_cpus
         .iter()
         .map(|(id, cpu)| (*id as u32, cpu.core_id as u32))
         .collect();
-    let siblings = plan_sibling_table(&cpu_to_core);
+    let mut core_min: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for &(cpu, core) in &cpu_to_core {
+        core_min
+            .entry(core)
+            .and_modify(|m| *m = (*m).min(cpu))
+            .or_insert(cpu);
+    }
 
     topo.all_cpus
         .iter()
@@ -497,7 +507,11 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
                 id: *id as u32,
                 freq_khz: cpu.max_freq as u64,
                 llc_id,
-                smt: siblings.cpu_sibling.get(*id).copied().unwrap_or(*id as u32) != *id as u32,
+                smt: core_min
+                    .get(&(cpu.core_id as u32))
+                    .copied()
+                    .unwrap_or(*id as u32)
+                    != *id as u32,
                 running_queue: 0,
                 running_pid: 0,
                 rt_occupied: false,
