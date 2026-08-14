@@ -6,7 +6,7 @@
 # scx_mlfq beta uninstaller for CachyOS (sched_ext).
 #
 # Manifest-driven removal. This script does NOTHING unless the installer's
-# manifest exists at /usr/lib/scx/scx_mlfq-beta.manifest; it never touches
+# manifest exists at /usr/lib/scx/scx_mlfq-beta.manifest. It never touches
 # files that the installer did not create or record. It restores a
 # package-owned binary from the recorded backup when the installed beta
 # binary is still in place, and otherwise leaves the binary alone. It
@@ -17,7 +17,7 @@
 # scx_loader.service, /etc/default/scx and scx.service itself are never
 # modified, disabled, or removed.
 #
-# The manifest is parsed strictly: duplicate keys, unknown keys, and values
+# The manifest is parsed strictly. Duplicate keys, unknown keys, and values
 # containing control characters abort the run. Every path read from the
 # manifest is canonicalized and confined to its expected directory before
 # use, and the drop-in is removed only if its content byte-matches what the
@@ -25,16 +25,16 @@
 #
 # When the loader manifest records webui_unblock=1 (or the web UI drop-in
 # byte-matches the content the loader installer writes), the
-# mlfq-webui.conf drop-in - which lifted the network sandbox the loader
+# mlfq-webui.conf drop-in, which lifted the network sandbox the loader
 # applies to its scheduler children so the web UI can bind its loopback
-# HTTP port - is removed and systemd reloaded, restoring the sandbox. The
+# HTTP port, is removed and systemd reloaded, restoring the sandbox. The
 # removal is by fixed filename plus a byte check, so a foreign drop-in in
 # the same directory can never be touched.
 #
 # When the scheduler detaches (either because scx.service is stopped or
 # because the binary is replaced), the kernel reverts to CFS automatically.
 #
-# Usage: sudo bash uninstall_scx_mlfq.sh [options]
+# Usage. sudo bash uninstall_scx_mlfq.sh [options]
 #
 # Options:
 #   --force      Skip confirmation prompts
@@ -78,13 +78,13 @@ err()   { printf '[ERR ]  %s\n' "$1" >&2; }
 step()  { printf '\n---- %s ----\n' "$1"; }
 dry()   { printf '[DRY ]  %s\n' "$1"; }
 
-# sanitize: replace control characters with '?' so untrusted values cannot
+# sanitize. Replaces control characters with '?' so untrusted values cannot
 # inject terminal escapes or break line-oriented output.
 sanitize() {
     printf '%s' "$1" | tr '[:cntrl:]' '?'
 }
 
-# our_dropin: the exact bytes this installer owns for the scx.service drop-in.
+# our_dropin. The exact bytes this installer owns for the scx.service drop-in.
 our_dropin() {
     printf '[Service]\nExecStart=\nExecStart=/usr/bin/scx_mlfq\n'
 }
@@ -103,7 +103,7 @@ Options:
 EOF
 }
 
-# run(): execute a command, or print it under --dry-run. Never uses eval.
+# run(). Executes a command, or prints it under --dry-run. Never uses eval.
 run() {
     if [ -n "$DRY_RUN" ]; then
         dry "$*"
@@ -119,7 +119,7 @@ sha256_of() {
     fi
 }
 
-# parse_manifest: strict key=value parser. Duplicate keys, unknown keys,
+# parse_manifest. Strict key=value parser. Duplicate keys, unknown keys,
 # and values with control characters are rejected. Populates the globals
 # used by the rest of the script. Returns non-zero on any malformed line.
 parse_manifest() {
@@ -243,7 +243,7 @@ restore_or_remove_binary() {
     if [ "$ORIG_OWNER" != "none" ]; then
         info "recorded owner: $ORIG_OWNER (original was package-owned)"
         if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$INSTALLED_SHA256" ]; then
-            # Our beta binary is still in place; restore the package file.
+            # Our beta binary is still in place. Restore the package file.
             # BACKUP was verified regular (not a symlink) before we got here.
             run mv -f "$BACKUP" "$BIN_PATH"
             if [ -z "$DRY_RUN" ]; then
@@ -331,7 +331,7 @@ remove_dropin() {
         info "drop-in not present: $DROPIN"
         DROPIN_STATE="absent"
     fi
-    # Remove the parent directory only if it is now empty; never force it.
+    # Remove the parent directory only if it is now empty. Never force it.
     if [ -d "$DROPIN_DIR" ]; then
         _leftover=$(ls -A "$DROPIN_DIR" 2>/dev/null || true)
         if [ -z "$_leftover" ]; then
@@ -370,9 +370,9 @@ remove_backup() {
     fi
 }
 
-# remove_loader_entry: drop the [scheds.scx_mlfq] section the installer
+# remove_loader_entry. Drops the [scheds.scx_mlfq] section the installer
 # appended to the scx_loader config. Only a section recorded in the
-# manifest is touched; the rest of the config is preserved byte for byte.
+# manifest is touched. The rest of the config is preserved byte for byte.
 remove_loader_entry() {
     local _tmp
 
@@ -418,7 +418,7 @@ remove_loader_entry() {
     fi
 }
 
-# remove_mlfq_default: the Kernel Manager GUI writes
+# remove_mlfq_default. The Kernel Manager GUI writes
 # default_sched = "scx_mlfq" into the loader config when scx_mlfq is
 # applied as the default scheduler. The stock loader rejects the whole
 # config file when the default scheduler is an unknown variant, so the
@@ -444,7 +444,7 @@ remove_mlfq_default() {
     LOADER_DEFAULT_STATE="removed"
 }
 
-# prune_loader_config_backups: the Kernel Manager rewrites
+# prune_loader_config_backups. The Kernel Manager rewrites
 # /etc/scx_loader.toml with a timestamped backup on every apply and
 # never prunes them.  Keep the newest file so the previous config can
 # still be restored by hand, and remove the rest.
@@ -481,13 +481,13 @@ prune_loader_config_backups() {
     fi
 }
 
-# our_loader_dropin: the exact bytes the loader installer owns for the
+# our_loader_dropin. The exact bytes the loader installer owns for the
 # scx_loader.service override.
 our_loader_dropin() {
     printf '[Service]\nExecStart=\nExecStart=%s\n' "$LOADER_BIN"
 }
 
-# webui_dropin: the exact bytes the loader installer owns for the web UI
+# webui_dropin. The exact bytes the loader installer owns for the web UI
 # network unblock (mlfq-webui.conf). Byte-identical to the loader
 # installer's webui_dropin() so the byte check below is a true match.
 webui_dropin() {
@@ -507,7 +507,7 @@ webui_dropin_matches() {
     [ -f "$WEBUI_DROPIN" ] && cmp -s "$WEBUI_DROPIN" <(webui_dropin)
 }
 
-# parse_loader_manifest: strict key=value parser for the loader manifest.
+# parse_loader_manifest. Strict key=value parser for the loader manifest.
 # Duplicate keys, unknown keys, and values with control characters are
 # rejected. Populates the LOADER_* globals used by remove_loader_patch().
 parse_loader_manifest() {
@@ -572,9 +572,9 @@ parse_loader_manifest() {
     done < "$LOADER_MANIFEST"
 }
 
-# remove_loader_patch: undo the patched-loader install. The drop-in is
+# remove_loader_patch. Undoes the patched-loader install. The drop-in is
 # removed only when it byte-matches the content the loader installer
-# writes; the binaries only when their sha256 matches the manifest
+# writes. The binaries only when their sha256 matches the manifest
 # records. The stock loader then takes over at the next service start.
 remove_loader_patch() {
     if [ -z "$LOADER_BIN_MF" ] && [ -z "$LOADER_DROPIN_MF" ] && [ -z "$SCXCTL_BIN_MF" ]; then
@@ -635,7 +635,7 @@ remove_loader_patch() {
 
     if [ -n "$LOADER_BIN_STATE" ] && [ -n "$LOADER_DROPIN_STATE" ]        && { [ "$LOADER_BIN_STATE" = "removed" ] || [ "$LOADER_BIN_STATE" = "absent" ]; }        && { [ "$LOADER_DROPIN_STATE" = "removed" ] || [ "$LOADER_DROPIN_STATE" = "absent" ]; }; then
         if systemctl is-active --quiet scx_loader 2>/dev/null; then
-            # The drop-in that pointed at the patched loader is gone; reload
+            # The drop-in that pointed at the patched loader is gone. Reload
             # the unit first so the restart uses the stock ExecStart.
             run systemctl daemon-reload || true
             run systemctl restart scx_loader                 || warn 'scx_loader restart failed; the stock loader takes over at the next start'
@@ -643,7 +643,7 @@ remove_loader_patch() {
     fi
 }
 
-# report_webui_sandbox: read-only. Print the EFFECTIVE (merged) network
+# report_webui_sandbox. Read-only. Prints the EFFECTIVE (merged) network
 # restrictions of scx_loader.service so the user can see whether the
 # packaged sandbox is in force again or a foreign drop-in still lifts it.
 # systemd renders an empty RestrictAddressFamilies as '~' and omits an
@@ -675,12 +675,12 @@ report_webui_sandbox() {
     fi
 }
 
-# remove_webui_unblock: remove the mlfq-webui.conf drop-in that lifts the
+# remove_webui_unblock. Removes the mlfq-webui.conf drop-in that lifts the
 # loader's network sandbox for the web UI, reload systemd so the packaged
 # restrictions are live again, restart an active loader, and report the
 # resulting state. The drop-in is removed only when the loader manifest
 # records webui_unblock=1 OR the file byte-matches the content the loader
-# installer writes (belt-and-braces for a lost manifest). The fixed
+# installer writes (an extra check for a lost manifest). The fixed
 # filename plus the byte check make touching a foreign drop-in in the same
 # directory structurally impossible.
 remove_webui_unblock() {
@@ -729,7 +729,7 @@ remove_webui_unblock() {
     report_webui_sandbox
 }
 
-# parse_gui_manifest: strict key=value parser for the GUI manifest.
+# parse_gui_manifest. Strict key=value parser for the GUI manifest.
 # Same discipline as the beta and loader manifests.
 parse_gui_manifest() {
     local line key value seen=""
@@ -785,9 +785,9 @@ parse_gui_manifest() {
     done < "$GUI_MANIFEST"
 }
 
-# restore_gui_lib: undo the GUI library replacement. The library is
+# restore_gui_lib. Undoes the GUI library replacement. The library is
 # restored only when the backup is a regular file and the current library
-# still matches the patched build recorded in the manifest; otherwise the
+# still matches the patched build recorded in the manifest. Otherwise the
 # package has already taken the file back and only the backup/manifest are
 # removed.
 restore_gui_lib() {
@@ -831,7 +831,7 @@ restore_gui_lib() {
 
     CURRENT_SHA=$(sha256_of "$GUI_LIB")
     if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$GUI_SHA256" ]; then
-        # Our patched library is still in place; restore the original.
+        # Our patched library is still in place. Restore the original.
         if [ ! -f "$GUI_BACKUP" ] || [ -L "$GUI_BACKUP" ]; then
             err "GUI backup is missing or is a symlink: $GUI_BACKUP"
             exit 1
@@ -1022,7 +1022,7 @@ main() {
     fi
 
     # The backup is used whenever the installer replaced a package-owned
-    # file: it must then be a regular file, never a symlink. Unowned
+    # file. It must then be a regular file, never a symlink. Unowned
     # installs record the path but never create the file.
     if [ "$ORIG_OWNER" != "none" ]; then
         if [ ! -f "$BACKUP" ] || [ -L "$BACKUP" ]; then

@@ -222,7 +222,7 @@ more step is needed before the GUI can apply it (see below).
 
 ## Web UI and the loader network sandbox
 
-scx_mlfq 1.3.0 ships a realtime web UI (loopback-only, port 50005 on
+Since 1.3.0, scx_mlfq ships a realtime web UI (loopback-only, port 50005 on
 `[::1]`/`127.0.0.1`, no auth, the localhost trust boundary). The packaged
 `scx_loader.service` sandboxes the schedulers it spawns with
 `RestrictAddressFamilies=AF_UNIX` and `SocketBindDeny=...`, so a
@@ -344,7 +344,7 @@ The uninstaller is **manifest-driven and idempotent**.
 - It removes the web UI unblock drop-in
   `scx_loader.service.d/mlfq-webui.conf` only when the loader manifest
   records `webui_unblock=1` or the file byte-matches the loader
-  installer's content (belt-and-braces for a lost manifest), reloads
+  installer's content (an extra check for a lost manifest), reloads
   systemd and restarts an active loader, then reports the effective
   `RestrictAddressFamilies`/`SocketBindDeny` values. "Network sandbox
   restored", or "still lifted" when a foreign drop-in remains (reported,
@@ -357,7 +357,7 @@ The uninstaller is **manifest-driven and idempotent**.
 - It never disables or modifies `scx_loader.service` (an active loader may
   be restarted so the stock binary takes effect) and never touches
   `/etc/default/scx`. The two unrecorded edits are documented exceptions,
-  each gated: the `default_sched = "scx_mlfq"` line in the loader config
+  each gated. The `default_sched = "scx_mlfq"` line in the loader config
   when the beta manifest records `loader_entry=1`, and stale loader-config
   backups (regular files only, newest kept). Every path read from the manifests
   is confined before use. Traversal

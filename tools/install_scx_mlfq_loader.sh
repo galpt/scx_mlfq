@@ -7,7 +7,7 @@
 #
 # The CachyOS Kernel Manager GUI lists schedulers through scx_loader, and
 # the loader's supported-scheduler list is compiled into the binary.
-# scx_mlfq is not in the shipped list, so the GUI cannot select it; the
+# scx_mlfq is not in the shipped list, so the GUI cannot select it. The
 # [scheds.scx_mlfq] entry in /etc/scx_loader.toml only supplies mode flags.
 #
 # This script builds the published scx_loader crate with a patch that adds
@@ -23,7 +23,7 @@
 # PATH. Without it, scxctl cannot parse scx_mlfq and aborts on any
 # switch command.
 #
-# scx_mlfq 1.3.0 ships a loopback web UI (port 50005), but the packaged
+# Since 1.3.0, scx_mlfq ships a loopback web UI (port 50005), but the packaged
 # scx_loader.service sandboxes its scheduler children with
 # RestrictAddressFamilies=AF_UNIX + SocketBindDeny=..., so a
 # loader-spawned scx_mlfq cannot bind the port. This script writes a
@@ -32,10 +32,10 @@
 # drop-in carries a marker comment (ownership is machine-checkable), is
 # written atomically and idempotently, is recorded in the loader manifest
 # as webui_unblock=1, and is rolled back by an EXIT trap if the install
-# fails. Pass --no-webui to skip the unblock; the web UI then falls back
-# to the unix socket /tmp/scx_mlfq.sock. Security note: the drop-in is
-# per-unit, not per-binary - it lifts the network sandbox for EVERY
-# scheduler the loader spawns; systemd offers no narrower alternative.
+# fails. Pass --no-webui to skip the unblock. The web UI then falls back
+# to the unix socket /tmp/scx_mlfq.sock. Security note. The drop-in is
+# per-unit, not per-binary. It lifts the network sandbox for EVERY
+# scheduler the loader spawns. systemd offers no narrower alternative.
 #
 # The install is recorded in the scx_mlfq beta manifest
 # (/usr/lib/scx/scx_mlfq-beta.manifest) under the loader_* keys, so
@@ -43,14 +43,14 @@
 # scx_loader.service is enabled, so the patched loader (and with it the
 # GUI entry for scx_mlfq) survives reboots.
 #
-# This script is normally invoked by install_scx_mlfq.sh; run it directly to rebuild the loader layer after a package upgrade has replaced it.
+# This script is normally invoked by install_scx_mlfq.sh. Run it directly to rebuild the loader layer after a package upgrade has replaced it.
 #
-# Usage: sudo bash install_scx_mlfq_loader.sh [options]
+# Usage. sudo bash install_scx_mlfq_loader.sh [options]
 #
 # Options:
 #   --force            Replace a conflicting pre-existing loader drop-in
 #                      (backed up under /usr/lib/scx first).
-#   --no-webui         Skip the web UI network unblock; the loader sandbox
+#   --no-webui         Skip the web UI network unblock. The loader sandbox
 #                      stays in place and the web UI uses the unix socket
 #                      /tmp/scx_mlfq.sock.
 #   --dry-run          Validate inputs and print every action without
@@ -97,7 +97,7 @@ sanitize() {
     printf '%s' "$1" | tr '[:cntrl:]' '?'
 }
 
-# our_dropin: the exact bytes this installer owns for the loader override.
+# our_dropin. The exact bytes this installer owns for the loader override.
 our_dropin() {
     printf '[Service]\nExecStart=\nExecStart=%s\n' "$LOADER_BIN"
 }
@@ -107,11 +107,11 @@ our_dropin_matches() {
     [ -f "$LOADER_DROPIN" ] && cmp -s "$LOADER_DROPIN" <(our_dropin)
 }
 
-# webui_dropin: the exact bytes this installer owns for the web UI network
+# webui_dropin. The exact bytes this installer owns for the web UI network
 # unblock. Empty assignments reset the packaged
 # RestrictAddressFamilies=AF_UNIX + SocketBindDeny=... restrictions for the
 # next loader-spawned scheduler. The marker comment makes ownership
-# machine-checkable; the uninstaller removes the file only when it is
+# machine-checkable. The uninstaller removes the file only when it is
 # recorded as ours or byte-matches this content.
 webui_dropin() {
     cat <<'EOF'
@@ -139,7 +139,7 @@ Usage: sudo bash install_scx_mlfq_loader.sh [options]
 Options:
   --force     Replace a conflicting pre-existing loader drop-in
               (backed up under /usr/lib/scx first).
-  --no-webui  Skip the web UI network unblock; the loader sandbox stays
+  --no-webui  Skip the web UI network unblock. The loader sandbox stays
               in place and the web UI uses the unix socket
               /tmp/scx_mlfq.sock.
   --dry-run   Validate inputs and print every action without
@@ -171,8 +171,8 @@ check_root() {
     fi
 }
 
-# record_manifest: write the loader manifest. The loader install owns
-# this file; the beta manifest records the scheduler binary install and
+# record_manifest. Writes the loader manifest. The loader install owns
+# this file. The beta manifest records the scheduler binary install and
 # is never touched here, so either script can be re-run independently.
 # webui_unblock records whether the web UI network unblock was requested
 # (1) or skipped with --no-webui (0).
@@ -225,7 +225,7 @@ confirm_continue() {
     esac
 }
 
-# check_dropin_conflict: read-only. Refuses before any system change when
+# check_dropin_conflict. Read-only. Refuses before any system change when
 # a pre-existing drop-in differs from the content this installer writes.
 check_dropin_conflict() {
     if [ -e "$LOADER_DROPIN" ] && ! our_dropin_matches; then
@@ -270,7 +270,7 @@ fetch_and_patch_crate() {
         exit 1
     fi
 
-    # The patch lives next to this script; resolve it without relying on
+    # The patch lives next to this script. Resolve it without relying on
     # the working directory.
     _patch_dir=$(cd "$(dirname "$0")" && pwd)
     _patch_file="$_patch_dir/scx_loader-mlfq.patch"
@@ -301,7 +301,7 @@ scx_loader = { path = "scx_loader-$LOADER_CRATE_VERSION" }
 EOF
 
     info 'building the patched loader and scxctl (release profile)'
-    # Own the target directory explicitly: the caller (install_scx_mlfq.sh)
+    # Own the target directory explicitly. The caller (install_scx_mlfq.sh)
     # may have exported CARGO_TARGET_DIR for its own build. Cap the job
     # count at half the cores so the build does not saturate the machine
     # and stall the desktop it is running on.
@@ -388,11 +388,11 @@ write_dropin() {
     ok "drop-in written to $LOADER_DROPIN"
 }
 
-# check_webui_state: read-only. Query the EFFECTIVE (merged) network
+# check_webui_state. Read-only. Queries the EFFECTIVE (merged) network
 # restrictions of scx_loader.service and report whether the web UI's
 # loopback TCP bind is currently blocked. systemd renders an empty
 # RestrictAddressFamilies as '~' and omits an empty SocketBindDeny. This
-# reports but never gates the write: our drop-in is written whenever it is
+# reports but never gates the write. Our drop-in is written whenever it is
 # not byte-identical, so we own the unblock regardless of any foreign
 # drop-in that is present today.
 check_webui_state() {
@@ -419,11 +419,11 @@ check_webui_state() {
     fi
 }
 
-# install_webui_dropin: write our mlfq-webui.conf drop-in to lift the
+# install_webui_dropin. Writes our mlfq-webui.conf drop-in to lift the
 # loader's network sandbox for the web UI. Idempotent and atomic
 # (mkdir -p, mktemp in the target dir, chmod, mv -f). UNBLOCK_WRITTEN
 # is set only when THIS run actually wrote the drop-in, and never under
-# --dry-run, so the EXIT trap rolls back exactly what this run owns: it
+# --dry-run, so the EXIT trap rolls back exactly what this run owns. It
 # is inert on a dry-run and leaves a pre-existing drop-in alone when a
 # re-install fails.
 install_webui_dropin() {
@@ -533,7 +533,7 @@ cleanup() {
 reblock_if_install_failed() {
     [ "$UNBLOCK_WRITTEN" = 1 ] || return 0
     [ "$INSTALL_OK" = 1 ] && return 0
-    # Remove only the file this run wrote: the byte check keeps the
+    # Remove only the file this run wrote. The byte check keeps the
     # rollback from deleting an admin-edited drop-in that landed in the
     # window between the write and the failure.
     if [ -f "$WEBUI_DROPIN" ] && cmp -s "$WEBUI_DROPIN" <(webui_dropin); then
@@ -606,7 +606,7 @@ main() {
     printf 'Remove with:  sudo bash uninstall_scx_mlfq.sh\n'
 }
 
-# on EXIT: roll back a failed install's network unblock, then remove the
+# On EXIT, roll back a failed install's network unblock, then remove the
 # owned build directory (both handlers guard themselves). bash runs a
 # single EXIT trap, so both run here in order.
 trap 'reblock_if_install_failed; cleanup' EXIT

@@ -17,12 +17,12 @@
 # with the result. The original file is backed up and recorded in the
 # scx_mlfq GUI manifest, so uninstall_scx_mlfq.sh restores it.
 #
-# The build needs the GUI build dependencies: cmake, ninja, Qt 6 base and
+# The build needs the GUI build dependencies, namely cmake, ninja, Qt 6 base and
 # tools, and the Rust toolchain. No packages are installed by this script.
 #
-# This script is normally invoked by install_scx_mlfq.sh; run it directly to rebuild the GUI layer after a package upgrade has replaced it.
+# This script is normally invoked by install_scx_mlfq.sh. Run it directly to rebuild the GUI layer after a package upgrade has replaced it.
 #
-# Usage: sudo bash install_scx_mlfq_gui.sh [options]
+# Usage. sudo bash install_scx_mlfq_gui.sh [options]
 #
 # Options:
 #   --force            Replace a conflicting pre-existing GUI library
@@ -127,7 +127,7 @@ check_build_deps() {
     fi
 }
 
-# check_lib_conflict: read-only. Refuses before any system change when a
+# check_lib_conflict. Read-only. Refuses before any system change when a
 # pre-existing GUI library differs from the packaged one (it would be a
 # foreign build, not the package's file we know how to restore).
 check_lib_conflict() {
@@ -191,7 +191,7 @@ clone_and_vendor() {
         "$BUILD_DIR/scx-manager/scx-rustlib/Cargo.toml"
 
     info 'building the GUI (release)'
-    # Own the cargo target directory explicitly: the caller
+    # Own the cargo target directory explicitly. The caller
     # (install_scx_mlfq.sh) may have exported CARGO_TARGET_DIR for its own
     # build, and corrosion would inherit it otherwise.
     if ! (cd "$BUILD_DIR/scx-manager" \
@@ -301,7 +301,7 @@ main() {
     step 'Checking the current GUI library'
     check_lib_conflict
 
-    # Idempotency: a previous run whose library still matches the manifest
+    # Idempotency. A previous run whose library still matches the manifest
     # record needs no rebuild.
     if [ -f "$GUI_MANIFEST" ]; then
         recorded=$(sed -n 's/^gui_sha256=//p' "$GUI_MANIFEST")

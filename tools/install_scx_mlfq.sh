@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Galih Tama <galpt@v.recipes>
 #
 # scx_mlfq installer for CachyOS (sched_ext). This is the single entry
-# point: it builds scx_mlfq from the galpt/scx fork (default branch
+# point. It builds scx_mlfq from the galpt/scx fork (default branch
 # "scx_mlfq"), installs it as /usr/bin/scx_mlfq, records the install in a
 # manifest, installs a systemd drop-in so `systemctl restart scx.service`
 # starts scx_mlfq instead of the packaged default scheduler, and then
@@ -17,7 +17,7 @@
 # scx_loader is active, also stops scx_loader.service. scx_mlfq is NOT
 # auto-started. When /etc/scx_loader.toml exists, the installer appends a
 # [scheds.scx_mlfq] section so the CachyOS Kernel Manager GUI can list,
-# start and switch to scx_mlfq; the loader is left stopped rather than
+# start and switch to scx_mlfq. The loader is left stopped rather than
 # disabled.
 #
 # The install manifest is written BEFORE the binary is swapped into place,
@@ -33,27 +33,27 @@
 # manifest as loader_entry=1 so the uninstaller can remove exactly that
 # section.
 #
-# Usage: sudo bash install_scx_mlfq.sh [options]
+# Usage. sudo bash install_scx_mlfq.sh [options]
 #
 # The scheduler sources come from the standalone repository
-# (https://github.com/galpt/scx_mlfq.git, branch main); the workspace
+# (https://github.com/galpt/scx_mlfq.git, branch main). The workspace
 # repository provides the sched-ext build environment and the scheduler
 # crate is copied into its scheds/experimental/scx_mlfq/ directory.
 #
 # Options:
 #   --repo URL         Git repository to use as the build workspace
-#                      (default: https://github.com/galpt/scx.git)
+#                      (defaults to https://github.com/galpt/scx.git)
 #   --branch NAME      Branch of the build workspace
-#                      (default: scx_mlfq)
+#                      (defaults to scx_mlfq)
 #   --source-dir DIR   Build from a local scx workspace instead of cloning.
 #                      DIR must contain Cargo.toml with
 #                      scheds/experimental/scx_mlfq listed as a member.
 #                      --repo/--branch are ignored when this is set.
-#   --beta-only        Install only the scheduler binary and its drop-in;
-#                      skip the loader and GUI integration steps.
+#   --beta-only        Install only the scheduler binary and its drop-in,
+#                      skipping the loader and GUI integration steps.
 #   --force            Skip the interactive confirmation when overwriting a
-#                      package-owned /usr/bin/scx_mlfq; also backs up and
-#                      replaces a conflicting pre-existing drop-in.
+#                      package-owned /usr/bin/scx_mlfq, and back up and
+#                      replace a conflicting pre-existing drop-in.
 #   --dry-run          Validate inputs and print every action without
 #                      changing the system. Does NOT clone or build.
 #   --help, -h         Print this help text and exit.
@@ -103,19 +103,19 @@ err()   { printf '[ERR ]  %s\n' "$1" >&2; }
 step()  { printf '\n---- %s ----\n' "$1"; }
 dry()   { printf '[DRY ]  %s\n' "$1"; }
 
-# sanitize: replace control characters with '?' so untrusted values cannot
+# sanitize. Replaces control characters with '?' so untrusted values cannot
 # inject terminal escapes or break line-oriented output.
 sanitize() {
     printf '%s' "$1" | tr '[:cntrl:]' '?'
 }
 
-# our_dropin: the exact bytes this installer owns for the scx.service drop-in.
+# our_dropin. The exact bytes this installer owns for the scx.service drop-in.
 our_dropin() {
     printf '[Service]\nExecStart=\nExecStart=/usr/bin/scx_mlfq\n'
 }
 
-# our_loader_section: the scx_loader config entry this installer owns.
-# Empty mode arrays: scx_mlfq is knob-free, so no mode adds flags.
+# our_loader_section. The scx_loader config entry this installer owns.
+# Empty mode arrays. scx_mlfq is knob-free, so no mode adds flags.
 our_loader_section() {
     cat <<'EOF'
 
@@ -128,9 +128,9 @@ server_mode = []
 EOF
 }
 
-# register_loader_entry: append the [scheds.scx_mlfq] section to the
+# register_loader_entry. Appends the [scheds.scx_mlfq] section to the
 # scx_loader config so the Kernel Manager GUI lists scx_mlfq. The section
-# is appended atomically through a temp file; an existing section is left
+# is appended atomically through a temp file. An existing section is left
 # untouched. Without a loader config there is nothing to register.
 register_loader_entry() {
     local _tmp
@@ -163,7 +163,7 @@ register_loader_entry() {
     LOADER_ENTRY="1"
 }
 
-# validate_flag_value: reject control characters and leading '-' in
+# validate_flag_value. Rejects control characters and leading '-' in
 # user-supplied flag values before they are used or logged.
 validate_flag_value() {
     local flag="$1" value="$2"
@@ -194,24 +194,24 @@ Options:
                      DIR must contain Cargo.toml with
                      scheds/experimental/scx_mlfq listed as a member.
                      --repo/--branch are ignored when this is set.
-  --beta-only        Install only the scheduler binary and its drop-in;
-                     skip the loader and GUI integration steps.
+  --beta-only        Install only the scheduler binary and its drop-in,
+                     skipping the loader and GUI integration steps.
   --force            Skip the interactive confirmation when overwriting a
-                     package-owned /usr/bin/scx_mlfq; also backs up and
-                     replaces a conflicting pre-existing drop-in.
+                     package-owned /usr/bin/scx_mlfq, and back up and
+                     replace a conflicting pre-existing drop-in.
   --dry-run          Validate inputs and print every action without
                      changing the system. Does NOT clone or build.
   --help, -h         Print this help text and exit.
 
 The scheduler sources are always taken from the standalone repository
-(https://github.com/galpt/scx_mlfq.git, branch main); the workspace
+(https://github.com/galpt/scx_mlfq.git, branch main). The workspace
 repository only provides the sched-ext build environment. The scheduler
 crate is copied into scheds/experimental/scx_mlfq/ of the workspace
 before building.
 EOF
 }
 
-# run(): execute a command, or print it under --dry-run. Never uses eval.
+# run(). Executes a command, or prints it under --dry-run. Never uses eval.
 run() {
     if [ -n "$DRY_RUN" ]; then
         dry "$*"
@@ -289,7 +289,7 @@ check_sched_ext() {
 
     [ -d /sys/kernel/sched_ext ] && _sysfs="yes"
     _kcfg="/boot/config-$(uname -r)"
-    # NOTE: grep -q cannot be used in a pipe here: it exits on the first
+    # Note. grep -q cannot be used in a pipe here. It exits on the first
     # match, SIGPIPE-kills zcat, and pipefail then reports failure. grep -c
     # reads the whole stream, so it is pipefail-safe.
     if { command -v zcat >/dev/null 2>&1 \
@@ -310,7 +310,7 @@ check_sched_ext() {
 
 build_source() {
     if [ -n "$SOURCE_DIR" ]; then
-        # Local-tree override: validate and build from it.
+        # Local-tree override. Validates and builds from it.
         if [ ! -d "$SOURCE_DIR" ]; then
             err "source directory not found: $SOURCE_DIR"
             exit 1
@@ -484,7 +484,7 @@ ownership_gate() {
     esac
 }
 
-# check_dropin_conflict: read-only. Refuses before any system change when a
+# check_dropin_conflict. Read-only. Refuses before any system change when a
 # pre-existing drop-in differs from the content this installer writes.
 check_dropin_conflict() {
     if [ -e "$DROPIN" ] && ! cmp -s "$DROPIN" <(our_dropin); then
@@ -701,7 +701,7 @@ main() {
     install_dropin
 
     # The manifest is written before the drop-in step so a crash between the
-    # binary swap and the drop-in never leaves an unrecoverable state; if the
+    # binary swap and the drop-in never leaves an unrecoverable state. If the
     # drop-in step backed up a conflicting file, record that in the manifest.
     if [ -n "$dropin_backup_recorded" ]; then
         run sed -i "s|^dropin_backup=.*|dropin_backup=$dropin_backup_recorded|" "$MANIFEST"
