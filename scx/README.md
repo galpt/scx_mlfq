@@ -67,17 +67,26 @@ The limits of the approach are these. If every core is saturated by realtime tas
 
 A realtime dashboard is served on the loopback address, port 50005. The server binds `[::1]:50005` first and falls back to `127.0.0.1:50005`. When both TCP binds fail, the same pages are served over the unix socket `/tmp/scx_mlfq.sock`, created mode 0600 so connecting needs root (`sudo socat TCP-LISTEN:50005 UNIX-CONNECT:/tmp/scx_mlfq.sock` exposes it at the port). There is no authentication. The loopback address is the trust boundary, and any local process can read the scheduler's counters, which are already world-readable through the stats server. `--no-webui` disables the thread entirely, so no bind is attempted and the metrics are not collected.
 
-The page shows one card per CPU with the running queue (Q1/Q2/Q3 or idle), the realtime-occupancy flag, the frequency, the LLC domain and the SMT badge, plus the per-queue and per-LLC runnable gauges, the placement, steal, realtime and tree counters, and the per-op latency histograms. The browser polls `/api/stats` once a second. The run loop pushes a fresh snapshot every 100 ms over a small bounded channel, and the server keeps the newest one for the handlers. The unix-socket fallback is what keeps the dashboard working under the loader sandbox without the network drop-in described below.
+The page shows one card per CPU with the running queue (Q1/Q2/Q3 or idle), the realtime-occupancy flag, the frequency, the LLC domain and the SMT badge, plus the per-queue and per-LLC runnable gauges, the placement, steal, realtime and tree counters, and the per-op latency histograms. The browser polls `/api/stats` once a second. The run loop pushes a fresh snapshot every 100 ms over a small bounded channel, and the server keeps the newest one for the handlers. The unix-socket fallback keeps the dashboard working when the loader sandboxes its children, as the next subsection describes.
 
-## Installing the loader layer and the web UI network sandbox
+### The loader network sandbox
 
-The packaged `scx_loader.service` sandboxes the schedulers it spawns with `RestrictAddressFamilies=AF_UNIX` and `SocketBindDeny=...`, so a loader-spawned scx_mlfq inherits the restriction and cannot bind the TCP port. The loader installer therefore manages a systemd drop-in, `scx_loader.service.d/mlfq-webui.conf`, whose empty assignments (`RestrictAddressFamilies=`, `SocketBindDeny=`) reset both settings for the loader and the scheduler children it spawns, letting the web UI bind the loopback port.
-
-The lifecycle is managed by the installers. The installer writes the drop-in atomically and idempotently, records the unblock in its manifest, and rolls it back with an EXIT trap if the install fails afterwards. `--no-webui` skips the unblock, and the web UI then uses the unix-socket fallback, which works without the drop-in. The uninstaller removes the drop-in (only when the manifest records the unblock or the file byte-matches the installer's content), reloads systemd, restarts an active loader, and reports whether the packaged sandbox is back in effect. The fixed filename plus the byte check keep the removal scoped to this installer's own file, and a foreign drop-in under any other name in the same directory is never touched.
-
-The tradeoff is structural. The drop-in is per-unit, not per-binary. Lifting the sandbox for the loader lifts it for every scheduler the loader spawns, not just scx_mlfq, because systemd drop-ins cannot target a single child binary, and no narrower alternative exists. The tradeoff is printed by the installer, the unblock is removable through the uninstaller, and `--no-webui` avoids it entirely.
-
-The scheduler also carries a runtime form of the same lifecycle, so the dashboard self-recovers even when the loader layer is installed without the unblock (for example when scx_mlfq runs under the stock loader shipped by the distribution). The seccomp sandbox is a per-process filter the scheduler inherits from the loader, and a process cannot lift its own filter. When both TCP binds fail, the scheduler classifies the last bind error by errno. A seccomp-style denial (EPERM, EAFNOSUPPORT or EACCES) is treated as the sandbox, while a busy port (EADDRINUSE) is not. It then writes its own runtime drop-in, `/run/systemd/system/scx_loader.service.d/mlfq-webui.conf`, atomically (temp file, chmod 0644, rename) before falling back to the unix socket. The runtime drop-in mirrors the installer's file (a marker comment plus the same two empty assignments) and lifts the sandbox for the next scheduler start. The running process stays on the unix socket because its filter is already applied and inherited filters cannot be removed in place. On exit the scheduler restores the restriction. It removes the drop-in only when the file on disk is byte-identical to the one it wrote, so a foreign or user-edited file is left alone, and reloads systemd. `/run` is tmpfs, so an unclean exit that skips the restore self-heals at the next reboot. The runtime file is per-boot state under `/run` and is complementary to, and independent of, the installer's persistent `/etc` drop-in.
+A loader that sandboxes its scheduler children (for example a unit
+that applies `RestrictAddressFamilies` and `SocketBindDeny` to the
+schedulers it spawns) prevents the web UI from binding the TCP port,
+since the sandbox is a seccomp filter the scheduler inherits and
+cannot lift in place. When both TCP binds fail with a seccomp-style
+denial (EPERM, EAFNOSUPPORT or EACCES, while a busy port is not
+treated as the sandbox), the dashboard serves over the unix socket,
+and the scheduler writes a marker-owned runtime drop-in at
+`/run/systemd/system/scx_loader.service.d/mlfq-webui.conf` whose empty
+assignments reset the loader's network restrictions, so the next
+scheduler start binds the TCP port. On exit the scheduler removes the
+drop-in only when the file still matches what it wrote, reloads
+systemd, and restores the restriction. `/run` is tmpfs, so an unclean
+exit that skips the removal self-heals at the next reboot. The
+drop-in is per-unit state, so the unblock applies to every scheduler
+the loader spawns, and `--no-webui` avoids the whole path.
 
 ## Measuring wakeup latency
 
