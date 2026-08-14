@@ -27,12 +27,14 @@ The loader's network sandbox is a seccomp filter the scheduler inherits and cann
 - The topology is snapshotted at attach, so a CPU hotplug needs a restart.
 - RT and DL tasks are handled by the kernel's own classes before sched_ext.
 
-## Real-time core avoidance
+## Real-time Core Avoidance
 
 Realtime tasks take a CPU over when they become runnable, since the kernel resolves them to their own classes before sched_ext. The scheduler detects every takeover on the context switch, drains the DSQs of the taken-over CPU, and skips occupied cores in placement. If every core stays saturated for longer than the 30 s watchdog, the scheduler exits and the kernel reverts to CFS. The details live in `src/bpf/rtdl.bpf.c`.
 
-## Status
+## Measuring Wakeup Latency
 
-| Production ready | Yes |
+To measure the wakeup latency the scheduler delivers with cyclictest, pin the measurement threads to dedicated CPUs with `-a`, use the monotonic clock (`-c 0`), a realtime priority (`-p 99`), and the performance governor, and move the device IRQs off the measured CPUs. For percentiles, run schbench with two message threads (`-m 2`) on an otherwise quiet machine. The kernel defers timers within a task's timer slack, so cyclictest reports bound the scheduler's contribution rather than a hardware-accurate measurement.
 
-Verified by the project's CI stress simulation and repeated on-machine runs.
+## Production Ready?
+
+Yes
