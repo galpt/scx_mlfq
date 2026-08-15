@@ -44,7 +44,7 @@ cp -r <this-repo>/scx scheds/experimental/scx_mlfq
 rm scheds/experimental/scx_mlfq/LICENSE
 ln -s ../../../LICENSE scheds/experimental/scx_mlfq/LICENSE
 # add "scheds/experimental/scx_mlfq" to [workspace].members in Cargo.toml
-cargo build --locked            # regenerates Cargo.lock for the new member
+cargo build                    # regenerates Cargo.lock for the new member
 cargo fmt --check
 cargo test --profile ci --locked -p scx_mlfq
 git add scheds/experimental/scx_mlfq Cargo.toml Cargo.lock
