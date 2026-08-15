@@ -189,7 +189,7 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 * The evacuation is version-gated. The local DSQ is reenqueued
 	 * from anywhere only where the call-from-anywhere kfunc exists
 	 * (v6.19+), and the queue DSQs only through the generic
-	 * reenqueue (v6.20+), with three explicit constant-id calls.
+	 * reenqueue (v7.1+), with three explicit constant-id calls.
 	 * The reenqueue itself re-anchors the tasks in the queue DSQs.
 	 * The enqueue redirect then relocates them off the occupied CPU,
 	 * so the drain plus the redirect is what actually evacuates. On

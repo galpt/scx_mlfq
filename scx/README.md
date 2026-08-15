@@ -45,5 +45,5 @@ To measure the wakeup latency the scheduler delivers with cyclictest, pin the me
 - The largest-LLC bias trades clock speed for cache capacity, is Q1-only and non-exclusive, and is off on single-LLC and equal-size machines.
 - The topology is snapshotted at attach, so a CPU hotplug needs a restart.
 - RT and DL tasks are handled by the kernel's own classes before sched_ext.
-- Requires Linux 6.18 or newer. The realtime-takeover drain degrades by kernel version. On 6.18 the drain is a no-op and the kernel re-enqueues the local DSQ itself. The scheduler-side local re-enqueue needs 6.19, and the queue-DSQ re-enqueue needs 6.20.
+- Requires Linux 6.18 or newer. The realtime-takeover drain degrades by kernel version. On 6.18 the drain is a no-op and the kernel re-enqueues the local DSQ itself. The scheduler-side local re-enqueue needs 6.19, and the queue-DSQ re-enqueue needs 7.1.
 
