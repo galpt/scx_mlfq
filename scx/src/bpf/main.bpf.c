@@ -408,7 +408,7 @@ static __always_inline void mlfq_adapt_step(u64 now, u64 elapsed)
  * The winner folds the accumulated wakeup waits into the latency
  * gauge before anything else, so the gauge stays live even with the
  * adaptation disabled. The rate fold and the shift step run only when
- * enabled. With the default off, the rate EMA stays frozen, the
+ * enabled. With the adaptation disabled, the rate EMA stays frozen, the
  * effective values stay at the init-time bases and the classification
  * consumes exactly the fixed thresholds.
  */

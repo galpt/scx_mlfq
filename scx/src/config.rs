@@ -71,7 +71,7 @@ const HYSTERESIS_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_HYSTERESIS_SL
 const LONG_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_LONG_SLEEP_NS as u64;
 
 /// Minimum residency before a same-queue wakeup may preempt the running
-/// task. Zero makes the same-queue preemption a pure deadline comparison.
+/// task. Zero, the default, makes the interactive rule unconditional.
 const SAMEQ_PREEMPT_MIN_RUN_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS as u64;
 
@@ -125,7 +125,7 @@ pub struct Config {
     /// Sleep beyond which the gauge collapses, nsecs.
     pub long_sleep_ns: u64,
     /// Minimum residency before a same-queue wakeup may preempt, nsecs.
-    /// Zero makes the same-queue preemption a pure deadline comparison.
+    /// Zero, the default, makes the interactive rule unconditional.
     pub sameq_preempt_min_run_ns: u64,
     /// Slice cap for a preempting wakeup, nsecs.
     pub preempt_slice_ns: u64,
