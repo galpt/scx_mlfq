@@ -20,9 +20,9 @@ to preview what they would do.
 Rust with a BPF component. It implements a Multilevel Feedback Queue (MLFQ)
 discipline on top of EEVDF-style virtual-time scheduling. Three queues per
 CPU (Q1/Q2/Q3), each a vtime-ordered dispatch queue, hold the tasks, and a
-continuous EMA-based interactivity gauge (plus hysteresis) decides which
-queue a task lives in. Interactive-first desktop and latency workloads are
-served from Q1, batch work is demoted toward Q3. Like all sched_ext
+per-task burst gauge with hysteresis decides which queue a task lives in.
+Interactive-first desktop and latency workloads are served from Q1, batch
+work is demoted toward Q3. Like all sched_ext
 schedulers it handles **non-RT tasks only**, so the kernel's rt and dl
 classes are untouched. The scheduler attaches directly to the kernel and is
 observed through the kernel's sched_ext interface, `scx_mlfq --stats`, and,

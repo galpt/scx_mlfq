@@ -145,8 +145,6 @@ pub struct WebMetrics {
     pub queue_runnable: Vec<u64>,
     /// Tracked runnable tasks per LLC domain.
     pub llc_runnable: Vec<u64>,
-    /// Read-only snapshot of the applied scheduling constants.
-    pub config: String,
 }
 
 /// Bucket edges of the op-latency histogram, matching `enum

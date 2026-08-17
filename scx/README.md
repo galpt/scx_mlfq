@@ -5,15 +5,13 @@ scx_mlfq is a user-defined scheduler for Linux, written in Rust with a BPF core,
 
 ## Overview
 
-Tasks are classified into three per-CPU queues, Q1 for interactive tasks, Q2 for unclassified tasks and Q3 for CPU-bound tasks, with 1/2/4 ms slices served in virtual-deadline order within a bounded dispatch batch.
+Tasks are classified into three per-CPU queues. Q1 holds interactive tasks with 1 ms slices, Q2 holds unclassified tasks with 2 ms slices, and Q3 holds CPU-bound tasks with 4 ms slices. All queues serve in virtual-deadline order within a bounded dispatch batch.
 
-Classification is driven by a per-task burst gauge, a u64 integer counter in nanoseconds clamped to [0, 8.4 ms]. The gauge climbs additively by the run segment and decays at wakeup by a fixed-window CBS-period step: each full server period of sleep refunds one budget. A task that has run more than it slept accumulates gauge and eventually crosses the CPU-bound threshold; a task that sleeps enough zeroes the gauge. No exponential decay, no floating point, no machine learning.
+Classification uses a per-task burst gauge. The gauge climbs by run time and decays at wakeup by a fixed-window step. A task that has run more than it slept accumulates gauge and crosses the CPU-bound threshold. A task that sleeps enough zeroes the gauge.
 
-Queue moves happen only at period boundaries. Wakeup for promotion, run-out for demotion. Promotion is unconditional: a short-sleep or I/O boost sends the task to Q1, and a gauge-gated hysteresis promotes Q2->Q1 or Q3->Q2 after two consecutive short sleeps. Demotion runs through an 8-exhaustion gate: eight consecutive slice run-outs with the gauge above the CPU-bound threshold demote Q1->Q2 or Q2->Q3. Aging elevates any task that has sat in Q2 or Q3 for one second back to Q1. The scheduler never demotes at wakeup.
+Queue moves happen only at period boundaries. Wakeup promotes, run-out demotes. An 8-exhaustion gate demotes tasks that repeatedly exhaust their slices. Aging elevates any task that has sat in Q2 or Q3 for one second back to Q1. The scheduler never demotes at wakeup.
 
-Each queue is a CBS server with a 50% soft reservation. Within-queue FCBS budget reclaim donates unspent budget from early-completing tasks to the next task enqueued in the same queue. Queue moves follow the EDF-WMR discipline: they occur only at the two period boundaries, never mid-slice.
-
-The scheduler also implements cache-aware stealing, placement tiers, keep-path dispatch, a guaranteed Q3 share of every dispatch batch, and RT/DL kernel-side avoidance, and the details live in the code comments of the named files. Every placement clamps a task's lag to within one lag bound of its queue's virtual clock. This per-queue bounded-lag guarantee is documented in `src/bpf/intf.h`.
+Each queue is a CBS server with a 50% soft reservation. Early-completing tasks donate unspent budget to the next task in the same queue. The scheduler also implements cache-aware stealing, placement tiers, keep-path dispatch, a guaranteed Q3 share of every dispatch batch, and RT/DL kernel-side avoidance. Every placement clamps a task's lag to within one lag bound of its queue's virtual clock. The details live in the code comments.
 
 
 ## Production Ready?
@@ -23,7 +21,7 @@ Yes
 
 ## Configuration
 
-The scheduler is deliberately knob-free. The scheduling constants are compile-time values in `src/bpf/intf.h`, and no command-line option changes the scheduling behavior. The runtime footprint depends only on the reporting options, which are `--stats`, `--monitor` and `--no-webui`. At startup a topology banner reports the CPU count, the big-core split, the LLC domains, the SMT state and whether one LLC domain is strictly the largest. The run also holds a 10 us PM QoS constraint on `/dev/cpu_dma_latency`, the maximum tolerated idle-exit latency.
+The scheduler is deliberately knob-free. The scheduling constants are compile-time values in `src/bpf/intf.h`, and no command-line option changes the scheduling behavior. The runtime footprint depends only on the reporting options (`--stats`, `--monitor`, `--no-webui`). At startup a topology banner reports the CPU count, the big-core split, the LLC domains, the SMT state, and whether one LLC domain is strictly the largest. The run also holds a 10 us PM QoS constraint on `/dev/cpu_dma_latency`.
 
 
 ## Web UI

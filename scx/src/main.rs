@@ -149,9 +149,6 @@ struct Scheduler<'a> {
      */
     #[expect(dead_code)]
     pm_qos_fd: Option<std::fs::File>,
-    /// Read-only snapshot of the applied scheduling constants, pushed
-    /// with every web metrics update.
-    config_desc: String,
 }
 
 impl<'a> Scheduler<'a> {
@@ -174,8 +171,6 @@ impl<'a> Scheduler<'a> {
         config.validate()?;
         config.apply(&mut skel)?;
         info!("Config: {}", config.describe());
-
-        let config_desc = config.describe();
 
         // Hybrid-capacity, cache-domain and NUMA placement data also goes
         // into rodata pre-load.
@@ -308,7 +303,6 @@ impl<'a> Scheduler<'a> {
             freq_read_at: None,
             started_at: std::time::Instant::now(),
             pm_qos_fd,
-            config_desc,
         })
     }
 
@@ -407,7 +401,6 @@ impl<'a> Scheduler<'a> {
             per_cpu,
             queue_runnable: self.read_queue_runnable(),
             llc_runnable: self.read_llc_runnable(),
-            config: self.config_desc.clone(),
         }
     }
 

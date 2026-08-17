@@ -9,13 +9,11 @@ slices, and Q3 holds CPU-bound tasks with 4 ms slices. Each queue is a
 vtime-ordered dispatch queue, where the virtual deadline of a task is the
 insertion key, so the kernel dispatch queue rbtree provides
 earliest-virtual-deadline-first selection. Task classification uses a
-learned burst-prediction tree, trained in the user-space daemon on the
-machine's own task samples and republished periodically, with the EMA
-interactivity gauge retained as a tree feature and as the fallback until
-the first model is trained, plus promotion and demotion following MLFQ
-rules with hysteresis, and an aging pass re-classifies tasks that wait in
-the lower queues for more than a second. See `scx/README.md` for an
-overview of the design.
+per-task burst gauge that climbs by run time and decays at wakeup by a
+fixed-window step, with promotion and demotion following MLFQ rules and
+hysteresis, and an aging pass re-classifies tasks that wait in the lower
+queues for more than a second. See `scx/README.md` for an overview of the
+design.
 
 RT and DL tasks are scheduled by the kernel rt and dl classes. sched_ext
 sits below the fair class, so this scheduler handles non-RT tasks only.

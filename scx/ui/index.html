@@ -98,18 +98,6 @@
     .section-label { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 8px; }
     .subsection-label { font-size: 0.6875rem; color: var(--text-muted); margin-bottom: 2px; }
 
-    /* Config block */
-    .config-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 4px 12px;
-      font-size: 0.8125rem;
-    }
-    @media (min-width: 640px) { .config-grid { grid-template-columns: repeat(3, 1fr); } }
-    .config-kv { display: flex; gap: 4px; }
-    .config-k { color: var(--text-muted); }
-    .config-v { color: var(--text-secondary); font-family: var(--font-mono); }
-
     /* System stats grid */
     .sys-grid {
       display: grid;
@@ -150,12 +138,6 @@
       <p class="summary-tldr" id="summary-tldr">Loading...</p>
       <p class="subsection-label">Explanation</p>
       <p class="summary-explanation" id="summary-explanation"></p>
-    </div>
-
-    <!-- Config -->
-    <div class="card" style="margin-bottom:16px">
-      <p class="section-label">Configuration</p>
-      <div class="config-grid" id="config-grid"></div>
     </div>
 
     <!-- System stats -->
@@ -291,45 +273,43 @@
       var boosts = s.short_sleep_boosts || 0;
       var grants = s.fcbs_grants || 0;
       var wakes = s.wakeup_total || 0;
-      var tldr = 'scx_mlfq classifies with fixed-window budget accounting. ' +
-        'The burst gauge crosses its CPU-bound threshold within one scheduling period.';
-      var explanation = 'The burst gauge keeps tasks that have run more than they slept ' +
-        'toward the CPU-bound queue.';
-      if (promos > 0 || ages > 0 || boosts > 0) {
-        explanation += ' Wakeup promotions, the short-sleep and I/O boost, and ' +
-          'one-second aging bound wakeup latency.';
+      var steals = s.steals || 0;
+      var onCpu = s.on_cpu || 0;
+
+      var demoteRate = wakes > 0 ? demotes / wakes : 0;
+      var promoRate = wakes > 0 ? (promos + ages + boosts) / wakes : 0;
+
+      var tldr, explanation;
+      if (wakes === 0) {
+        tldr = 'scx_mlfq is running but has not observed any wakeups yet.';
+        explanation = 'The scheduler is idle. Wakeup activity will appear once tasks start running.';
+      } else if (demoteRate < 0.01 && promoRate > 0) {
+        tldr = 'scx_mlfq is working as expected. The workload is predominantly interactive.';
+        explanation = 'The burst gauge shows that most tasks are sleeping frequently enough to stay in Q1. ' +
+          'Wakeup promotions and the short-sleep boost are keeping latency low. ' +
+          fmt(promos + ages + boosts) + ' tasks were promoted to higher queues.';
+      } else if (demoteRate > 0.05) {
+        tldr = 'scx_mlfq is working as expected and adapting to the workload.';
+        explanation = 'The burst gauge is actively classifying tasks. ' +
+          fmt(demotes) + ' sustained consumers were demoted to lower queues, while ' +
+          fmt(promos + ages + boosts) + ' interactive tasks were promoted. ' +
+          'This is the expected behavior for a mixed interactive and batch workload.';
+      } else {
+        tldr = 'scx_mlfq is working as expected.';
+        explanation = 'The burst gauge is classifying tasks across all three queues. ' +
+          'Promotions, demotions, and aging are all operating normally.';
+      }
+
+      if (steals > 0) {
+        explanation += ' Idle CPUs are stealing owed tasks across ' + fmt(steals) + ' steal events.';
       }
       if (grants > 0) {
-        explanation += ' ' + fmt(grants) + ' budget grants were reclaimed within ' +
-          'queues from early-completing tasks.';
+        explanation += ' ' + fmt(grants) + ' budget grants were reclaimed from early-completing tasks.';
       }
-      if (wakes > 0) {
-        explanation += ' Total wakeups observed: ' + fmt(wakes) + '.';
-      }
-      if (demotes > 0) {
-        explanation += ' ' + fmt(demotes) + ' demotions moved sustained consumers to lower queues.';
+      if (onCpu > 0) {
+        explanation += ' ' + fmt(onCpu) + ' tasks are currently on CPU.';
       }
       return { tldr: tldr, explanation: explanation };
-    }
-
-    function renderConfig(c) {
-      if (!c) return;
-      var grid = el('config-grid');
-      var items = [
-        ['Q1 slice', fmtNs(c.q1_slice_us || 0) + ' us'],
-        ['Q2 slice', fmtNs(c.q2_slice_us || 0) + ' us'],
-        ['Q3 slice', fmtNs(c.q3_slice_us || 0) + ' us'],
-        ['T_L', fmtNs(c.t_l_us || 0) + ' us'],
-        ['T_H', fmtNs(c.t_h_us || 0) + ' us'],
-        ['Gauge max', fmtNs(c.gauge_max_us || 0) + ' us'],
-        ['CBS period mult', c.cbs_period_mult || 2],
-        ['Aging', fmtNs(c.aging_us || 0) + ' us'],
-        ['Preempt slice', fmtNs(c.preempt_us || 0) + ' us'],
-        ['Q1/Q2/Q3 quota', (c.q1_quota || 4) + ' / ' + (c.q2_quota || 8) + ' / rest'],
-      ];
-      grid.innerHTML = items.map(function(kv) {
-        return '<div class="config-kv"><span class="config-k">' + kv[0] + ':</span> <span class="config-v">' + kv[1] + '</span></div>';
-      }).join('');
     }
 
     function updateUI(data) {
@@ -361,15 +341,9 @@
       el('rt-evacuations').textContent = fmt(s.rt_evacuations || 0);
       el('rt-redirects').textContent = fmt(s.rt_redirects || 0);
       el('rt-reenqs').textContent = fmt(s.rt_reenqs || 0);
+      el('wakeup-total').textContent = fmt(s.wakeup_total || 0);
       el('fcbs-grants').textContent = fmt(s.fcbs_grants || 0);
       el('fcbs-slack').textContent = fmt(s.fcbs_slack_events || 0);
-      el('wakeup-total').textContent = fmt(s.wakeup_total || 0);
-
-      var summary = buildSummary(s);
-      el('summary-tldr').textContent = summary.tldr;
-      el('summary-explanation').textContent = summary.explanation;
-
-      renderConfig(data.config);
 
       // Per-LLC runnable occupancy. One chip per domain with tracked
       // runnable tasks, in domain order. All-zero shows a single muted
@@ -393,6 +367,10 @@
       el('op-lat').textContent = opStr;
 
       renderCoreCards(data);
+
+      var summary = buildSummary(s);
+      el('summary-tldr').textContent = summary.tldr;
+      el('summary-explanation').textContent = summary.explanation;
     }
 
     function pollStats() {
