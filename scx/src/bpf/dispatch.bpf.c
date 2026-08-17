@@ -70,32 +70,46 @@
  */
 
 /*
+ * mlfq_queue_dsqs_any_nonempty - Check whether any queue DSQ has tasks.
+ * @cpu: The CPU whose per-queue DSQs to inspect.
+ *
+ * Loops over MLFQ_NR_QUEUES with a constant bound so the verifier
+ * sees exactly three iterations at the current queue count.
+ *
+ * Return: True if at least one queue DSQ for @cpu is non-empty.
+ */
+static __always_inline bool mlfq_queue_dsqs_any_nonempty(s32 cpu)
+{
+	u32 qid;
+
+	bpf_for(qid, 1, MLFQ_NR_QUEUES + 1) {
+		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cpu)))
+			return true;
+	}
+	return false;
+}
+
+/*
  * mlfq_remote_work_probe - Peek one remote CPU's queue DSQ heads.
  * @cand: Remote CPU to probe.
  * @cpu: Local CPU, the affinity target of the peeked tasks.
  *
- * Three lockless peeks, one per queue DSQ, each gated on nr_queued so an
- * empty DSQ is skipped without a peek. A head that can run on @cpu means
- * the slot loops below have work to steal.
+ * Loops over MLFQ_NR_QUEUES with a constant bound.  Each iteration
+ * is gated on nr_queued so an empty DSQ is skipped without a peek.
+ * A head that can run on @cpu means the slot loops below have work
+ * to steal.
  *
  * Return: true if any queue DSQ head can run on @cpu.
  */
 static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
 {
 	struct task_struct *t;
+	u32 qid;
 
-	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cand))) {
-		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(1, cand));
-		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-			return true;
-	}
-	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cand))) {
-		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(2, cand));
-		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-			return true;
-	}
-	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cand))) {
-		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(3, cand));
+	bpf_for(qid, 1, MLFQ_NR_QUEUES + 1) {
+		if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
+			continue;
+		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
 		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
 			return true;
 	}
@@ -216,7 +230,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		/*
 		 * Tier A, the same-LLC steal. The flat window over the
 		 * consuming CPU's own-LLC list keeps stolen work inside
-		 * the cache domain; the window starts at the same rotating
+		 * the cache domain. The window starts at the same rotating
 		 * offset as Tier B so the drift is shared and the rotation
 		 * stays fair. The candidate index wraps with a
 		 * compile-time-constant modulo (MLFQ_LLC_SCAN_MAX). The
@@ -232,7 +246,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		 * order rotates the start, and the idx >= nr guard skips
 		 * the list padding beyond the populated count (the zeroed
 		 * tail of the map value). The window base and the entry
-		 * count were hoisted out of the slot loop above; a zero
+		 * count were hoisted out of the slot loop above. A zero
 		 * count (the unpopulated map state, or a domain too large
 		 * for the window that the front-end left empty) keeps
 		 * tier_a_ran false, so Tier B's rotating window covers
@@ -362,7 +376,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			 * this pre-check and the kernel move can make the
 			 * moved task differ from @best. The head-pop API
 			 * offers no post-move verification, so the adjust
-			 * targets @best regardless; the gauges are advisory
+			 * targets @best regardless. The gauges are advisory
 			 * and self-heal at the moved task's next episode
 			 * boundary (mlfq_runnable_exit()).
 			 */
@@ -411,9 +425,6 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	u32 remaining = mlfq_dispatch_max_batch;
 	u64 op_lat_start = scx_bpf_now();
 
-	/* Rate-limited adaptation step, before any state is touched. */
-	mlfq_maybe_adapt_step(op_lat_start);
-
 	if (nr_cpus == 0) {
 		mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH, op_lat_start);
 		return;
@@ -454,8 +465,8 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * Keep the outgoing task when nothing else is dispatchable here.
 	 * balance() runs before put_prev_task() in the scheduling pass,
 	 * and with SCX_OPS_ENQ_LAST set the kernel does not keep prev
-	 * automatically (ext.c). So when @prev is still queued and all
-	 * three of the CPU's queue DSQs are empty, @prev is the only
+	 * automatically (ext.c). So when @prev is still queued and every
+	 * queue DSQ for this CPU is empty, @prev is the only
 	 * runnable work this CPU can take. The alternative is switching to
 	 * idle with runnable work, which leaves the CPU parked until an
 	 * external wakeup. Replenishing the queue slice alone makes
@@ -476,25 +487,23 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * placement and accounting resume naturally.
 	 *
 	 * The keep is an accounting freeze. While it repeats, no context
-	 * switch happens, so vruntime, the queue clock, the EMA gauges and
-	 * the tree features see none of the real time that passes. The
-	 * freeze is bounded by competition arrival or by @prev sleeping
-	 * (the gate requires all three queue DSQs empty, so any enqueue
-	 * ends it at the next dispatch), and the next real placement
-	 * re-anchors under the lag clamp, so the bounded-lag safety
-	 * property is unaffected. The cost is that a solo task's
-	 * classification gauges under-count its run until the freeze ends.
+	 * switch happens, so vruntime, the queue clock, the burst gauge
+	 * and the cpuperf busy window see none of the real time that
+	 * passes. The freeze is bounded by competition arrival or by
+	 * @prev sleeping (the gate requires all queue DSQs empty,
+	 * so any enqueue ends it at the next dispatch), and the next real
+	 * placement re-anchors under the lag clamp, so the bounded-lag
+	 * safety property is unaffected. The cost is that a solo task's
+	 * classification gauge under-counts its run until the freeze ends.
 	 *
-	 * Before keeping, the three queue DSQ heads of one remote CPU (the
+	 * Before keeping, the queue DSQ heads of one remote CPU (the
 	 * rotating scan candidate) are probed: a CPU whose own queues are
 	 * empty should still pull the most-owed remote task instead of
 	 * running the previous task for a full slice. The probe is gated
-	 * on nr_queued and is three lockless peeks.
+	 * on nr_queued and loops over MLFQ_NR_QUEUES.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu))) {
+	    !mlfq_queue_dsqs_any_nonempty(cpu)) {
 		struct task_ctx *tctx = mlfq_lookup_task_ctx(prev);
 		u8 qid;
 
@@ -519,26 +528,32 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 							     (u32)nr_cpus);
 					remote_work = mlfq_remote_work_probe(cand, cpu);
 				}
-				if (!remote_work) {
-					scx_bpf_task_set_slice(prev, slice);
-					/*
-					 * The keep grant runs @prev for a
-					 * fresh slice without a context
-					 * switch, so no ops.running() fires.
-					 * Clear the enqueue stamp of the
-					 * run-out re-enqueue, or the next
-					 * measurement would charge the whole
-					 * keep to the wait. Policy is
-					 * untouched; only the measurement
-					 * state is cleared.
-					 */
-					tctx->enq_at = 0;
+			if (!remote_work) {
+				/*
+				 * FCBS: the keep-path consumes the
+				 * queue's bonus, so a solo early-
+				 * completing task of queue q can collect
+				 * q's bonus and sustain ~2*Q_q grants.
+				 * The preemption path (150 us cap)
+				 * deliberately does not consume bonus.
+				 */
+				struct queue_ctx *q = mlfq_lookup_queue(qid);
+				u64 grant = q ?
+					mlfq_fcbs_consume_bonus(q, slice,
+								scx_bpf_now()) :
+					slice;
+
+				scx_bpf_task_set_slice(prev, grant);
+				tctx->last_grant_ns = grant;
+				if (grant != slice)
 					__sync_fetch_and_add(
-						&mlfq_stats.keep_running, 1);
-					mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH,
-							  op_lat_start);
-					return;
-				}
+						&mlfq_stats.fcbs_grants, 1);
+				__sync_fetch_and_add(
+					&mlfq_stats.keep_running, 1);
+				mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH,
+						  op_lat_start);
+				return;
+			}
 				/* Remote work present. The slot loops steal. */
 			}
 		}

@@ -46,19 +46,19 @@ use crate::bpf_intf::mlfq_consts_MLFQ_MAX_LLCS;
 use crate::bpf_intf::mlfq_consts_MLFQ_MAX_LLC_CPUS;
 use crate::bpf_intf::mlfq_llc_cpu_list;
 
-/// Compile-time CPU bound; must match `MLFQ_MAX_CPUS` in `src/bpf/intf.h`.
+/// Compile-time CPU bound. Must match `MLFQ_MAX_CPUS` in `src/bpf/intf.h`.
 const MAX_CPUS: usize = mlfq_consts_MLFQ_MAX_CPUS as usize;
 
-/// Compile-time LLC bound; must match `MLFQ_MAX_LLCS` in `src/bpf/intf.h`.
+/// Compile-time LLC bound. Must match `MLFQ_MAX_LLCS` in `src/bpf/intf.h`.
 const MAX_LLCS: usize = mlfq_consts_MLFQ_MAX_LLCS as usize;
 
-/// Compile-time per-LLC CPU-list bound; must match `MLFQ_MAX_LLC_CPUS`
+/// Compile-time per-LLC CPU-list bound. Must match `MLFQ_MAX_LLC_CPUS`
 /// in `src/bpf/intf.h`.
 const MAX_LLC_CPUS: usize = mlfq_consts_MLFQ_MAX_LLC_CPUS as usize;
 
 /// Whether SMT is active on the host, read from the kernel's
 /// `/sys/devices/system/cpu/smt/active` interface. The knob is absent on
-/// systems without SMT support; a missing or unreadable knob yields
+/// systems without SMT support. A missing or unreadable knob yields
 /// `None`, so the caller can omit the SMT annotation from the startup
 /// banner rather than guessing.
 pub fn smt_enabled() -> Option<bool> {
@@ -73,7 +73,7 @@ pub struct CapacityPlan {
     /// True when every CPU is treated as primary: uniform-capacity system,
     /// or the primary set could not be determined.
     pub primary_all: bool,
-    /// CPUs to add to the primary mask (sorted, deduplicated); empty when
+    /// CPUs to add to the primary mask (sorted, deduplicated). Empty when
     /// `primary_all` is true.
     pub primary_cpus: Vec<u32>,
 }
@@ -81,7 +81,7 @@ pub struct CapacityPlan {
 /// Decide the primary set from the discovered big cores.
 ///
 /// A primary list covering every online CPU means there is no capacity
-/// asymmetry to exploit; an empty list means discovery produced no usable
+/// asymmetry to exploit. An empty list means discovery produced no usable
 /// data. Both fall back to the uniform-capacity behavior.
 pub fn plan_primary_mask(primary_cpus: &[u32], nr_online: usize) -> CapacityPlan {
     if primary_cpus.is_empty() || primary_cpus.len() >= nr_online {
@@ -111,7 +111,7 @@ pub struct LlcPlan {
     /// Per-LLC: the CPUs of that domain.
     pub llc_cpus: Vec<Vec<u32>>,
     /// Per-CPU LLC domain id (MLFQ_MAX_LLCS, the sentinel, when the CPU
-    /// is unknown or out of range; only known online CPUs get a real
+    /// is unknown or out of range. Only known online CPUs get a real
     /// domain id).
     pub cpu_llc: [u32; MAX_CPUS],
 }
@@ -220,7 +220,7 @@ pub fn plan_sibling_table(cpu_to_core: &[(u32, u32)]) -> SiblingPlan {
 
 /// Parse a kernel cache size string ("32M", "16384K", plain bytes) into
 /// bytes. The kernel exposes cache sizes in the human-readable form
-/// with a K/M/G suffix; a parse failure yields `None`.
+/// with a K/M/G suffix. A parse failure yields `None`.
 fn parse_cache_size(size: &str) -> Option<u64> {
     let s = size.trim();
     let (num, mult) = if let Some(v) = s.strip_suffix('K') {
@@ -241,9 +241,9 @@ fn parse_cache_size(size: &str) -> Option<u64> {
 /// directories each describe one cache level with `level`/`type`/`size`
 /// (and, on machines that expose it, `id`) files. The LLC level is the
 /// index whose `id` matches the CPU's kernel `topology/llc_id` (both
-/// describe the same level); on machines whose index entries carry no
+/// describe the same level). On machines whose index entries carry no
 /// `id` file, the deepest (largest `level`) index is used. A per-entry
-/// read failure skips that entry; a failure of the whole discovery
+/// read failure skips that entry. A failure of the whole discovery
 /// yields `None` and the caller falls back to 0 for the domain.
 fn llc_size_bytes(cache_path: &Path) -> Option<u64> {
     let cpu_path = cache_path.parent()?;
@@ -292,7 +292,7 @@ fn llc_size_bytes(cache_path: &Path) -> Option<u64> {
 /// than two domains, or two or more domains tied for the largest size
 /// (including the all-zeros case of a fully failed discovery), there is
 /// no capacity win to exploit and the feature stays off (`None`).
-/// `sizes` is indexed by LLC domain id; only the first `nr_llcs`
+/// `sizes` is indexed by LLC domain id. Only the first `nr_llcs`
 /// entries are considered.
 pub fn pick_largest_llc(sizes: &[u64], nr_llcs: u32) -> Option<u32> {
     if (nr_llcs as usize) < 2 {
@@ -523,7 +523,7 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
 
 /// Read a CPU's current operating frequency from sysfs, in kHz. The
 /// `scaling_cur_freq` file reflects the live frequency of the CPU,
-/// whatever the governor is doing; a missing or unreadable file (no
+/// whatever the governor is doing. A missing or unreadable file (no
 /// cpufreq driver) yields 0.
 pub fn current_freq_khz(cpu: u32) -> u64 {
     std::fs::read_to_string(format!(

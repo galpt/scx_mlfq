@@ -53,7 +53,7 @@ const UNIX_SOCKET_PATH: &str = "/tmp/scx_mlfq.sock";
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// systemd's runtime unit directory. The root-owned tree under `/run`
-/// (tmpfs) that PID 1 maintains for the current boot; runtime drop-ins
+/// (tmpfs) that PID 1 maintains for the current boot. Runtime drop-ins
 /// written below it are picked up by `systemctl daemon-reload` and
 /// disappear on reboot.
 const RUNTIME_SYSTEM_DIR: &str = "/run/systemd/system";
@@ -79,7 +79,7 @@ const EACCES: i32 = 13;
 
 /// Set once this run actually wrote the runtime drop-in (not merely
 /// attempted it), so the exit path knows a sandbox restore is owed. The
-/// webui thread stores it; `main` reads it after the run loop ends.
+/// webui thread stores it. `main` reads it after the run loop ends.
 /// SeqCst orders the drop-in write before the main-thread restore
 /// decision regardless of which core each ran on.
 static UNBLOCK_WRITTEN: AtomicBool = AtomicBool::new(false);
@@ -297,7 +297,7 @@ fn try_unblock_loader_sandbox() -> bool {
     }
 
     log::warn!(
-        "Web UI: wrote {} — the loader network sandbox is lifted for the NEXT scheduler start; this run stays on the unix socket because the seccomp filter cannot be lifted in-place",
+        "Web UI: wrote {}. The loader network sandbox is lifted for the NEXT scheduler start. This run stays on the unix socket because the seccomp filter cannot be lifted in-place",
         RUNTIME_DROPIN
     );
     true
@@ -364,7 +364,7 @@ pub fn restore_loader_sandbox() {
     }
 
     log::info!(
-        "Web UI: removed {} — the loader network restriction is restored for the next scheduler start",
+        "Web UI: removed {}. The loader network restriction is restored for the next scheduler start",
         RUNTIME_DROPIN
     );
     UNBLOCK_WRITTEN.store(false, Ordering::SeqCst);
@@ -428,7 +428,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
 
     if let Some(server) = server {
         log::info!(
-            "Web UI listening on http://{}/ — disable with --no-webui",
+            "Web UI listening on http://{}/. Disable with --no-webui",
             tcp_addr
         );
 
@@ -523,7 +523,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         }
 
         log::info!(
-            "Web UI listening on unix:{} (mode 0600, root-only) — access via: sudo socat TCP-LISTEN:{} UNIX-CONNECT:{}",
+            "Web UI listening on unix:{} (mode 0600, root-only). Access via: sudo socat TCP-LISTEN:{} UNIX-CONNECT:{}",
             UNIX_SOCKET_PATH,
             PORT,
             UNIX_SOCKET_PATH
@@ -620,8 +620,8 @@ mod tests {
     fn dropin_matches_is_byte_exact() {
         assert!(dropin_matches(&runtime_dropin_content()));
 
-        // Any deviation — an empty file, a reset kept but a marker
-        // edited, a restriction left in place — breaks the byte match,
+        // Any deviation, an empty file, a reset kept but a marker
+        // edited, a restriction left in place, breaks the byte match,
         // so a foreign edit is never removed by the restore path.
         assert!(!dropin_matches(""));
         assert!(!dropin_matches(&runtime_dropin_content().replace(

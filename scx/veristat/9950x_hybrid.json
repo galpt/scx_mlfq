@@ -1,21 +1,17 @@
 [{
         "value": {
             ".rodata": [{
-                    "mlfq_q1_slice_ns": 1000000
+                    "mlfq_q1_slice_ns": 1048576
                 },{
-                    "mlfq_q2_slice_ns": 2000000
+                    "mlfq_q2_slice_ns": 2097152
                 },{
-                    "mlfq_q3_slice_ns": 4000000
+                    "mlfq_q3_slice_ns": 4194304
                 },{
-                    "mlfq_budget_max_ns": 6000000
-                },{
-                    "mlfq_alpha": 3072
+                    "mlfq_gauge_max_ns": 8388608
                 },{
                     "mlfq_t_l_ns": 250000
                 },{
                     "mlfq_t_h_ns": 2000000
-                },{
-                    "mlfq_ema_half_life_ns": 24000000
                 },{
                     "mlfq_aging_period_ns": 1000000000
                 },{
@@ -25,17 +21,9 @@
                 },{
                     "mlfq_hysteresis_sleep_ns": 4000000
                 },{
-                    "mlfq_long_sleep_ns": 120000000
-                },{
                     "mlfq_sameq_preempt_min_run_ns": 0
                 },{
                     "mlfq_preempt_slice_ns": 150000
-                },{
-                    "mlfq_tree_t_int_ns": 1000000
-                },{
-                    "mlfq_tree_t_bound_ns": 3000000
-                },{
-                    "mlfq_adapt_enabled": true
                 },{
                     "mlfq_q1_quota": 4
                 },{
@@ -76,25 +64,6 @@
             ],
             ".bss": [{
                     "mlfq_idle_count": 4
-                },{
-                    "mlfq_sys_gauge": {
-                        "lat_ema": 0,
-                        "rate_ema": 0,
-                        "step_at": 0,
-                        "wait_total": 0,
-                        "wait_count": 0,
-                        "adapt_steps": 0,
-                        "pad": 0
-                    }
-                },{
-                    "mlfq_adapt_state": {
-                        "shift_fp": 0,
-                        "t_l_eff_ns": 250000,
-                        "t_h_eff_ns": 2000000,
-                        "t_int_eff_ns": 1000000,
-                        "t_bnd_eff_ns": 3000000,
-                        "guard_eff_ns": 0
-                    }
                 }
             ]
         }

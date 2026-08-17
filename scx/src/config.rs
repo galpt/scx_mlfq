@@ -23,7 +23,6 @@ use anyhow::Result;
 
 /// Time units matching `enum mlfq_consts` in `src/bpf/intf.h`.
 const NSEC_PER_USEC: u64 = 1_000;
-const NSEC_PER_MSEC: u64 = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 /*
@@ -32,8 +31,6 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
  * from the bindgen-generated constants (the same source `topology.rs`
  * cross-checks its constants against), so an intf.h change propagates here
  * automatically and the `defaults_match_intf_h` test pins the binding.
- * SHORT_SLEEP_NS is the one explicit value and the test pins it to the
- * intf.h constant.
  */
 
 /// Per-queue request sizes.
@@ -41,42 +38,30 @@ const Q1_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q1_SLICE_NS as u64;
 const Q2_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q2_SLICE_NS as u64;
 const Q3_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q3_SLICE_NS as u64;
 
-/// EMA gauge ceiling.
-const BUDGET_MAX_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_BUDGET_MAX_NS as u64;
-
-/// Climb aggressiveness, fixed.
-const ALPHA: u64 = crate::bpf_intf::mlfq_consts_MLFQ_ALPHA as u64;
+/// Burst gauge ceiling, replacing the former EMA budget_max.
+const GAUGE_MAX_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_GAUGE_MAX_NS as u64;
 
 /// Classification thresholds.
 const T_L_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_T_L_NS as u64;
 const T_H_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_T_H_NS as u64;
-
-/// EMA decay half-life.
-const EMA_HALF_LIFE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_EMA_HALF_LIFE_NS as u64;
 
 /// Aging period.
 const AGING_PERIOD_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_AGING_PERIOD_NS as u64;
 
 /// Short-sleep boost window. Periodic wakeup cadences such as the 60 Hz
 /// frame interval stay interactive. The per-task boost rate limit bounds
-/// the churn. The value is set against the slowest common cadence, so
-/// faster refresh rates, which sleep less per frame, fall inside the
-/// window as well.
-const SHORT_SLEEP_NS: u64 = 32 * NSEC_PER_MSEC;
+/// the churn.
+const SHORT_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_NS as u64;
 const SHORT_SLEEP_RATE_LIMIT_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS as u64;
 const HYSTERESIS_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS as u64;
-
-/// A sleep longer than this collapses the gauge.
-const LONG_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_LONG_SLEEP_NS as u64;
 
 /// Minimum residency before a same-queue wakeup may preempt the running
 /// task. Zero, the default, makes the interactive rule unconditional.
 const SAMEQ_PREEMPT_MIN_RUN_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS as u64;
 
-/// Slice cap for a preempting wakeup, in nsecs. The displaced task
-/// resumes at the next scheduling event once the cap expires.
+/// Slice cap for a preempting wakeup, in nsecs.
 const PREEMPT_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_PREEMPT_SLICE_NS as u64;
 
 /// Dispatch quotas.
@@ -87,14 +72,10 @@ const DISPATCH_MAX_BATCH: u32 = crate::bpf_intf::mlfq_consts_MLFQ_DISPATCH_MAX_B
 /// Drain interval of the realtime-takeover evacuation, nsecs.
 const RTDL_DRAIN_INTERVAL_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS as u64;
 
-/// Tree band edges, the rodata bases of the effective adaptation values.
-const TREE_T_INT_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_TREE_T_INT_NS as u64;
-const TREE_T_BOUND_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_TREE_T_BOUND_NS as u64;
-
 /// Validated scheduling constants.
 ///
 /// Every field maps to a `const volatile` rodata global in
-/// `src/bpf/main.bpf.c`; field names match the BPF globals 1:1 so
+/// `src/bpf/main.bpf.c`. Field names match the BPF globals 1:1 so
 /// `Config::apply()` is a mechanical write-through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -104,16 +85,12 @@ pub struct Config {
     pub q2_slice_ns: u64,
     /// Q3 request size (batch), nsecs.
     pub q3_slice_ns: u64,
-    /// EMA gauge ceiling, nsecs.
-    pub budget_max_ns: u64,
-    /// EMA climb aggressiveness (fixed).
-    pub alpha: u64,
+    /// Burst gauge ceiling, nsecs (T_L < T_H < gauge_max).
+    pub gauge_max_ns: u64,
     /// Interactive threshold T_L, nsecs.
     pub t_l_ns: u64,
     /// CPU-bound threshold T_H, nsecs.
     pub t_h_ns: u64,
-    /// EMA decay half-life, nsecs.
-    pub ema_half_life_ns: u64,
     /// Global aging period, nsecs.
     pub aging_period_ns: u64,
     /// Short-sleep boost window, nsecs.
@@ -122,10 +99,7 @@ pub struct Config {
     pub short_sleep_rate_limit_ns: u64,
     /// Sleep counted as "short" for the wake_cnt hysteresis, nsecs.
     pub hysteresis_sleep_ns: u64,
-    /// Sleep beyond which the gauge collapses, nsecs.
-    pub long_sleep_ns: u64,
     /// Minimum residency before a same-queue wakeup may preempt, nsecs.
-    /// Zero, the default, makes the interactive rule unconditional.
     pub sameq_preempt_min_run_ns: u64,
     /// Slice cap for a preempting wakeup, nsecs.
     pub preempt_slice_ns: u64,
@@ -137,12 +111,6 @@ pub struct Config {
     pub dispatch_max_batch: u32,
     /// Drain interval of the realtime-takeover evacuation, nsecs.
     pub rtdl_drain_interval_ns: u64,
-    /// Tree Q1/Q2 band edge, the base of the effective value, nsecs.
-    pub tree_t_int_ns: u64,
-    /// Tree Q2/Q3 band edge, the base of the effective value, nsecs.
-    pub tree_t_bound_ns: u64,
-    /// Master gate of the threshold adaptation (false = fixed thresholds).
-    pub adapt_enabled: bool,
 }
 
 impl Default for Config {
@@ -152,25 +120,19 @@ impl Default for Config {
             q1_slice_ns: Q1_SLICE_NS,
             q2_slice_ns: Q2_SLICE_NS,
             q3_slice_ns: Q3_SLICE_NS,
-            budget_max_ns: BUDGET_MAX_NS,
-            alpha: ALPHA,
+            gauge_max_ns: GAUGE_MAX_NS,
             t_l_ns: T_L_NS,
             t_h_ns: T_H_NS,
-            ema_half_life_ns: EMA_HALF_LIFE_NS,
             aging_period_ns: AGING_PERIOD_NS,
             short_sleep_ns: SHORT_SLEEP_NS,
             short_sleep_rate_limit_ns: SHORT_SLEEP_RATE_LIMIT_NS,
             hysteresis_sleep_ns: HYSTERESIS_SLEEP_NS,
-            long_sleep_ns: LONG_SLEEP_NS,
             sameq_preempt_min_run_ns: SAMEQ_PREEMPT_MIN_RUN_NS,
             preempt_slice_ns: PREEMPT_SLICE_NS,
             q1_quota: Q1_QUOTA,
             q2_quota: Q2_QUOTA,
             dispatch_max_batch: DISPATCH_MAX_BATCH,
             rtdl_drain_interval_ns: RTDL_DRAIN_INTERVAL_NS,
-            tree_t_int_ns: TREE_T_INT_NS,
-            tree_t_bound_ns: TREE_T_BOUND_NS,
-            adapt_enabled: true,
         }
     }
 }
@@ -192,11 +154,8 @@ impl Config {
                 self.q3_slice_ns
             );
         }
-        if self.budget_max_ns == 0 {
-            bail!("budget_max must be non-zero");
-        }
-        if self.alpha == 0 {
-            bail!("alpha must be non-zero");
+        if self.gauge_max_ns == 0 {
+            bail!("gauge_max must be non-zero");
         }
         if self.t_l_ns == 0 {
             bail!("T_L must be non-zero");
@@ -208,15 +167,12 @@ impl Config {
                 self.t_h_ns
             );
         }
-        if self.t_h_ns >= self.budget_max_ns {
+        if self.t_h_ns >= self.gauge_max_ns {
             bail!(
-                "T_H ({}) must be strictly below BUDGET_MAX ({})",
+                "T_H ({}) must be strictly below gauge_max ({})",
                 self.t_h_ns,
-                self.budget_max_ns
+                self.gauge_max_ns
             );
-        }
-        if self.ema_half_life_ns == 0 {
-            bail!("EMA half-life must be non-zero");
         }
         if self.aging_period_ns == 0 {
             bail!("aging period must be non-zero");
@@ -229,9 +185,6 @@ impl Config {
         }
         if self.hysteresis_sleep_ns == 0 {
             bail!("hysteresis sleep window must be non-zero");
-        }
-        if self.long_sleep_ns == 0 {
-            bail!("long-sleep window must be non-zero");
         }
         if self.q1_quota == 0 || self.q2_quota == 0 {
             bail!(
@@ -275,16 +228,6 @@ impl Config {
         if self.rtdl_drain_interval_ns == 0 {
             bail!("rtdl drain interval must be non-zero");
         }
-        if self.tree_t_int_ns == 0 {
-            bail!("tree T_INT must be non-zero");
-        }
-        if self.tree_t_int_ns >= self.tree_t_bound_ns {
-            bail!(
-                "tree T_INT ({}) must be strictly below T_BOUND ({})",
-                self.tree_t_int_ns,
-                self.tree_t_bound_ns
-            );
-        }
         Ok(())
     }
 
@@ -301,25 +244,19 @@ impl Config {
         rodata.mlfq_q1_slice_ns = self.q1_slice_ns;
         rodata.mlfq_q2_slice_ns = self.q2_slice_ns;
         rodata.mlfq_q3_slice_ns = self.q3_slice_ns;
-        rodata.mlfq_budget_max_ns = self.budget_max_ns;
-        rodata.mlfq_alpha = self.alpha;
+        rodata.mlfq_gauge_max_ns = self.gauge_max_ns;
         rodata.mlfq_t_l_ns = self.t_l_ns;
         rodata.mlfq_t_h_ns = self.t_h_ns;
-        rodata.mlfq_ema_half_life_ns = self.ema_half_life_ns;
         rodata.mlfq_aging_period_ns = self.aging_period_ns;
         rodata.mlfq_short_sleep_ns = self.short_sleep_ns;
         rodata.mlfq_short_sleep_rate_limit_ns = self.short_sleep_rate_limit_ns;
         rodata.mlfq_hysteresis_sleep_ns = self.hysteresis_sleep_ns;
-        rodata.mlfq_long_sleep_ns = self.long_sleep_ns;
         rodata.mlfq_sameq_preempt_min_run_ns = self.sameq_preempt_min_run_ns;
         rodata.mlfq_preempt_slice_ns = self.preempt_slice_ns;
         rodata.mlfq_q1_quota = self.q1_quota;
         rodata.mlfq_q2_quota = self.q2_quota;
         rodata.mlfq_dispatch_max_batch = self.dispatch_max_batch;
         rodata.mlfq_rtdl_drain_interval_ns = self.rtdl_drain_interval_ns;
-        rodata.mlfq_tree_t_int_ns = self.tree_t_int_ns;
-        rodata.mlfq_tree_t_bound_ns = self.tree_t_bound_ns;
-        rodata.mlfq_adapt_enabled = self.adapt_enabled;
         Ok(())
     }
 
@@ -327,40 +264,33 @@ impl Config {
     pub fn describe(&self) -> String {
         format!(
             "slices: Q1={}us Q2={}us Q3={}us, T_L={}us, T_H={}us, \
-             budget_max={}us, alpha={}, ema_half_life={}us, aging_period={}s, \
+             gauge_max={}us, cbs_period_mult=2, aging_period={}s, \
              short_sleep={}us, ss_rate_limit={}us, hysteresis_sleep={}us, \
-             long_sleep={}ms, sameq_min_run={}us, preempt_slice={}us, \
-             rtdl_drain_interval={}us, quotas: Q1={} Q2={} max_batch={}, \
-             tree_bands: T_INT={}us T_BOUND={}us, adapt_enabled={}",
+             sameq_min_run={}us, preempt_slice={}us, \
+             rtdl_drain_interval={}us, quotas: Q1={} Q2={} max_batch={}",
             self.q1_slice_ns / NSEC_PER_USEC,
             self.q2_slice_ns / NSEC_PER_USEC,
             self.q3_slice_ns / NSEC_PER_USEC,
             self.t_l_ns / NSEC_PER_USEC,
             self.t_h_ns / NSEC_PER_USEC,
-            self.budget_max_ns / NSEC_PER_USEC,
-            self.alpha,
-            self.ema_half_life_ns / NSEC_PER_USEC,
+            self.gauge_max_ns / NSEC_PER_USEC,
             self.aging_period_ns / NSEC_PER_SEC,
             self.short_sleep_ns / NSEC_PER_USEC,
             self.short_sleep_rate_limit_ns / NSEC_PER_USEC,
             self.hysteresis_sleep_ns / NSEC_PER_USEC,
-            self.long_sleep_ns / NSEC_PER_MSEC,
             self.sameq_preempt_min_run_ns / NSEC_PER_USEC,
             self.preempt_slice_ns / NSEC_PER_USEC,
             self.rtdl_drain_interval_ns / NSEC_PER_USEC,
             self.q1_quota,
             self.q2_quota,
             self.dispatch_max_batch,
-            self.tree_t_int_ns / NSEC_PER_USEC,
-            self.tree_t_bound_ns / NSEC_PER_USEC,
-            self.adapt_enabled,
         )
     }
 }
 
 /// Builder for `Config`, assembled from optional setters.
 ///
-/// Every setter is optional; unset fields fall back to the `intf.h`
+/// Every setter is optional. Unset fields fall back to the `intf.h`
 /// defaults. `build()` validates the result and returns an error for any
 /// configuration that would break a BPF invariant.
 ///
@@ -374,25 +304,19 @@ pub struct ConfigBuilder {
     q1_slice_ns: Option<u64>,
     q2_slice_ns: Option<u64>,
     q3_slice_ns: Option<u64>,
-    budget_max_ns: Option<u64>,
-    alpha: Option<u64>,
+    gauge_max_ns: Option<u64>,
     t_l_ns: Option<u64>,
     t_h_ns: Option<u64>,
-    ema_half_life_ns: Option<u64>,
     aging_period_ns: Option<u64>,
     short_sleep_ns: Option<u64>,
     short_sleep_rate_limit_ns: Option<u64>,
     hysteresis_sleep_ns: Option<u64>,
-    long_sleep_ns: Option<u64>,
     sameq_preempt_min_run_ns: Option<u64>,
     preempt_slice_ns: Option<u64>,
     q1_quota: Option<u32>,
     q2_quota: Option<u32>,
     dispatch_max_batch: Option<u32>,
     rtdl_drain_interval_ns: Option<u64>,
-    tree_t_int_ns: Option<u64>,
-    tree_t_bound_ns: Option<u64>,
-    adapt_enabled: Option<bool>,
 }
 
 /*
@@ -402,153 +326,96 @@ pub struct ConfigBuilder {
  */
 #[cfg(test)]
 impl ConfigBuilder {
-    /// Set the Q1 (interactive) request size in nsecs.
     pub fn q1_slice_ns(mut self, v: u64) -> Self {
         self.q1_slice_ns = Some(v);
         self
     }
 
-    /// Set the Q2 (default) request size in nsecs.
     pub fn q2_slice_ns(mut self, v: u64) -> Self {
         self.q2_slice_ns = Some(v);
         self
     }
 
-    /// Set the Q3 (batch) request size in nsecs.
     pub fn q3_slice_ns(mut self, v: u64) -> Self {
         self.q3_slice_ns = Some(v);
         self
     }
 
-    /// Set the EMA gauge ceiling in nsecs.
-    pub fn budget_max_ns(mut self, v: u64) -> Self {
-        self.budget_max_ns = Some(v);
+    pub fn gauge_max_ns(mut self, v: u64) -> Self {
+        self.gauge_max_ns = Some(v);
         self
     }
 
-    /// Set the EMA climb aggressiveness.
-    pub fn alpha(mut self, v: u64) -> Self {
-        self.alpha = Some(v);
-        self
-    }
-
-    /// Set the interactive threshold T_L in nsecs.
     pub fn t_l_ns(mut self, v: u64) -> Self {
         self.t_l_ns = Some(v);
         self
     }
 
-    /// Set the CPU-bound threshold T_H in nsecs.
     pub fn t_h_ns(mut self, v: u64) -> Self {
         self.t_h_ns = Some(v);
         self
     }
 
-    /// Set the EMA decay half-life in nsecs.
-    pub fn ema_half_life_ns(mut self, v: u64) -> Self {
-        self.ema_half_life_ns = Some(v);
-        self
-    }
-
-    /// Set the global aging period in nsecs.
     pub fn aging_period_ns(mut self, v: u64) -> Self {
         self.aging_period_ns = Some(v);
         self
     }
 
-    /// Set the short-sleep boost window in nsecs.
     pub fn short_sleep_ns(mut self, v: u64) -> Self {
         self.short_sleep_ns = Some(v);
         self
     }
 
-    /// Set the per-task short-sleep boost rate limit in nsecs.
     pub fn short_sleep_rate_limit_ns(mut self, v: u64) -> Self {
         self.short_sleep_rate_limit_ns = Some(v);
         self
     }
 
-    /// Set the sleep counted as "short" for the wake_cnt hysteresis in nsecs.
     pub fn hysteresis_sleep_ns(mut self, v: u64) -> Self {
         self.hysteresis_sleep_ns = Some(v);
         self
     }
 
-    /// Set the long-sleep gauge-collapse window in nsecs.
-    pub fn long_sleep_ns(mut self, v: u64) -> Self {
-        self.long_sleep_ns = Some(v);
-        self
-    }
-
-    /// Set the same-queue preemption minimum residency in nsecs.
     pub fn sameq_preempt_min_run_ns(mut self, v: u64) -> Self {
         self.sameq_preempt_min_run_ns = Some(v);
         self
     }
 
-    /// Set the preempting-wakeup slice cap in nsecs.
     pub fn preempt_slice_ns(mut self, v: u64) -> Self {
         self.preempt_slice_ns = Some(v);
         self
     }
 
-    /// Set the Q1 dispatch quota.
     pub fn q1_quota(mut self, v: u32) -> Self {
         self.q1_quota = Some(v);
         self
     }
 
-    /// Set the Q2 dispatch quota.
     pub fn q2_quota(mut self, v: u32) -> Self {
         self.q2_quota = Some(v);
         self
     }
 
-    /// Set the dispatch-loop bound.
     pub fn dispatch_max_batch(mut self, v: u32) -> Self {
         self.dispatch_max_batch = Some(v);
         self
     }
 
-    /// Set the realtime-takeover drain interval in nsecs.
     pub fn rtdl_drain_interval_ns(mut self, v: u64) -> Self {
         self.rtdl_drain_interval_ns = Some(v);
         self
     }
 
-    /// Set the tree Q1/Q2 band edge (the base of the effective value).
-    pub fn tree_t_int_ns(mut self, v: u64) -> Self {
-        self.tree_t_int_ns = Some(v);
-        self
-    }
-
-    /// Set the tree Q2/Q3 band edge (the base of the effective value).
-    pub fn tree_t_bound_ns(mut self, v: u64) -> Self {
-        self.tree_t_bound_ns = Some(v);
-        self
-    }
-
-    /// Set the threshold-adaptation master gate.
-    pub fn adapt_enabled(mut self, v: bool) -> Self {
-        self.adapt_enabled = Some(v);
-        self
-    }
-
     /// Assemble and validate the configuration.
-    ///
-    /// Returns an error if any invariant is violated; the resulting
-    /// `Config` is guaranteed valid.
     pub fn build(self) -> Result<Config> {
         let defaults = Config::default();
         let cfg = Config {
             q1_slice_ns: self.q1_slice_ns.unwrap_or(defaults.q1_slice_ns),
             q2_slice_ns: self.q2_slice_ns.unwrap_or(defaults.q2_slice_ns),
             q3_slice_ns: self.q3_slice_ns.unwrap_or(defaults.q3_slice_ns),
-            budget_max_ns: self.budget_max_ns.unwrap_or(defaults.budget_max_ns),
-            alpha: self.alpha.unwrap_or(defaults.alpha),
+            gauge_max_ns: self.gauge_max_ns.unwrap_or(defaults.gauge_max_ns),
             t_l_ns: self.t_l_ns.unwrap_or(defaults.t_l_ns),
             t_h_ns: self.t_h_ns.unwrap_or(defaults.t_h_ns),
-            ema_half_life_ns: self.ema_half_life_ns.unwrap_or(defaults.ema_half_life_ns),
             aging_period_ns: self.aging_period_ns.unwrap_or(defaults.aging_period_ns),
             short_sleep_ns: self.short_sleep_ns.unwrap_or(defaults.short_sleep_ns),
             short_sleep_rate_limit_ns: self
@@ -557,7 +424,6 @@ impl ConfigBuilder {
             hysteresis_sleep_ns: self
                 .hysteresis_sleep_ns
                 .unwrap_or(defaults.hysteresis_sleep_ns),
-            long_sleep_ns: self.long_sleep_ns.unwrap_or(defaults.long_sleep_ns),
             sameq_preempt_min_run_ns: self
                 .sameq_preempt_min_run_ns
                 .unwrap_or(defaults.sameq_preempt_min_run_ns),
@@ -570,9 +436,6 @@ impl ConfigBuilder {
             rtdl_drain_interval_ns: self
                 .rtdl_drain_interval_ns
                 .unwrap_or(defaults.rtdl_drain_interval_ns),
-            tree_t_int_ns: self.tree_t_int_ns.unwrap_or(defaults.tree_t_int_ns),
-            tree_t_bound_ns: self.tree_t_bound_ns.unwrap_or(defaults.tree_t_bound_ns),
-            adapt_enabled: self.adapt_enabled.unwrap_or(defaults.adapt_enabled),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -585,24 +448,15 @@ mod tests {
 
     #[test]
     fn defaults_match_intf_h() {
-        /*
-         * Cross-check the Config defaults against the bindgen-generated
-         * enum mlfq_consts constants, the way topology.rs cross-checks its
-         * constants: intf.h is the single source of truth, and this test
-         * pins the binding so a default that diverges from the BPF side
-         * (or a constant that stops existing) fails here.
-         */
         use crate::bpf_intf::{
-            mlfq_consts_MLFQ_AGING_PERIOD_NS, mlfq_consts_MLFQ_ALPHA,
-            mlfq_consts_MLFQ_BUDGET_MAX_NS, mlfq_consts_MLFQ_DISPATCH_MAX_BATCH,
-            mlfq_consts_MLFQ_EMA_HALF_LIFE_NS, mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS,
-            mlfq_consts_MLFQ_LONG_SLEEP_NS, mlfq_consts_MLFQ_PREEMPT_SLICE_NS,
-            mlfq_consts_MLFQ_Q1_QUOTA, mlfq_consts_MLFQ_Q1_SLICE_NS, mlfq_consts_MLFQ_Q2_QUOTA,
-            mlfq_consts_MLFQ_Q2_SLICE_NS, mlfq_consts_MLFQ_Q3_SLICE_NS,
-            mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS, mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS,
-            mlfq_consts_MLFQ_SHORT_SLEEP_NS, mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS,
-            mlfq_consts_MLFQ_TREE_T_BOUND_NS, mlfq_consts_MLFQ_TREE_T_INT_NS,
-            mlfq_consts_MLFQ_T_H_NS, mlfq_consts_MLFQ_T_L_NS,
+            mlfq_consts_MLFQ_AGING_PERIOD_NS, mlfq_consts_MLFQ_DISPATCH_MAX_BATCH,
+            mlfq_consts_MLFQ_GAUGE_MAX_NS, mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS,
+            mlfq_consts_MLFQ_PREEMPT_SLICE_NS, mlfq_consts_MLFQ_Q1_QUOTA,
+            mlfq_consts_MLFQ_Q1_SLICE_NS, mlfq_consts_MLFQ_Q2_QUOTA, mlfq_consts_MLFQ_Q2_SLICE_NS,
+            mlfq_consts_MLFQ_Q3_SLICE_NS, mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS,
+            mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS, mlfq_consts_MLFQ_SHORT_SLEEP_NS,
+            mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS, mlfq_consts_MLFQ_T_H_NS,
+            mlfq_consts_MLFQ_T_L_NS,
         };
 
         let cfg = Config::default();
@@ -610,14 +464,9 @@ mod tests {
         assert_eq!(cfg.q1_slice_ns, mlfq_consts_MLFQ_Q1_SLICE_NS as u64);
         assert_eq!(cfg.q2_slice_ns, mlfq_consts_MLFQ_Q2_SLICE_NS as u64);
         assert_eq!(cfg.q3_slice_ns, mlfq_consts_MLFQ_Q3_SLICE_NS as u64);
-        assert_eq!(cfg.budget_max_ns, mlfq_consts_MLFQ_BUDGET_MAX_NS as u64);
-        assert_eq!(cfg.alpha, mlfq_consts_MLFQ_ALPHA as u64);
+        assert_eq!(cfg.gauge_max_ns, mlfq_consts_MLFQ_GAUGE_MAX_NS as u64);
         assert_eq!(cfg.t_l_ns, mlfq_consts_MLFQ_T_L_NS as u64);
         assert_eq!(cfg.t_h_ns, mlfq_consts_MLFQ_T_H_NS as u64);
-        assert_eq!(
-            cfg.ema_half_life_ns,
-            mlfq_consts_MLFQ_EMA_HALF_LIFE_NS as u64
-        );
         assert_eq!(cfg.aging_period_ns, mlfq_consts_MLFQ_AGING_PERIOD_NS as u64);
         assert_eq!(cfg.short_sleep_ns, mlfq_consts_MLFQ_SHORT_SLEEP_NS as u64);
         assert_eq!(
@@ -628,7 +477,6 @@ mod tests {
             cfg.hysteresis_sleep_ns,
             mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS as u64
         );
-        assert_eq!(cfg.long_sleep_ns, mlfq_consts_MLFQ_LONG_SLEEP_NS as u64);
         assert_eq!(
             cfg.sameq_preempt_min_run_ns,
             mlfq_consts_MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS as u64
@@ -644,9 +492,6 @@ mod tests {
             cfg.rtdl_drain_interval_ns,
             mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS as u64
         );
-        assert_eq!(cfg.tree_t_int_ns, mlfq_consts_MLFQ_TREE_T_INT_NS as u64);
-        assert_eq!(cfg.tree_t_bound_ns, mlfq_consts_MLFQ_TREE_T_BOUND_NS as u64);
-        assert!(cfg.adapt_enabled, "the adaptation ships enabled");
     }
 
     #[test]
@@ -694,14 +539,16 @@ mod tests {
 
     #[test]
     fn rejects_t_l_at_or_above_t_h() {
-        assert!(ConfigBuilder::default().t_l_ns(2_000_000).build().is_err());
-        assert!(ConfigBuilder::default().t_l_ns(3_000_000).build().is_err());
+        // T_H default is 4 ms. T_L at or above that must fail.
+        assert!(ConfigBuilder::default().t_l_ns(4_000_000).build().is_err());
+        assert!(ConfigBuilder::default().t_l_ns(5_000_000).build().is_err());
     }
 
     #[test]
-    fn rejects_t_h_at_or_above_budget_max() {
-        assert!(ConfigBuilder::default().t_h_ns(6_000_000).build().is_err());
-        assert!(ConfigBuilder::default().t_h_ns(7_000_000).build().is_err());
+    fn rejects_t_h_at_or_above_gauge_max() {
+        // GAUGE_MAX_NS = 2^23 = 8_388_608 ns
+        assert!(ConfigBuilder::default().t_h_ns(8_388_608).build().is_err());
+        assert!(ConfigBuilder::default().t_h_ns(9_000_000).build().is_err());
     }
 
     #[test]
@@ -716,7 +563,6 @@ mod tests {
 
     #[test]
     fn rejects_quotas_consuming_the_batch() {
-        // Q1+Q2 must leave headroom for Q3 within dispatch_max_batch.
         let cfg = ConfigBuilder::default()
             .q1_quota(16)
             .q2_quota(16)
@@ -727,13 +573,10 @@ mod tests {
 
     #[test]
     fn rejects_dispatch_batch_above_ops_bound() {
-        // The rodata batch must never exceed the ops-table bound
-        // (.dispatch_max_batch = MLFQ_DISPATCH_MAX_BATCH in main.bpf.c).
         let cfg = ConfigBuilder::default()
             .dispatch_max_batch(crate::bpf_intf::mlfq_consts_MLFQ_DISPATCH_MAX_BATCH + 1)
             .build();
         assert!(cfg.is_err());
-        // At the ops-table bound itself the config is valid.
         let cfg = ConfigBuilder::default()
             .dispatch_max_batch(crate::bpf_intf::mlfq_consts_MLFQ_DISPATCH_MAX_BATCH)
             .build();
@@ -746,43 +589,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tree_bands_out_of_order() {
-        assert!(ConfigBuilder::default().tree_t_int_ns(0).build().is_err());
-        let cfg = ConfigBuilder::default()
-            .tree_t_int_ns(3_000_000)
-            .tree_t_bound_ns(3_000_000)
-            .build();
-        assert!(cfg.is_err());
-        let cfg = ConfigBuilder::default()
-            .tree_t_int_ns(4_000_000)
-            .tree_t_bound_ns(3_000_000)
-            .build();
-        assert!(cfg.is_err());
-        // The default band pair is valid.
+    fn rejects_gauge_max_at_or_below_t_h() {
+        // gauge_max must be strictly above T_H.
+        let cfg = ConfigBuilder::default().gauge_max_ns(2_000_000).build();
+        assert!(cfg.is_err()); // gauge_max == T_H
+        let cfg = ConfigBuilder::default().gauge_max_ns(1_000_000).build();
+        assert!(cfg.is_err()); // gauge_max < T_H
+                               // The default band pair is valid.
         assert!(ConfigBuilder::default().build().is_ok());
-    }
-
-    #[test]
-    fn adapt_gate_flag_round_trips() {
-        let cfg = ConfigBuilder::default()
-            .adapt_enabled(true)
-            .build()
-            .unwrap();
-        assert!(cfg.adapt_enabled);
-        let cfg = ConfigBuilder::default().build().unwrap();
-        assert!(cfg.adapt_enabled);
     }
 
     #[test]
     fn describe_is_stable() {
         let cfg = Config::default();
         let s = cfg.describe();
-        assert!(s.contains("slices: Q1=1000us Q2=2000us Q3=4000us"));
-        assert!(s.contains("T_L=250us, T_H=2000us"));
+        // Slices are powers of two: Q1=2^20=1048576ns=1048us, Q2=2^21=2048us, Q3=2^22=4194us
+        assert!(s.contains("T_L=250us, T_H=4000us"));
+        assert!(s.contains("cbs_period_mult=2"));
         assert!(s.contains("aging_period=1s"));
         assert!(s.contains("rtdl_drain_interval=1000us"));
         assert!(s.contains("quotas: Q1=4 Q2=8 max_batch=32"));
-        assert!(s.contains("tree_bands: T_INT=1000us T_BOUND=3000us"));
-        assert!(s.contains("adapt_enabled=true"));
     }
 }

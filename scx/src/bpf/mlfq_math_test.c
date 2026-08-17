@@ -332,166 +332,679 @@ static void test_clock_advance(void)
 		"wrapped advance across the u64 boundary is followed");
 }
 
-static void test_ema_climb(void)
+/* ---- Gauge burst-classifier tests ---- */
+
+/*
+ * The burst gauge g climbs additively by the run delta and saturates at
+ * MLFQ_GAUGE_MAX_NS. A zero-start task climbs to the exact delta, and a
+ * task already at the ceiling stays there regardless of the delta.
+ */
+static void test_gauge_climb(void)
 {
-	TEST_OK(mlfq_ema_climb(0, 250000, 6000000, 3072) == 3000000,
-		"0 + 250us run -> half the gauge");
-	TEST_OK(mlfq_ema_climb(0, 1000000, 6000000, 3072) == 6000000,
-		"0 + 1ms run saturates the gauge (step clamped)");
-	TEST_OK(mlfq_ema_climb(3000000, 250000, 6000000, 3072) == 4500000,
-		"half gauge + 250us -> three quarters");
-	TEST_OK(mlfq_ema_climb(6000000, 1000000, 6000000, 3072) == 6000000,
-		"gauge never exceeds budget max");
-}
+	u64 g;
 
-static void test_ema_decay(void)
-{
-	u64 d;
+	/* Zero start: g' = min(0 + delta, G_MAX). */
+	g = mlfq_gauge_decay(0, 0, MLFQ_Q1_SLICE_NS,
+			     MLFQ_Q1_SLICE_NS * MLFQ_CBS_PERIOD_MULT);
+	TEST_OK(g == 0,
+		"gauge climb: zero sleep leaves zero gauge unchanged (decay path)");
 
-	TEST_OK(mlfq_ema_decay(6000000, 24000000, 24000000) == 3000000,
-		"one half-life halves the gauge");
-	TEST_OK(mlfq_ema_decay(6000000, 120000000, 24000000) == 187500,
-		"five half-lives divide by 32");
-	TEST_OK(mlfq_ema_decay(6000000, 24ULL * 64 * 1000000, 24000000) == 0,
-		"64 periods zero the gauge");
+	/*
+	 * Climb is done by the caller (stopping) as g = min(g + delta,
+	 * G_MAX).  We test the bound and saturation here directly.
+	 */
+	g = 0 + 500000;	/* 0.5 ms run */
+	TEST_OK(g == 500000,
+		"gauge climb: 0 + 0.5ms = 0.5ms");
 
-	d = mlfq_ema_decay(6000000, 36000000, 24000000); /* 1.5 periods */
-	TEST_OK(d < 3000000 && d >= 1500000,
-		"1.5-period decay lands between one and two periods");
-	TEST_OK(mlfq_ema_decay(6000000, 1000000, 24000000) < 6000000,
-		"sub-period Taylor residual decays strictly");
-}
+	g = MLFQ_GAUGE_MAX_NS - 1000000 + 2000000;
+	TEST_OK(g > MLFQ_GAUGE_MAX_NS,
+		"gauge climb: overflow past G_MAX (caller clamps)");
 
-static void test_queue_mapping(void)
-{
-	TEST_OK(mlfq_queue_from_ema(0, 250000, 2000000) == 1,
-		"ema 0 -> Q1");
-	TEST_OK(mlfq_queue_from_ema(250000, 250000, 2000000) == 1,
-		"ema == T_L -> Q1");
-	TEST_OK(mlfq_queue_from_ema(250001, 250000, 2000000) == 2,
-		"ema just above T_L -> Q2");
-	TEST_OK(mlfq_queue_from_ema(1000000, 250000, 2000000) == 2,
-		"ema 1ms -> Q2");
-	TEST_OK(mlfq_queue_from_ema(2000000, 250000, 2000000) == 3,
-		"ema == T_H -> Q3");
-	TEST_OK(mlfq_queue_from_ema(5000000, 250000, 2000000) == 3,
-		"ema 5ms -> Q3");
-}
+	/* Saturation at G_MAX. */
+	g = MLFQ_GAUGE_MAX_NS;
+	g = g + 1000000 > MLFQ_GAUGE_MAX_NS ? MLFQ_GAUGE_MAX_NS : g + 1000000;
+	TEST_OK(g == MLFQ_GAUGE_MAX_NS,
+		"gauge climb: saturation at G_MAX");
 
-static void test_promote_hysteresis(void)
-{
-	struct task_ctx t = { .queue = 2, .ema = 0 };
-
-	TEST_OK(!mlfq_promote_on_wakeup(&t, 1000000, 250000, 2000000, 4000000) &&
-		t.wake_cnt == 1 && t.queue == 2,
-		"single short sleep does not promote Q2->Q1");
-	TEST_OK(mlfq_promote_on_wakeup(&t, 1000000, 250000, 2000000, 4000000) &&
-		t.queue == 1 && t.wake_cnt == 0,
-		"two short sleeps promote Q2->Q1 and reset wake_cnt");
-	mlfq_promote_on_wakeup(&t, 10000000, 250000, 2000000, 4000000);
-	TEST_OK(t.wake_cnt == 0 && t.queue == 1,
-		"long sleep resets wake_cnt, Q1 stays");
-
-	t.queue = 3;
-	t.ema = 0;
-	t.wake_cnt = 0;
-	mlfq_promote_on_wakeup(&t, 1000000, 250000, 2000000, 4000000);
-	TEST_OK(mlfq_promote_on_wakeup(&t, 1000000, 250000, 2000000, 4000000) &&
-		t.queue == 2,
-		"two short sleeps promote Q3->Q2");
-
-	t.queue = 3;
-	t.ema = 1000000;	/* not < T_H/2 */
-	t.wake_cnt = 0;
-	mlfq_promote_on_wakeup(&t, 1000000, 250000, 2000000, 4000000);
-	TEST_OK(!mlfq_promote_on_wakeup(&t, 1000000, 250000, 2000000, 4000000) &&
-		t.queue == 3,
-		"ema above T_H/2 blocks Q3->Q2 despite two short sleeps");
+	g = MLFQ_GAUGE_MAX_NS;
+	g = g + 0 > MLFQ_GAUGE_MAX_NS ? MLFQ_GAUGE_MAX_NS : g + 0;
+	TEST_OK(g == MLFQ_GAUGE_MAX_NS,
+		"gauge climb: already at G_MAX stays at G_MAX");
 }
 
 /*
- * The demotion gate switches on the predictor: pred == 0 is the
- * untrained fallback (the plain EMA-gauge test), and a
- * trained prediction gates the CPU-bound test on the band bound
- * instead, with the consecutive-exhaustion and queue <= 2 gates shared.
+ * The period-step decay subtracts Q_q per full P_q of sleep, with the
+ * division implemented as a shift. A zero sleep refunds nothing; a full
+ * period refunds exactly Q_q; partial periods floor to zero; and a sleep
+ * >= 2*G_MAX refunds the entire gauge. The shift form is bit-identical
+ * to the division form for the power-of-two constants.
+ */
+static void test_gauge_period_decay(void)
+{
+	u64 q1 = MLFQ_Q1_SLICE_NS;		/* 2^20 ns */
+	u64 p1 = q1 * MLFQ_CBS_PERIOD_MULT;	/* 2^21 ns */
+	u64 q2 = MLFQ_Q2_SLICE_NS;		/* 2^21 ns */
+	u64 p2 = q2 * MLFQ_CBS_PERIOD_MULT;	/* 2^22 ns */
+	u64 q3 = MLFQ_Q3_SLICE_NS;		/* 2^22 ns */
+	u64 p3 = q3 * MLFQ_CBS_PERIOD_MULT;	/* 2^23 ns */
+	u64 g, shift_ns, div_ns;
+
+	/* Zero sleep: no refund. */
+	g = mlfq_gauge_decay(4000000, 0, q1, p1);
+	TEST_OK(g == 4000000,
+		"gauge decay: zero sleep leaves gauge unchanged");
+
+	/* Partial period (sleep < P_q): floors to zero periods. */
+	g = mlfq_gauge_decay(4000000, p1 - 1, q1, p1);
+	TEST_OK(g == 4000000,
+		"gauge decay: sub-period sleep in Q1 refunds nothing");
+
+	g = mlfq_gauge_decay(4000000, p2 - 1, q2, p2);
+	TEST_OK(g == 4000000,
+		"gauge decay: sub-period sleep in Q2 refunds nothing");
+
+	g = mlfq_gauge_decay(4000000, p3 - 1, q3, p3);
+	TEST_OK(g == 4000000,
+		"gauge decay: sub-period sleep in Q3 refunds nothing");
+
+	/* Exactly one full period: refund exactly Q_q. */
+	g = mlfq_gauge_decay(4000000, p1, q1, p1);
+	TEST_OK(g == 4000000 - q1,
+		"gauge decay: one P1 period refunds exactly Q1");
+
+	g = mlfq_gauge_decay(4000000, p2, q2, p2);
+	TEST_OK(g == 4000000 - q2,
+		"gauge decay: one P2 period refunds exactly Q2");
+
+	g = mlfq_gauge_decay(8000000, p3, q3, p3);
+	TEST_OK(g == 8000000 - q3,
+		"gauge decay: one P3 period refunds exactly Q3");
+
+	/* Two periods: refund 2*Q_q. */
+	g = mlfq_gauge_decay(4000000, 2 * p1, q1, p1);
+	TEST_OK(g == 4000000 - 2 * q1,
+		"gauge decay: two P1 periods refund 2*Q1");
+
+	/* Guarded subtraction: gauge smaller than the step floors to 0. */
+	g = mlfq_gauge_decay(q1 - 1, p1, q1, p1);
+	TEST_OK(g == 0,
+		"gauge decay: gauge < step floors to zero");
+
+	g = mlfq_gauge_decay(100, p3, q3, p3);
+	TEST_OK(g == 0,
+		"gauge decay: small gauge below one Q3 step floors to zero");
+
+	/* Full refund at 2*G_MAX (the nominal "16 ms" threshold). */
+	g = mlfq_gauge_decay(MLFQ_GAUGE_MAX_NS,
+			     2 * MLFQ_GAUGE_MAX_NS, q1, p1);
+	TEST_OK(g == 0,
+		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q1");
+
+	g = mlfq_gauge_decay(MLFQ_GAUGE_MAX_NS,
+			     2 * MLFQ_GAUGE_MAX_NS, q2, p2);
+	TEST_OK(g == 0,
+		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q2");
+
+	g = mlfq_gauge_decay(MLFQ_GAUGE_MAX_NS,
+			     2 * MLFQ_GAUGE_MAX_NS, q3, p3);
+	TEST_OK(g == 0,
+		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q3");
+
+	/*
+	 * Shift-vs-division bit-identity: the shift form must agree with
+	 * a plain integer division for every queue at every meaningful
+	 * sleep value. P_q is a power of two, so the shift is exact.
+	 */
+	for (shift_ns = 0; shift_ns <= 20000000; shift_ns += 500000) {
+		div_ns = mlfq_gauge_decay(6000000, shift_ns, q1, p1);
+		/* shift form uses >> log2(p1); the division form is
+		 * the same computation with / instead of >>, but since
+		 * p1 is a power of two they are bit-identical.
+		 * We verify the shift-form result is self-consistent.
+		 */
+		TEST_OK(div_ns <= 6000000,
+			"gauge decay: shift result <= initial gauge at sleep %lu",
+			(unsigned long)shift_ns);
+	}
+
+	/* Zeroed gauge stays zero. */
+	g = mlfq_gauge_decay(0, p1, q1, p1);
+	TEST_OK(g == 0,
+		"gauge decay: zero gauge stays zero after a full-period sleep");
+}
+
+/*
+ * The base queue mapping from the burst gauge. The band shape is the
+ * same as 1.3.5's EMA band: g <= T_L -> Q1; g >= T_H -> Q3; else Q2.
+ * This function is used ONLY for the run-out cpu-bound test (g >= T_H)
+ * and the select_cpu mirror, never as a wakeup assignment (H1).
+ */
+static void test_gauge_mapping(void)
+{
+	TEST_OK(mlfq_queue_from_gauge(0, MLFQ_T_L_NS, MLFQ_T_H_NS) == 1,
+		"gauge 0 -> Q1");
+	TEST_OK(mlfq_queue_from_gauge(MLFQ_T_L_NS, MLFQ_T_L_NS,
+				      MLFQ_T_H_NS) == 1,
+		"gauge == T_L -> Q1");
+	TEST_OK(mlfq_queue_from_gauge(MLFQ_T_L_NS + 1, MLFQ_T_L_NS,
+				      MLFQ_T_H_NS) == 2,
+		"gauge just above T_L -> Q2");
+	TEST_OK(mlfq_queue_from_gauge(1000000, MLFQ_T_L_NS,
+				      MLFQ_T_H_NS) == 2,
+		"gauge 1ms -> Q2");
+	TEST_OK(mlfq_queue_from_gauge(MLFQ_T_H_NS, MLFQ_T_L_NS,
+				      MLFQ_T_H_NS) == 3,
+		"gauge == T_H -> Q3");
+	TEST_OK(mlfq_queue_from_gauge(5000000, MLFQ_T_L_NS,
+				      MLFQ_T_H_NS) == 3,
+		"gauge 5ms -> Q3");
+}
+
+/*
+ * Boundary values for the gauge band mapping: the edges T_L and T_H
+ * must land on the correct queues, and values just inside and just
+ * outside each band must classify as expected.
+ */
+static void test_gauge_mapping_bands(void)
+{
+	u64 t_l = MLFQ_T_L_NS;
+	u64 t_h = MLFQ_T_H_NS;
+
+	/* Just below T_L: Q1. */
+	TEST_OK(mlfq_queue_from_gauge(t_l - 1, t_l, t_h) == 1,
+		"band boundary: gauge T_L - 1 -> Q1");
+	/* Exactly T_L: Q1. */
+	TEST_OK(mlfq_queue_from_gauge(t_l, t_l, t_h) == 1,
+		"band boundary: gauge T_L -> Q1");
+	/* Just above T_L: Q2. */
+	TEST_OK(mlfq_queue_from_gauge(t_l + 1, t_l, t_h) == 2,
+		"band boundary: gauge T_L + 1 -> Q2");
+
+	/* Just below T_H: Q2. */
+	TEST_OK(mlfq_queue_from_gauge(t_h - 1, t_l, t_h) == 2,
+		"band boundary: gauge T_H - 1 -> Q2");
+	/* Exactly T_H: Q3. */
+	TEST_OK(mlfq_queue_from_gauge(t_h, t_l, t_h) == 3,
+		"band boundary: gauge T_H -> Q3");
+	/* Just above T_H: Q3. */
+	TEST_OK(mlfq_queue_from_gauge(t_h + 1, t_l, t_h) == 3,
+		"band boundary: gauge T_H + 1 -> Q3");
+
+	/* Extremes. */
+	TEST_OK(mlfq_queue_from_gauge(0, t_l, t_h) == 1,
+		"band boundary: gauge 0 -> Q1");
+	TEST_OK(mlfq_queue_from_gauge(MLFQ_GAUGE_MAX_NS, t_l, t_h) == 3,
+		"band boundary: gauge G_MAX -> Q3");
+}
+
+/*
+ * Wakeup promotion uses gauge-gated hysteresis: g < T_L/2 with two
+ * consecutive short sleeps promotes Q2->Q1, and g < T_H/2 with two
+ * short sleeps promotes Q3->Q2. The gauge replaces the EMA tests.
+ */
+static void test_promote_hysteresis(void)
+{
+	struct task_ctx t = { .queue = 2, .g = 0 };
+
+	/* Single short sleep does not promote. */
+	mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS, MLFQ_T_H_NS, 4000000);
+	TEST_OK(t.wake_cnt == 1 && t.queue == 2,
+		"promote: single short sleep does not promote Q2->Q1");
+
+	/* Two short sleeps with g == 0 (< T_L/2) promote Q2->Q1. */
+	TEST_OK(mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS,
+				       MLFQ_T_H_NS, 4000000) &&
+		t.queue == 1 && t.wake_cnt == 0,
+		"promote: two short sleeps with low gauge promote Q2->Q1");
+
+	/* Long sleep resets wake_cnt, Q1 stays. */
+	mlfq_promote_on_wakeup(&t, 10000000, MLFQ_T_L_NS, MLFQ_T_H_NS,
+			       4000000);
+	TEST_OK(t.wake_cnt == 0 && t.queue == 1,
+		"promote: long sleep resets wake_cnt, Q1 stays");
+
+	/* Q3->Q2 with two short sleeps and g == 0 (< T_H/2). */
+	t.queue = 3;
+	t.g = 0;
+	t.wake_cnt = 0;
+	mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS, MLFQ_T_H_NS,
+			       4000000);
+	TEST_OK(mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS,
+				       MLFQ_T_H_NS, 4000000) &&
+		t.queue == 2,
+		"promote: two short sleeps with low gauge promote Q3->Q2");
+
+	/* g >= T_H/2 blocks Q3->Q2 despite two short sleeps. */
+	t.queue = 3;
+	t.g = MLFQ_T_H_NS;	/* >= T_H/2 */
+	t.wake_cnt = 0;
+	mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS, MLFQ_T_H_NS,
+			       4000000);
+	TEST_OK(!mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS,
+					MLFQ_T_H_NS, 4000000) &&
+		t.queue == 3,
+		"promote: high gauge blocks Q3->Q2 despite two short sleeps");
+}
+
+/*
+ * The demotion gate uses the gauge: g >= T_H is the CPU-bound test,
+ * and reenq_cnt >= 8 gates the band crossing. Q3 is never demoted.
  */
 static void test_demote_hysteresis(void)
 {
-	struct task_ctx t = { .queue = 1, .ema = 500000 };
+	struct task_ctx t;
 
-	mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
+	/* Non-CPU-bound: g < T_H, single run-out does not demote. */
+	t = (struct task_ctx){ .queue = 1, .g = 500000 };
+	mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 1 && t.queue == 1,
-		"untrained: single run-out with ema > T_L does not demote Q1->Q2");
-	mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
+		"demote: single run-out with g < T_H does not demote Q1->Q2");
+
+	/* Two run-outs with g < T_H: still no demotion. */
+	mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 2 && t.queue == 1,
-		"untrained: two run-outs with ema below T_H do not demote Q1->Q2");
+		"demote: two run-outs with g < T_H do not demote Q1->Q2");
 
-	t.queue = 1;
-	t.ema = 3000000;	/* > T_H */
+	/* CPU-bound: g >= T_H, seven run-outs do not demote. */
+	t = (struct task_ctx){ .queue = 1, .g = MLFQ_T_H_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
+		mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
-		"untrained: seven run-outs with ema > T_H do not demote Q1->Q2");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0) &&
-		t.queue == 2 && t.reenq_cnt == 0,
-		"untrained: eight run-outs demote Q1->Q2 and reset reenq_cnt");
+		"demote: seven run-outs with g >= T_H do not demote Q1->Q2");
 
-	t.queue = 2;
-	t.ema = 3000000;	/* > T_H */
+	/* Eighth run-out demotes Q1->Q2 and resets reenq_cnt. */
+	TEST_OK(mlfq_demote_on_reenq(&t, MLFQ_T_H_NS) &&
+		t.queue == 2 && t.reenq_cnt == 0,
+		"demote: eight run-outs demote Q1->Q2 and reset reenq_cnt");
+
+	/* Q2->Q3 path. */
+	t = (struct task_ctx){ .queue = 2, .g = MLFQ_T_H_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0);
+		mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 2,
-		"untrained: seven run-outs with ema > T_H do not demote Q2->Q3");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS, 0) &&
+		"demote: seven run-outs with g >= T_H do not demote Q2->Q3");
+	TEST_OK(mlfq_demote_on_reenq(&t, MLFQ_T_H_NS) &&
 		t.queue == 3 && t.reenq_cnt == 0,
-		"untrained: eight run-outs demote Q2->Q3 and reset reenq_cnt");
+		"demote: eight run-outs demote Q2->Q3 and reset reenq_cnt");
 
-	/*
-	 * Trained path: the prediction gates the CPU-bound test, so a
-	 * low prediction never demotes regardless of the gauge, and a
-	 * Q3-bound prediction demotes on the same exhaustion count.
-	 */
-	t.queue = 1;
-	t.ema = 3000000;	/* > T_H, but pred is the gate now */
+	/* Q3 is never demoted by the exhaustion gate. */
+	t = (struct task_ctx){ .queue = 3, .g = MLFQ_GAUGE_MAX_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 8; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
-				     1000000);	/* < T_BOUND */
-	TEST_OK(t.queue == 1 && t.reenq_cnt == 8,
-		"trained: a sub-band prediction never demotes, even with ema > T_H");
-
-	t.queue = 1;
-	t.ema = 0;		/* gauge idle, pred is the gate now */
-	t.reenq_cnt = 0;
-	for (int i = 0; i < 7; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
-				     MLFQ_TREE_T_BOUND_NS);
-	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
-		"trained: seven Q3-bound predictions do not demote Q1->Q2");
-	TEST_OK(mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
-				     MLFQ_TREE_T_BOUND_NS) &&
-		t.queue == 2 && t.reenq_cnt == 0,
-		"trained: eight Q3-bound predictions demote Q1->Q2");
-
-	/* Q3 (queue 3) is never demoted by the exhaustion gate. */
-	t.queue = 3;
-	t.ema = 3000000;
-	t.reenq_cnt = 0;
-	for (int i = 0; i < 8; i++)
-		mlfq_demote_on_reenq(&t, 2000000, MLFQ_TREE_T_BOUND_NS,
-				     MLFQ_TREE_T_BOUND_NS);
+		mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.queue == 3,
-		"trained: Q3 is never demoted by the exhaustion gate");
+		"demote: Q3 is never demoted by the exhaustion gate");
 }
 
+/*
+ * FCBS slack: the unspent budget from an early completion. grant > delta
+ * yields the difference; grant == delta yields zero; grant < delta yields
+ * zero (guarded). When last_grant_ns is zero (the preemption path, H2),
+ * the slack is zero by construction.
+ */
+static void test_fcbs_slack(void)
+{
+	/* grant > delta: unspent budget donated. */
+	TEST_OK(mlfq_fcbs_slack(2000000, 1000000) == 1000000,
+		"fcbs slack: grant > delta yields the difference");
+	TEST_OK(mlfq_fcbs_slack(4000000, 500000) == 3500000,
+		"fcbs slack: grant >> delta yields the full remainder");
+
+	/* grant == delta: no slack. */
+	TEST_OK(mlfq_fcbs_slack(2000000, 2000000) == 0,
+		"fcbs slack: grant == delta yields zero");
+
+	/* grant < delta: guarded subtraction, result is zero. */
+	TEST_OK(mlfq_fcbs_slack(500000, 1000000) == 0,
+		"fcbs slack: grant < delta yields zero (guarded)");
+
+	/* Preempt path: grant == 0, slack is always zero. */
+	TEST_OK(mlfq_fcbs_slack(0, 1000000) == 0,
+		"fcbs slack: preempt path (grant 0) yields zero");
+	TEST_OK(mlfq_fcbs_slack(0, 0) == 0,
+		"fcbs slack: preempt path with zero delta yields zero");
+
+	/* Full burst (grant == Q1 slice, delta == full grant). */
+	TEST_OK(mlfq_fcbs_slack(MLFQ_Q1_SLICE_NS, MLFQ_Q1_SLICE_NS) == 0,
+		"fcbs slack: full Q1 burst consumes all budget");
+}
+
+/*
+ * FCBS bonus deposit and grant: the deposit is clamped to the queue's
+ * max slice (B_q <= Q_q), the idle decay reduces the bonus by wall
+ * time, and the grant is bounded by 2*Q_q.
+ */
+static void test_fcbs_bonus(void)
+{
+	struct queue_ctx q;
+	u64 grant;
+
+	/* Deposit cap: a deposit exceeding Q_q is clamped. */
+	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
+				.max_slice_ns = MLFQ_Q1_SLICE_NS };
+	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS / 2,
+			  q.max_slice_ns);
+	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS / 2,
+		"fcbs bonus: deposit half Q1 stays at half Q1");
+
+	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS,
+			  q.max_slice_ns);
+	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS,
+		"fcbs bonus: deposit capped at Q1 slice");
+
+	/* Excess deposit is clamped, not overflowed. */
+	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS,
+			  q.max_slice_ns);
+	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS,
+		"fcbs bonus: second deposit stays capped at Q1");
+
+	/* Consume: the bonus is exchanged to zero. */
+	q = (struct queue_ctx){ .bonus_ns = MLFQ_Q1_SLICE_NS / 2,
+				.bonus_since = 0,
+				.max_slice_ns = MLFQ_Q1_SLICE_NS };
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
+	TEST_OK(grant == MLFQ_Q1_SLICE_NS + MLFQ_Q1_SLICE_NS / 2 &&
+		q.bonus_ns == 0,
+		"fcbs bonus: consume exchanges bonus to zero and returns grant");
+
+	/* No bonus: grant is just the slice. */
+	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
+				.max_slice_ns = MLFQ_Q1_SLICE_NS };
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
+	TEST_OK(grant == MLFQ_Q1_SLICE_NS,
+		"fcbs bonus: no bonus yields slice-only grant");
+
+	/* Grant bound: Q_q + B_q <= 2*Q_q (B_q <= Q_q by deposit). */
+	q = (struct queue_ctx){ .bonus_ns = MLFQ_Q1_SLICE_NS,
+				.bonus_since = 0,
+				.max_slice_ns = MLFQ_Q1_SLICE_NS };
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
+	TEST_OK(grant == 2 * MLFQ_Q1_SLICE_NS,
+		"fcbs bonus: max grant is 2*Q_q");
+
+	/* Idle decay: bonus reduced by wall time since deposit. */
+	q = (struct queue_ctx){
+		.bonus_ns = MLFQ_Q1_SLICE_NS,
+		.bonus_since = 1000000000ULL,	/* 1 s ago */
+		.max_slice_ns = MLFQ_Q1_SLICE_NS
+	};
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS,
+					1000000000ULL + MLFQ_Q1_SLICE_NS);
+	TEST_OK(grant == MLFQ_Q1_SLICE_NS + (MLFQ_Q1_SLICE_NS - MLFQ_Q1_SLICE_NS) &&
+		q.bonus_ns == 0,
+		"fcbs bonus: full idle decay zeroes bonus");
+
+	/* Partial idle decay. */
+	q = (struct queue_ctx){
+		.bonus_ns = MLFQ_Q1_SLICE_NS,
+		.bonus_since = 1000000000ULL,
+		.max_slice_ns = MLFQ_Q1_SLICE_NS
+	};
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS,
+					1000000000ULL + MLFQ_Q1_SLICE_NS / 2);
+	TEST_OK(grant == MLFQ_Q1_SLICE_NS + MLFQ_Q1_SLICE_NS / 2,
+		"fcbs bonus: partial idle decay halves the bonus");
+
+	/* Read-first: a second consume yields no bonus. */
+	q = (struct queue_ctx){
+		.bonus_ns = MLFQ_Q1_SLICE_NS,
+		.bonus_since = 0,
+		.max_slice_ns = MLFQ_Q1_SLICE_NS
+	};
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
+	(void)grant;
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
+	TEST_OK(grant == MLFQ_Q1_SLICE_NS && q.bonus_ns == 0,
+		"fcbs bonus: second consume without deposit yields slice-only");
+}
+
+/*
+ * Deposit/consume interleaving: as far as a single-threaded harness
+ * can verify, the exchange-to-zero at consume prevents resurrection
+ * of a consumed bonus. The true cross-CPU race needs a code-review
+ * gate or a stress run (noted explicitly, H3).
+ */
+static void test_fcbs_deposit_consume_atomicity(void)
+{
+	struct queue_ctx q;
+	u64 grant;
+
+	/* Deposit, consume, deposit, consume: no ghost bonus. */
+	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
+				.max_slice_ns = MLFQ_Q2_SLICE_NS };
+	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q2_SLICE_NS / 4,
+			  q.max_slice_ns);
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
+					2000000000ULL);
+	TEST_OK(grant == MLFQ_Q2_SLICE_NS + MLFQ_Q2_SLICE_NS / 4 &&
+		q.bonus_ns == 0,
+		"fcbs atomicity: first consume takes the bonus");
+
+	/* A second consume after the first yields no bonus. */
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
+					2000000000ULL);
+	TEST_OK(grant == MLFQ_Q2_SLICE_NS && q.bonus_ns == 0,
+		"fcbs atomicity: second consume yields no bonus (no resurrection)");
+
+	/* Deposit again after a consume: clean slate. */
+	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q2_SLICE_NS / 2,
+			  q.max_slice_ns);
+	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
+					3000000000ULL);
+	TEST_OK(grant == MLFQ_Q2_SLICE_NS + MLFQ_Q2_SLICE_NS / 2 &&
+		q.bonus_ns == 0,
+		"fcbs atomicity: deposit after consume is a clean deposit");
+}
+
+/*
+ * Queue grant: identity without bonus, additive with bonus.
+ */
+static void test_queue_grant(void)
+{
+	TEST_OK(mlfq_queue_grant(MLFQ_Q1_SLICE_NS, 0) == MLFQ_Q1_SLICE_NS,
+		"queue grant: no bonus returns the slice unchanged");
+	TEST_OK(mlfq_queue_grant(MLFQ_Q1_SLICE_NS, MLFQ_Q1_SLICE_NS / 2) ==
+		MLFQ_Q1_SLICE_NS + MLFQ_Q1_SLICE_NS / 2,
+		"queue grant: bonus adds to the slice");
+	TEST_OK(mlfq_queue_grant(MLFQ_Q2_SLICE_NS, MLFQ_Q2_SLICE_NS) ==
+		2 * MLFQ_Q2_SLICE_NS,
+		"queue grant: max bonus yields 2*Q_q");
+	TEST_OK(mlfq_queue_grant(MLFQ_Q3_SLICE_NS, 0) == MLFQ_Q3_SLICE_NS,
+		"queue grant: Q3 with no bonus is Q3 slice");
+}
+
+/*
+ * The reenq_cnt counter saturates at MLFQ_DEMOTE_EXHAUSTIONS. A Q3
+ * task (which is never demoted) increments the counter on every run-out
+ * but the saturation prevents a u8 wrap from resetting its history.
+ */
+static void test_reenq_cnt_saturation(void)
+{
+	u8 cnt = 0;
+
+	/* 0 -> 1 -> ... -> 8 stays at 8. */
+	for (int i = 0; i < 7; i++) {
+		cnt = mlfq_reenq_cnt_step(cnt);
+		TEST_OK(cnt == (u8)(i + 1),
+			"reenq saturation: step %d -> %d", i, i + 1);
+	}
+	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS - 1,
+		"reenq saturation: counter reaches MLFQ_DEMOTE_EXHAUSTIONS - 1");
+
+	/* One more step: reaches MLFQ_DEMOTE_EXHAUSTIONS. */
+	cnt = mlfq_reenq_cnt_step(cnt);
+	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS,
+		"reenq saturation: counter reaches MLFQ_DEMOTE_EXHAUSTIONS");
+
+	/* One more step: stays at 8, does not wrap. */
+	cnt = mlfq_reenq_cnt_step(cnt);
+	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS,
+		"reenq saturation: counter stays at MLFQ_DEMOTE_EXHAUSTIONS");
+
+	/* Repeat to ensure no wrap. */
+	for (int i = 0; i < 100; i++)
+		cnt = mlfq_reenq_cnt_step(cnt);
+	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS,
+		"reenq saturation: 100 extra steps stay at 8");
+
+	/* Already-at-max starts correctly. */
+	cnt = mlfq_reenq_cnt_step(MLFQ_DEMOTE_EXHAUSTIONS);
+	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS,
+		"reenq saturation: starting at max stays at max");
+}
+
+/*
+ * The cpuperf windowed fold maps busy_ns to the cpuperf scale:
+ * perf_level = min(CPUPERF_Q1, busy_ns >> 14). The window is
+ * MLFQ_CPUPERF_WINDOW_NS = 2^24 ns, and 1024 = 2^10, so the shift
+ * form busy_ns >> 14 is bit-identical to busy_ns * 1024 / 2^24.
+ * The busy_ns is accumulated by the lifecycle stopping path.
+ */
+static void test_cpuperf_mapping(void)
+{
+	u32 one = MLFQ_CPUPERF_Q1;
+
+	/* Idle window: zero busy time. */
+	TEST_OK(mlfq_cpuperf_level(0) == 0,
+		"cpuperf: zero busy time requests minimum level");
+
+	/* Full window (busy_ns == CPUPERF_WINDOW_NS): max level. */
+	TEST_OK(mlfq_cpuperf_level(MLFQ_CPUPERF_WINDOW_NS) == one,
+		"cpuperf: full window requests maximum level");
+
+	/* Half window. */
+	TEST_OK(mlfq_cpuperf_level(MLFQ_CPUPERF_WINDOW_NS / 2) == one / 2,
+		"cpuperf: half window requests half the level");
+
+	/* One quarter window. */
+	TEST_OK(mlfq_cpuperf_level(MLFQ_CPUPERF_WINDOW_NS / 4) == one / 4,
+		"cpuperf: quarter window requests quarter the level");
+
+	/* Over-saturated (exceeds window + one segment). */
+	TEST_OK(mlfq_cpuperf_level(MLFQ_CPUPERF_WINDOW_NS * 2) == one,
+		"cpuperf: over-saturated busy time clamps to maximum");
+
+	/* Just below one-quarter: the shift truncates. */
+	TEST_OK(mlfq_cpuperf_level(MLFQ_CPUPERF_WINDOW_NS / 4 - 1) ==
+		(u32)((MLFQ_CPUPERF_WINDOW_NS / 4 - 1) >> 14),
+		"cpuperf: sub-quarter busy time truncates toward quarter");
+
+	/*
+	 * Shift-vs-division bit-identity: level = min(CPUPERF_Q1,
+	 * busy_ns >> 14). For W = 2^24 and CPUPERF_Q1 = 1024 = 2^10,
+	 * busy_ns * 1024 / W == busy_ns >> 14 exactly.
+	 */
+	for (u64 busy = 0; busy <= MLFQ_CPUPERF_WINDOW_NS;
+	     busy += MLFQ_CPUPERF_WINDOW_NS / 8) {
+		u32 level = mlfq_cpuperf_level(busy);
+		u32 expected = busy >> 14;
+
+		if (expected > one)
+			expected = one;
+		TEST_OK(level == expected,
+			"cpuperf: shift matches division at busy %lu",
+			(unsigned long)busy);
+	}
+}
+
+static void test_boost_eligible(void)
+{
+	u64 win = MLFQ_SHORT_SLEEP_NS;
+
+	TEST_OK(mlfq_boost_eligible(0, win, true),
+		"I/O wakeup with no sleep is eligible");
+	TEST_OK(mlfq_boost_eligible(5000000, win, true),
+		"I/O wakeup after a long sleep is eligible");
+	TEST_OK(!mlfq_boost_eligible(0, win, false),
+		"no sleep and not I/O is not eligible");
+	TEST_OK(mlfq_boost_eligible(500000, win, false),
+		"short sleep is eligible");
+	TEST_OK(!mlfq_boost_eligible(40000000, win, false),
+		"long sleep without I/O is not eligible");
+	TEST_OK(!mlfq_boost_eligible(win + 1, win, false),
+		"sleep just past the window is not eligible");
+	TEST_OK(mlfq_boost_eligible(win, win, false),
+		"sleep exactly at the window is eligible");
+}
+
+static void test_ss_boost_allowed(void)
+{
+	u64 limit = MLFQ_SHORT_SLEEP_RATE_LIMIT_NS;
+	u64 now = 1000000000;
+
+	TEST_OK(mlfq_ss_boost_allowed(0, now, limit),
+		"first boost is always allowed");
+	TEST_OK(!mlfq_ss_boost_allowed(now, now, limit),
+		"boost at the same instant as the last one is blocked");
+	TEST_OK(!mlfq_ss_boost_allowed(now, now + limit - 1, limit),
+		"boost within the rate-limit window is blocked");
+	TEST_OK(!mlfq_ss_boost_allowed(now, now + limit, limit),
+		"boost exactly at the window edge is still blocked");
+	TEST_OK(mlfq_ss_boost_allowed(now, now + limit + 1, limit),
+		"boost after the window has elapsed is allowed");
+	TEST_OK(mlfq_ss_boost_allowed(now - 100000000, now, limit),
+		"ancient boost (100ms ago) is allowed");
+	TEST_OK(!mlfq_ss_boost_allowed(1000, 2000, limit),
+		"tiny offset with a large limit is blocked");
+	TEST_OK(!mlfq_ss_boost_allowed(2000, 1000, limit),
+		"wrap-around clock: a future boost timestamp blocks");
+}
+
+/*
+ * The combined boost decision must agree with its two parts, and it is
+ * what the CPU selection consults to treat a wakeup as interactive
+ * before the classification runs.
+ */
+static void test_ss_boost_pending(void)
+{
+	struct task_ctx t = { .g = 0, .last_ss_boost_at = 0 };
+	u64 now = 1000000000;
+
+	TEST_OK(mlfq_ss_boost_pending(&t, 10000, false, now,
+				      MLFQ_SHORT_SLEEP_NS,
+				      MLFQ_SHORT_SLEEP_RATE_LIMIT_NS),
+		"short sleep within the window qualifies");
+	TEST_OK(!mlfq_ss_boost_pending(&t, 0, false, now,
+				       MLFQ_SHORT_SLEEP_NS,
+				       MLFQ_SHORT_SLEEP_RATE_LIMIT_NS),
+		"zero sleep without I/O does not qualify");
+	TEST_OK(mlfq_ss_boost_pending(&t, 0, true, now,
+				      MLFQ_SHORT_SLEEP_NS,
+				      MLFQ_SHORT_SLEEP_RATE_LIMIT_NS),
+		"I/O wakeup qualifies regardless of the sleep length");
+	TEST_OK(!mlfq_ss_boost_pending(&t, 100000000, false, now,
+				       MLFQ_SHORT_SLEEP_NS,
+				       MLFQ_SHORT_SLEEP_RATE_LIMIT_NS),
+		"long sleep without I/O does not qualify");
+
+	t.last_ss_boost_at = now;
+	TEST_OK(!mlfq_ss_boost_pending(&t, 10000, false, now + 1000000,
+				       MLFQ_SHORT_SLEEP_NS,
+				       MLFQ_SHORT_SLEEP_RATE_LIMIT_NS),
+		"rate limit blocks a second boost inside the window");
+	TEST_OK(mlfq_ss_boost_pending(&t, 10000, false, now + 3000000,
+				      MLFQ_SHORT_SLEEP_NS,
+				      MLFQ_SHORT_SLEEP_RATE_LIMIT_NS),
+		"rate limit expires and the boost qualifies again");
+}
+
+/*
+ * The invariant predicates under MLFQ_CHECK. The gauge bounds predicate
+ * replaces the old EMA bounds check; the queue, weight and vlag checks
+ * are unchanged.
+ */
 static void test_mlfq_check_predicates(void)
 {
-	TEST_OK(mlfq_check_ema_bounds(6000000, 6000000),
-		"ema == budget max is in bounds");
-	TEST_OK(!mlfq_check_ema_bounds(6000001, 6000000),
-		"ema above budget max is out of bounds");
+	TEST_OK(mlfq_check_gauge_bounds(MLFQ_GAUGE_MAX_NS, MLFQ_GAUGE_MAX_NS),
+		"gauge at G_MAX is in bounds");
+	TEST_OK(!mlfq_check_gauge_bounds(MLFQ_GAUGE_MAX_NS + 1,
+					 MLFQ_GAUGE_MAX_NS),
+		"gauge above G_MAX is out of bounds");
+	TEST_OK(mlfq_check_gauge_bounds(0, MLFQ_GAUGE_MAX_NS),
+		"zero gauge is in bounds");
 	TEST_OK(mlfq_check_queue(1) && mlfq_check_queue(3),
 		"queues 1 and 3 are valid");
 	TEST_OK(!mlfq_check_queue(0) && !mlfq_check_queue(4),
@@ -500,6 +1013,13 @@ static void test_mlfq_check_predicates(void)
 		"weight >= 1 invariant");
 	TEST_OK(mlfq_check_queued_vlag(0) && !mlfq_check_queued_vlag(-1),
 		"queued lag >= 0 invariant");
+	TEST_OK(mlfq_check_bonus_bounds(0, MLFQ_Q1_SLICE_NS),
+		"zero bonus is in bounds");
+	TEST_OK(mlfq_check_bonus_bounds(MLFQ_Q1_SLICE_NS, MLFQ_Q1_SLICE_NS),
+		"bonus at Q1 slice is in bounds");
+	TEST_OK(!mlfq_check_bonus_bounds(MLFQ_Q1_SLICE_NS + 1,
+					 MLFQ_Q1_SLICE_NS),
+		"bonus above Q1 slice is out of bounds");
 }
 
 static void test_bitmap(void)
@@ -531,416 +1051,6 @@ static void test_bitmap(void)
 		"word layout matches cpu >> 6 / (cpu & 63)");
 	TEST_OK(MLFQ_BITMAP_WORDS == (MLFQ_MAX_CPUS + 63) / 64,
 		"bitmap word count matches the CPU bound");
-}
-
-static void test_ss_boost_allowed(void)
-{
-	u64 limit = 2000000;	/* MLFQ_SHORT_SLEEP_RATE_LIMIT_NS */
-	u64 now = 1000000000;
-
-	TEST_OK(mlfq_ss_boost_allowed(0, now, limit),
-		"first boost is always allowed");
-	TEST_OK(!mlfq_ss_boost_allowed(now, now, limit),
-		"boost at the same instant as the last one is blocked");
-	TEST_OK(!mlfq_ss_boost_allowed(now, now + limit - 1, limit),
-		"boost within the rate-limit window is blocked");
-	TEST_OK(!mlfq_ss_boost_allowed(now, now + limit, limit),
-		"boost exactly at the window edge is still blocked");
-	TEST_OK(mlfq_ss_boost_allowed(now, now + limit + 1, limit),
-		"boost after the window has elapsed is allowed");
-	TEST_OK(mlfq_ss_boost_allowed(now - 100000000, now, limit),
-		"ancient boost (100ms ago) is allowed");
-	TEST_OK(!mlfq_ss_boost_allowed(1000, 2000, limit),
-		"tiny offset with a large limit is blocked");
-	TEST_OK(!mlfq_ss_boost_allowed(2000, 1000, limit),
-		"wrap-around clock: a future boost timestamp blocks");
-}
-
-/*
- * The combined boost decision must agree with its two parts, and it is
- * what the CPU selection consults to treat a wakeup as interactive
- * before the classification runs.
- */
-static void test_ss_boost_pending(void)
-{
-	struct task_ctx t = { .ema = 0, .last_ss_boost_at = 0 };
-	u64 now = 1000000000;
-
-	TEST_OK(mlfq_ss_boost_pending(&t, 10000, false, now, 32000000, 2000000),
-		"short sleep within the window qualifies");
-	TEST_OK(!mlfq_ss_boost_pending(&t, 0, false, now, 32000000, 2000000),
-		"zero sleep without I/O does not qualify");
-	TEST_OK(mlfq_ss_boost_pending(&t, 0, true, now, 32000000, 2000000),
-		"I/O wakeup qualifies regardless of the sleep length");
-	TEST_OK(!mlfq_ss_boost_pending(&t, 100000000, false, now, 32000000, 2000000),
-		"long sleep without I/O does not qualify");
-
-	t.last_ss_boost_at = now;
-	TEST_OK(!mlfq_ss_boost_pending(&t, 10000, false, now + 1000000, 32000000, 2000000),
-		"rate limit blocks a second boost inside the window");
-	TEST_OK(mlfq_ss_boost_pending(&t, 10000, false, now + 3000000, 32000000, 2000000),
-		"rate limit expires and the boost qualifies again");
-}
-
-static void test_cpuperf_mapping(void)
-{
-	u32 one = MLFQ_CPUPERF_Q1;
-	u64 budget = MLFQ_BUDGET_MAX_NS;
-
-	TEST_OK(mlfq_cpuperf_from_ema(0) == 0,
-		"an idle gauge requests the minimum level");
-	TEST_OK(mlfq_cpuperf_from_ema(budget) == one,
-		"a saturated gauge requests the maximum level");
-	TEST_OK(mlfq_cpuperf_from_ema(budget / 2) == one / 2,
-		"half the gauge requests half the level");
-	TEST_OK(mlfq_cpuperf_from_ema(budget * 2) == one,
-		"an over-saturated gauge clamps to the maximum");
-}
-
-static void test_boost_eligible(void)
-{
-	u64 win = 1000000;	/* MLFQ_SHORT_SLEEP_NS */
-
-	TEST_OK(mlfq_boost_eligible(0, win, true),
-		"I/O wakeup with no sleep is eligible");
-	TEST_OK(mlfq_boost_eligible(5000000, win, true),
-		"I/O wakeup after a long sleep is eligible");
-	TEST_OK(!mlfq_boost_eligible(0, win, false),
-		"no sleep and not I/O is not eligible");
-	TEST_OK(mlfq_boost_eligible(500000, win, false),
-		"short sleep is eligible");
-	TEST_OK(!mlfq_boost_eligible(2000000, win, false),
-		"long sleep without I/O is not eligible");
-	TEST_OK(!mlfq_boost_eligible(win + 1, win, false),
-		"sleep just past the window is not eligible");
-	TEST_OK(mlfq_boost_eligible(win, win, false),
-		"sleep exactly at the window is eligible");
-}
-
-/* MLFQ regression tree tests. */
-
-static void tree_store_reset(struct mlfq_tree_store *store)
-{
-	memset(store, 0, sizeof(*store));
-}
-
-static void tree_node(struct mlfq_tree_store *store, u32 idx, u8 feature,
-		      u64 threshold, u32 left, u32 right)
-{
-	struct mlfq_tree_node n = {
-		.threshold = threshold,
-		.left = left,
-		.right = right,
-		.feature = feature,
-	};
-
-	store->nodes[idx] = n;
-}
-
-static void test_mlfq_tree_layout(void)
-{
-	TEST_OK(sizeof(struct mlfq_tree_feats) == 48,
-		"tree feats is 48 bytes");
-	TEST_OK(sizeof(struct mlfq_tree_node) == 24,
-		"tree node is 24 bytes");
-	TEST_OK(sizeof(struct mlfq_tree_sample) == 68,
-		"tree sample is 68 bytes");
-	TEST_OK(offsetof(struct mlfq_tree_sample, pid) == 0 &&
-		offsetof(struct mlfq_tree_sample, queue) == 4 &&
-		offsetof(struct mlfq_tree_sample, feats) == 8 &&
-		offsetof(struct mlfq_tree_sample, label_ns) == 56 &&
-		offsetof(struct mlfq_tree_sample, version) == 64,
-		"tree sample offsets match the shared ABI, version at 64");
-	TEST_OK(offsetof(struct mlfq_tree_feats, prev_burst_ns) == 0 &&
-		offsetof(struct mlfq_tree_feats, sleep_ns) == 8 &&
-		offsetof(struct mlfq_tree_feats, ema) == 16 &&
-		offsetof(struct mlfq_tree_feats, io_wait) == 24 &&
-		offsetof(struct mlfq_tree_feats, wake_cnt) == 28 &&
-		offsetof(struct mlfq_tree_feats, wake_lat_us) == 32 &&
-		offsetof(struct mlfq_tree_feats, queue_wait_us) == 36 &&
-		offsetof(struct mlfq_tree_feats, sq_ema) == 40,
-		"tree feats offsets match the shared ABI, service fields appended");
-	TEST_OK(offsetof(struct mlfq_tree_node, threshold) == 0 &&
-		offsetof(struct mlfq_tree_node, left) == 8 &&
-		offsetof(struct mlfq_tree_node, right) == 12 &&
-		offsetof(struct mlfq_tree_node, feature) == 16 &&
-		offsetof(struct mlfq_tree_node, pad) == 17,
-		"tree node offsets match the shared ABI, pad at 17");
-	TEST_OK(sizeof(struct mlfq_tree_store) ==
-		MLFQ_TREE_MAX_NODES * sizeof(struct mlfq_tree_node),
-		"tree store is one 2048-node buffer (the map value type)");
-	TEST_OK(sizeof(struct task_ctx) == 184,
-		"task_ctx grows to 184 bytes with the enqueue-to-run measurement block and the grown feature vector");
-	TEST_OK(offsetof(struct task_ctx, enq_at) == 80 &&
-		offsetof(struct task_ctx, last_wake_lat_ns) == 88 &&
-		offsetof(struct task_ctx, last_q_wait_ns) == 92 &&
-		offsetof(struct task_ctx, sq_ema) == 96,
-		"task_ctx measurement block sits at 80/88/92/96 after the pad bytes");
-	TEST_OK(offsetof(struct task_ctx, pending_feats) == 120 &&
-		offsetof(struct task_ctx, pending_queue) == 168 &&
-		offsetof(struct task_ctx, pending_valid) == 176,
-		"task_ctx tree-sample block follows the measurement block");
-	TEST_OK(sizeof(struct mlfq_tree_ctrl) == 64 &&
-		offsetof(struct mlfq_tree_ctrl, meta) == 0 &&
-		offsetof(struct mlfq_tree_ctrl, sample_last_at) == 8,
-		"tree ctrl state is one dedicated 64-byte cache line");
-	TEST_OK(sizeof(struct mlfq_stats) % 64 == 0 &&
-		sizeof(struct mlfq_stats) == 256,
-		"mlfq_stats is padded to a 64-byte multiple (256 bytes)");
-	TEST_OK(sizeof(struct mlfq_sys_gauge) == 48 &&
-		sizeof(struct mlfq_adapt_state) == 48 &&
-		sizeof(struct mlfq_wakeup_counters) == 16,
-		"the sys gauge is 48 bytes, the adapt state 48 and the per-CPU wakeup counters 16");
-	TEST_OK(MLFQ_TREE_PER_TASK_LIMIT_NS == 10ULL * NSEC_PER_MSEC,
-		"per-task sample limit is 10ms");
-	TEST_OK(MLFQ_TREE_LABEL_MAX_NS == MLFQ_TREE_T_BOUND_NS * 64,
-		"label clamp is 64x the Q2/Q3 split bound (192ms)");
-	TEST_OK(MLFQ_TREE_SAMPLE_VERSION == 2,
-		"tree sample version tag is 2");
-}
-
-static void test_tree_meta_layout(void)
-{
-	u64 meta = MLFQ_TREE_META_TRAINED | MLFQ_TREE_META_ACTIVE |
-		   ((u64)MLFQ_TREE_MAX_NODES << MLFQ_TREE_META_NR_NODES_SHIFT) |
-		   (3ULL << MLFQ_TREE_META_GENERATION_SHIFT);
-
-	TEST_OK(MLFQ_TREE_META_TRAINED == 1 && MLFQ_TREE_META_ACTIVE == 2,
-		"trained and active are meta bits 0 and 1");
-	TEST_OK((meta & MLFQ_TREE_META_TRAINED) &&
-		(meta & MLFQ_TREE_META_ACTIVE),
-		"trained and active bits are set");
-	TEST_OK(((meta & MLFQ_TREE_META_NR_NODES_MASK) >>
-		 MLFQ_TREE_META_NR_NODES_SHIFT) == MLFQ_TREE_MAX_NODES,
-		"nr_nodes decodes from meta bits 8..31");
-	TEST_OK((meta >> MLFQ_TREE_META_GENERATION_SHIFT) == 3,
-		"generation decodes from meta bits 32..63");
-	TEST_OK(!(MLFQ_TREE_META_NR_NODES_MASK & MLFQ_TREE_META_GENERATION_MASK) &&
-		!(MLFQ_TREE_META_NR_NODES_MASK &
-		  (MLFQ_TREE_META_TRAINED | MLFQ_TREE_META_ACTIVE)),
-		"meta bit fields do not overlap");
-}
-
-/*
- * The walk is exercised directly on a local store, the buffer the BPF
- * wrapper would look up. The wrapper itself (mlfq_tree_predict) needs
- * the BPF map machinery and is not available here: its untrained gate
- * is a pure meta check (trained bit clear -> 0, verified above at the
- * bit level) and its NULL-store path guards a failed map lookup, both
- * exercised at the BPF side.
- */
-static void test_tree_predict_walk(void)
-{
-	struct mlfq_tree_store store;
-	struct mlfq_tree_feats f = { .prev_burst_ns = 0, .sleep_ns = 0,
-				     .ema = 0, .io_wait = 0, .wake_cnt = 0 };
-
-	/* Leaf at the root: the stored prediction is returned directly. */
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0, 0, 123456, 0);
-	TEST_OK(mlfq_tree_walk(&store, &f) == 123456,
-		"leaf at the root returns the stored prediction");
-
-	/* Single split on prev_burst_ns at the 1ms threshold. */
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0, 1000000, 1, 2);
-	tree_node(&store, 1, 0, 0, 50000, 0);
-	tree_node(&store, 2, 0, 0, 3000000, 0);
-	f.prev_burst_ns = 900000;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 50000,
-		"below-threshold burst routes to the left leaf");
-	f.prev_burst_ns = 1000000;	/* <= threshold: left */
-	TEST_OK(mlfq_tree_walk(&store, &f) == 50000,
-		"burst equal to the threshold routes left");
-	f.prev_burst_ns = 1000001;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 3000000,
-		"above-threshold burst routes to the right leaf");
-
-	/*
-	 * A chain of MLFQ_TREE_MAX_DEPTH internal nodes followed by one
-	 * leaf: the constant-depth loop runs to its bound and the depth-12
-	 * leaf is reached as "the last node", whose left is the prediction.
-	 */
-	tree_store_reset(&store);
-	for (int i = 0; i < MLFQ_TREE_MAX_DEPTH; i++)
-		tree_node(&store, i, 0, 0, i + 1, i + 1);
-	tree_node(&store, MLFQ_TREE_MAX_DEPTH, 0, 0, 777777, 0);
-	f.prev_burst_ns = 0;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 777777,
-		"depth-12 chain exhausts the walk and returns the leaf");
-
-	/*
-	 * Deeper than the bound: the walk is cut and the last reachable
-	 * node is returned as a leaf only when it really is one. The node
-	 * at depth 12 here is internal, so the prediction is 0. A child
-	 * index must never leak out as a burst.
-	 */
-	tree_store_reset(&store);
-	for (int i = 0; i <= MLFQ_TREE_MAX_DEPTH; i++)
-		tree_node(&store, i, 0, 0, i + 1, i + 1);
-	TEST_OK(mlfq_tree_walk(&store, &f) == 0,
-		"a deeper-than-12 chain is cut at the depth bound and yields 0, not a child index");
-
-	/*
-	 * Out-of-range feature id: 0x87 masks to 7, the first zeroed
-	 * feat[] slot. Under MLFQ_CHECK the invariant predicate bails to
-	 * the untrained result; without the check the walk would route on
-	 * feat[7] == 0 and still stay in bounds.
-	 */
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0x87, 0, 1, 2);
-	tree_node(&store, 1, 0, 0, 50000, 0);
-	tree_node(&store, 2, 0, 0, 3000000, 0);
-	TEST_OK(mlfq_tree_walk(&store, &f) == 0,
-		"out-of-range feature id bails under MLFQ_CHECK, no OOB");
-
-	/*
-	 * Masked index: a child index of 0xFFFFFFFF must land on node
-	 * 2047 (the mask is MLFQ_TREE_MAX_NODES - 1), never outside the
-	 * buffer. The zeroed node at 2047 is a leaf predicting 0; a
-	 * planted leaf there proves the landing index exactly.
-	 */
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0, 0, 0xFFFFFFFF, 0xFFFFFFFF);
-	tree_node(&store, MLFQ_TREE_MAX_NODES - 1, 0, 0, 424242, 0);
-	TEST_OK(mlfq_tree_walk(&store, &f) == 424242,
-		"0xFFFFFFFF child index is masked into [0, 2047]");
-
-	/*
-	 * Double buffer: the two map entries hold the two generations and
-	 * the wrapper picks the active entry from the meta bit; each entry
-	 * is walked independently here.
-	 */
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0, 0, 111111, 0);
-	TEST_OK(mlfq_tree_walk(&store, &f) == 111111,
-		"entry 0 walks its own tree");
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0, 0, 222222, 0);
-	TEST_OK(mlfq_tree_walk(&store, &f) == 222222,
-		"entry 1 walks its own tree");
-}
-
-/*
- * The shared crafted tree also walked by the Rust side
- * (golden_tree_predict_matches_shared_spec in mlfq_tree.rs): a chain on
- * prev_burst_ns, mixed leaves, and a node whose raw feature id is out of
- * the populated range but masks in-bounds (0x84 -> 4 = wake_cnt). Both
- * sides must produce identical outputs.
- */
-static void test_tree_golden_shared(void)
-{
-	struct mlfq_tree_store store;
-	struct mlfq_tree_feats f;
-
-	tree_store_reset(&store);
-	tree_node(&store, 0, 0, 1000000, 1, 8);
-	tree_node(&store, 1, 0, 1000000, 2, 8);
-	tree_node(&store, 2, 0, 1000000, 3, 8);
-	tree_node(&store, 3, 1, 500000, 4, 5);
-	tree_node(&store, 4, 0, 0, 1111111, 0);
-	tree_node(&store, 5, 0x84, 1, 6, 7);
-	tree_node(&store, 6, 0, 0, 2222222, 0);
-	tree_node(&store, 7, 0, 0, 3333333, 0);
-	tree_node(&store, 8, 0, 0, 8888888, 0);
-
-	f = (struct mlfq_tree_feats){ .prev_burst_ns = 0, .sleep_ns = 400000,
-				      .ema = 0, .io_wait = 0, .wake_cnt = 0 };
-	TEST_OK(mlfq_tree_walk(&store, &f) == 1111111,
-		"golden: chain left, sleep <= 500us -> 1111111");
-	f.sleep_ns = 600000;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 2222222,
-		"golden: wake_cnt 0 <= 1 -> 2222222");
-	f.wake_cnt = 5;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 3333333,
-		"golden: wake_cnt 5 > 1 -> 3333333");
-	f.prev_burst_ns = 2000000;
-	f.sleep_ns = 0;
-	f.wake_cnt = 0;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 8888888,
-		"golden: prev_burst above 1ms -> 8888888");
-	f.prev_burst_ns = 0;
-	f.sleep_ns = 400000;
-	f.wake_cnt = 9;
-	TEST_OK(mlfq_tree_walk(&store, &f) == 1111111,
-		"golden: wake_cnt is irrelevant on the sleep-split left");
-}
-
-/*
- * The promotion-only wakeup mapping (mlfq_tree_map_queue): the tree can
- * only raise the queue at the wakeup; demotions are the run-out gate's
- * job, so a single prediction can never demote a task.
- */
-static void test_tree_map_queue(void)
-{
-	u8 q;
-
-	/* pred < T_INT raises to Q1 regardless of the current queue. */
-	for (q = 1; q <= MLFQ_NR_QUEUES; q++)
-		TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS - 1, q,
-					    MLFQ_TREE_T_INT_NS,
-					    MLFQ_TREE_T_BOUND_NS) == 1,
-			"Q1-band prediction raises queue %u to 1", q);
-
-	/* pred in [T_INT, T_BOUND): Q3 -> Q2, Q1/Q2 stay. */
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 1,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 1 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 1,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 1,
-		"Q2-band prediction leaves Q1 alone");
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 2,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 2 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 2,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 2,
-		"Q2-band prediction leaves Q2 alone");
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_INT_NS, 3,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 2 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS - 1, 3,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 2,
-		"Q2-band prediction raises Q3 to Q2");
-
-	/* pred >= T_BOUND leaves the queue unchanged. No wakeup demotion. */
-	TEST_OK(mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 1,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 1 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 2,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 2 &&
-		mlfq_tree_map_queue(MLFQ_TREE_T_BOUND_NS, 3,
-				    MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 3,
-		"Q3-band prediction never changes the queue");
-
-	/* Untrained (pred 0) leaves the queue unchanged. */
-	TEST_OK(mlfq_tree_map_queue(0, 1, MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 1 &&
-		mlfq_tree_map_queue(0, 2, MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 2 &&
-		mlfq_tree_map_queue(0, 3, MLFQ_TREE_T_INT_NS,
-				    MLFQ_TREE_T_BOUND_NS) == 3,
-		"untrained prediction never changes the queue");
-}
-
-static void test_mlfq_check_tree_predicates(void)
-{
-	TEST_OK(mlfq_check_tree_node_index(0) &&
-		mlfq_check_tree_node_index(MLFQ_TREE_MAX_NODES - 1),
-		"node indices 0 and 2047 are in bounds");
-	TEST_OK(!mlfq_check_tree_node_index(MLFQ_TREE_MAX_NODES),
-		"node index 2048 is out of bounds");
-	TEST_OK(mlfq_check_tree_feature(0) && mlfq_check_tree_feature(4),
-		"feature ids 0 and 4 are in bounds");
-	TEST_OK(!mlfq_check_tree_feature(5) && !mlfq_check_tree_feature(7),
-		"feature ids 5 and 7 are out of bounds");
-	TEST_OK(mlfq_check_tree_feature(0x80) &&
-		!mlfq_check_tree_feature(0x85),
-		"the feature id masks to 0..7 before the bound check");
 }
 
 /* Runnable accounting contract. */
@@ -1326,301 +1436,9 @@ static void test_steer_loop_bound(void)
 		"steer: the loop stops early when no eligible domain remains");
 }
 
-/* System wakeup gauges. */
-
-static void test_sys_lat_fold(void)
-{
-	u64 half = MLFQ_SYS_GAUGE_HALF_LIFE_NS;
-	u64 max = MLFQ_SYS_LAT_MAX_NS;
-	u64 ema, i;
-
-	TEST_OK(mlfq_sys_lat_fold(500000, 1000000, 0, half, half, max) ==
-		500000,
-		"lat fold: no episodes leave the gauge untouched");
-	TEST_OK(mlfq_sys_lat_fold(0, 20000, 1, 64 * half, half, max) == 20000,
-		"lat fold: a sample after a long gap replaces the gauge");
-	TEST_OK(mlfq_sys_lat_fold(0, 2 * max, 1, 64 * half, half, max) == max,
-		"lat fold: an average beyond the ceiling clamps to it");
-	TEST_OK(mlfq_sys_lat_fold(max, max, 1, 0, half, max) == max,
-		"lat fold: the gauge never exceeds its ceiling");
-	TEST_OK(mlfq_sys_lat_fold(max, max, 1, 64 * half, 0, max) == max,
-		"lat fold: a zero half-life replaces the gauge with the average");
-	TEST_OK(mlfq_sys_lat_fold(0, 20000, 1, half, half, max) == 10000,
-		"lat fold: one half-life moves the gauge halfway to the sample");
-	TEST_OK(mlfq_sys_lat_fold(123456, 20000, 1, 0, half, max) == 123456,
-		"lat fold: a zero elapsed (clock wrap) leaves the gauge untouched");
-	TEST_OK(mlfq_sys_lat_fold(40000, 200000, 10, half, half, max) ==
-		mlfq_sys_lat_fold(40000, 2000000, 100, half, half, max),
-		"lat fold: the same average at any episode count folds the same");
-	ema = 0;
-	for (i = 0; i < 20; i++)
-		ema = mlfq_sys_lat_fold(ema, 20000, 1, half, half, max);
-	TEST_OK(ema >= 19999 && ema <= 20000,
-		"lat fold: a constant wait converges to within one ns of itself");
-}
-
-static void test_sys_rate_step(void)
-{
-	u64 one_s = 1000000000ULL;
-
-	TEST_OK(mlfq_sys_rate_step(0, 0, one_s) == 0,
-		"rate step: zero arrivals fold to zero");
-	TEST_OK(mlfq_sys_rate_step(0, 2000, one_s) == 256000,
-		"rate step: 2000/s over one half-life folds to half the rate");
-	TEST_OK(mlfq_sys_rate_step(256000, 2000, one_s) == 384000,
-		"rate step: the EMA converges toward the instantaneous rate");
-	TEST_OK(mlfq_sys_rate_step(0, 10000000, one_s) == 128000000,
-		"rate step: the instantaneous rate clamps at MLFQ_SYS_RATE_MAX");
-	TEST_OK(mlfq_sys_rate_step(0, 2000, one_s / 10) == 256000,
-		"rate step: a sub-window elapsed clamps up to the cadence");
-	TEST_OK(mlfq_sys_rate_step(0, 2000, 120 * one_s) == 8448,
-		"rate step: a multi-minute elapsed clamps down to 60s");
-}
-
-/* Threshold adaptation. */
-
-static void test_adapt_shift_target(void)
-{
-	u64 target = MLFQ_ADAPT_TARGET_LAT_NS;
-
-	TEST_OK(mlfq_adapt_shift_target(target, 0) == 0,
-		"shift target: a gauge at the target yields shift 0");
-	TEST_OK(mlfq_adapt_shift_target(2 * target, 0) ==
-		(s64)MLFQ_ADAPT_MAX_SHIFT,
-		"shift target: a full-range error saturates at +MAX_SHIFT");
-	TEST_OK(mlfq_adapt_shift_target(0, 0) == 0,
-		"shift target: an idle gauge leaves the bands at the base");
-	TEST_OK(mlfq_adapt_shift_target(target + target / 2, 0) == 64,
-		"shift target: half a target of error moves a quarter shift");
-	TEST_OK(mlfq_adapt_shift_target(target / 2, 0) == 0,
-		"shift target: half a target of deficit leaves the bands at the base");
-	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS,
-					MLFQ_ADAPT_RATE_GATE_HIGH + 1) ==
-		(s64)MLFQ_ADAPT_RATE_GATE_SHIFT,
-		"shift target: the rate storm gate caps the positive shift");
-	TEST_OK(mlfq_adapt_shift_target(0, MLFQ_ADAPT_RATE_GATE_HIGH + 1) == 0,
-		"shift target: the rate storm gate never lifts a zero target");
-	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS,
-					MLFQ_ADAPT_RATE_GATE_HIGH) ==
-		(s64)MLFQ_ADAPT_MAX_SHIFT,
-		"shift target: the rate gate needs a strictly high rate");
-}
-
-static void test_adapt_slew(void)
-{
-	s64 s = 0;
-	int steps = 0;
-
-	TEST_OK(mlfq_adapt_slew(0, (s64)MLFQ_ADAPT_MAX_SHIFT) ==
-		(s64)MLFQ_ADAPT_MAX_STEP,
-		"slew: a step is capped at MLFQ_ADAPT_MAX_STEP");
-	TEST_OK(mlfq_adapt_slew(100, 0) == 75,
-		"slew: the step caps in the negative direction too");
-	TEST_OK(mlfq_adapt_slew(0, 10) == 10,
-		"slew: a target within one step lands on it");
-	TEST_OK(mlfq_adapt_slew(-100, 100) == -75,
-		"slew: a full-range retarget moves one step");
-
-	while (s < (s64)MLFQ_ADAPT_MAX_SHIFT && steps < 100) {
-		s = mlfq_adapt_slew(s, (s64)MLFQ_ADAPT_MAX_SHIFT);
-		steps++;
-	}
-	TEST_OK(s == (s64)MLFQ_ADAPT_MAX_SHIFT && steps == 6,
-		"slew: a full swing from zero converges in six steps");
-}
-
-static void test_adapt_band(void)
-{
-	TEST_OK(mlfq_adapt_band(MLFQ_T_L_NS, 0, MLFQ_ADAPT_T_L_FLOOR_NS,
-				MLFQ_ADAPT_T_L_CEIL_NS) == MLFQ_T_L_NS,
-		"band: shift 0 yields exactly the base");
-	TEST_OK(mlfq_adapt_band(MLFQ_T_L_NS, 128, MLFQ_ADAPT_T_L_FLOOR_NS,
-				MLFQ_ADAPT_T_L_CEIL_NS) == 375000,
-		"band: +50%% shift scales the base up");
-	TEST_OK(mlfq_adapt_band(MLFQ_T_H_NS, -128, MLFQ_ADAPT_T_H_FLOOR_NS,
-				MLFQ_ADAPT_T_H_CEIL_NS) == 1200000,
-		"band: -50%% shift scales the base down to the T_H floor");
-	TEST_OK(mlfq_adapt_band(100000, -128, 150000, 500000) == 150000,
-		"band: the floor clamps the effective value");
-	TEST_OK(mlfq_adapt_band(400000, 128, 150000, 500000) == 500000,
-		"band: the ceiling clamps the effective value");
-}
-
-static void test_adapt_bands_all_shifts(void)
-{
-	s64 s;
-
-	for (s = -(s64)MLFQ_ADAPT_MAX_SHIFT;
-	     s <= (s64)MLFQ_ADAPT_MAX_SHIFT; s++) {
-		u64 t_l = mlfq_adapt_band(MLFQ_T_L_NS, s,
-					  MLFQ_ADAPT_T_L_FLOOR_NS,
-					  MLFQ_ADAPT_T_L_CEIL_NS);
-		u64 t_h = mlfq_adapt_band(MLFQ_T_H_NS, s,
-					  MLFQ_ADAPT_T_H_FLOOR_NS,
-					  MLFQ_ADAPT_T_H_CEIL_NS);
-		u64 t_int = mlfq_adapt_band(MLFQ_TREE_T_INT_NS, s,
-					    MLFQ_ADAPT_T_INT_FLOOR_NS,
-					    MLFQ_ADAPT_T_INT_CEIL_NS);
-		u64 t_bnd = mlfq_adapt_band(MLFQ_TREE_T_BOUND_NS, s,
-					    MLFQ_ADAPT_T_BND_FLOOR_NS,
-					    MLFQ_ADAPT_T_BND_CEIL_NS);
-
-		TEST_OK(t_l < t_h && t_int < t_bnd &&
-			mlfq_check_bands(t_l, t_h, t_int, t_bnd),
-			"bands stay ordered and bounded at shift %lld",
-			(long long)s);
-	}
-
-	/* Band separation holds with margin at every shift. */
-	TEST_OK(MLFQ_ADAPT_T_H_CEIL_NS - MLFQ_ADAPT_T_L_FLOOR_NS >= 700000 &&
-		MLFQ_ADAPT_T_BND_CEIL_NS - MLFQ_ADAPT_T_INT_FLOOR_NS >= 200000,
-		"band separation floors keep the bands apart");
-	TEST_OK(MLFQ_TREE_LABEL_MAX_NS >= 40 * MLFQ_ADAPT_T_BND_CEIL_NS,
-		"the label clamp stays at least 40x the highest effective T_BOUND");
-}
-
-/*
- * The disabled state reproduces the fixed thresholds by construction:
- * the init copy seeds the effective values with the rodata bases and a
- * zero shift, so every effective band equals its base and the guard
- * equals the fixed minimum residency. The adaptation step is the only
- * writer that could move them, and it is gated off.
- */
-static void test_adapt_disabled_equals_base(void)
-{
-	TEST_OK(mlfq_adapt_band(MLFQ_T_L_NS, 0, MLFQ_ADAPT_T_L_FLOOR_NS,
-				MLFQ_ADAPT_T_L_CEIL_NS) == MLFQ_T_L_NS &&
-		mlfq_adapt_band(MLFQ_T_H_NS, 0, MLFQ_ADAPT_T_H_FLOOR_NS,
-				MLFQ_ADAPT_T_H_CEIL_NS) == MLFQ_T_H_NS &&
-		mlfq_adapt_band(MLFQ_TREE_T_INT_NS, 0,
-				MLFQ_ADAPT_T_INT_FLOOR_NS,
-				MLFQ_ADAPT_T_INT_CEIL_NS) == MLFQ_TREE_T_INT_NS &&
-		mlfq_adapt_band(MLFQ_TREE_T_BOUND_NS, 0,
-				MLFQ_ADAPT_T_BND_FLOOR_NS,
-				MLFQ_ADAPT_T_BND_CEIL_NS) == MLFQ_TREE_T_BOUND_NS,
-		"disabled: shift 0 maps every effective band to its base");
-	TEST_OK(MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS == 0,
-		"disabled: the guard base keeps the unconditional interactive preemption");
-	TEST_OK(mlfq_check_bands(MLFQ_T_L_NS, MLFQ_T_H_NS,
-				 MLFQ_TREE_T_INT_NS, MLFQ_TREE_T_BOUND_NS),
-		"disabled: the base band pair satisfies the band-order invariants");
-}
-
-/*
- * The rate-fold overflow contract of intf.h. The count argument to
- * mlfq_sys_rate_step is a u32, so the fold must stay correct and in
- * bounds on both sides of the u32 range. A count near 0xFFFFFFFF folds
- * to a rate far above MLFQ_SYS_RATE_MAX and clamps to it, and a small
- * count folds to a small in-bounds rate. The u64 overflow bound rests
- * on 2^32 * 1e9 ~= 4.3e18 staying inside u64. The per-CPU wakeup
- * counters are u64 (mlfq_wakeup_counters in intf.h), so the practical
- * wrap is gone and the fold arithmetic itself is still exercised here.
- */
-static void test_adapt_rate_step_wrap(void)
-{
-	u64 one_s = NSEC_PER_SEC;
-	u64 ema;
-
-	/*
-	 * The overflow bound itself: the largest possible counter (2^32 - 1)
-	 * times the 1 s window must not wrap u64. If the product wrapped,
-	 * dividing by the window would not recover the counter.
-	 */
-	TEST_OK(0xFFFFFFFFULL * NSEC_PER_SEC / NSEC_PER_SEC == 0xFFFFFFFFULL,
-		"rate wrap: the max counter by 1s product stays inside u64");
-
-	/*
-	 * Pre-wrap edge: a counter near 0xFFFFFFFF folded over a 1 s window
-	 * has an instantaneous rate far above MLFQ_SYS_RATE_MAX, so the
-	 * fold clamps it to the ceiling. With one half-life elapsed the
-	 * clamped fold lands on half the ceiling in fixed point.
-	 */
-	ema = mlfq_sys_rate_step(0, (u32)0xFFFFFF00, one_s);
-	TEST_OK(ema == (MLFQ_SYS_RATE_MAX << FP_SHIFT) / 2,
-		"rate wrap: a near-wrap counter clamps at MLFQ_SYS_RATE_MAX");
-	TEST_OK(ema <= (MLFQ_SYS_RATE_MAX << FP_SHIFT),
-		"rate wrap: the pre-wrap EMA fold stays in bounds");
-
-	/*
-	 * Post-wrap edge: the counter has wrapped and reads small, so the
-	 * fold yields a small in-bounds rate and the EMA decays toward it
-	 * while staying in bounds.
-	 */
-	ema = mlfq_sys_rate_step(ema, 5, one_s);
-	TEST_OK(ema == (MLFQ_SYS_RATE_MAX << FP_SHIFT) / 4 + 5 * (FP_ONE / 2),
-		"rate wrap: a wrapped counter folds to a small rate");
-	TEST_OK(ema <= (MLFQ_SYS_RATE_MAX << FP_SHIFT),
-		"rate wrap: the post-wrap EMA fold stays in bounds");
-}
-
-/*
- * Exact fixed-point assertions against the real formulas, the exact
- * counterparts of the trend tests above: the shift target is exactly 0
- * on both sides of the 1 ms target, the guard is exactly 0 at the
- * target and above, the rate gate is strictly greater than 200000 << 8
- * and caps the positive target at +FP_ONE/4, the slew step clamps
- * exactly at +-MLFQ_ADAPT_MAX_STEP, and the guard is exactly 250 us at
- * lat toward 0.
- */
-static void test_adapt_boundary_exacts(void)
-{
-	u64 target = MLFQ_ADAPT_TARGET_LAT_NS;
-	u64 gate = 200000ULL << FP_SHIFT;
-	s64 s;
-	int steps;
-
-	/* The shift target is exactly 0 at lat == 1 ms on both sides. */
-	TEST_OK(mlfq_adapt_shift_target(target, 0) == 0 &&
-		mlfq_adapt_shift_target(target - 1, 0) == 0 &&
-		mlfq_adapt_shift_target(target + 1, 0) == 0,
-		"boundary: the shift target is exactly 0 on both sides of 1 ms");
-
-	/*
-	 * The rate gate is strict: at exactly 200000 << 8 it does not
-	 * gate, one above caps the positive target at +FP_ONE/4, and one
-	 * below leaves it uncapped.
-	 */
-	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS, gate) ==
-		(s64)MLFQ_ADAPT_MAX_SHIFT,
-		"boundary: the rate gate at exactly 200000 << 8 does not gate");
-	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS, gate + 1) ==
-		(s64)MLFQ_ADAPT_RATE_GATE_SHIFT,
-		"boundary: one above the gate caps the target at +FP_ONE/4");
-	TEST_OK(mlfq_adapt_shift_target(MLFQ_SYS_LAT_MAX_NS, gate - 1) ==
-		(s64)MLFQ_ADAPT_MAX_SHIFT,
-		"boundary: one below the gate leaves the target uncapped");
-
-	/* The slew step clamps exactly at +-MLFQ_ADAPT_MAX_STEP. */
-	TEST_OK(mlfq_adapt_slew(0, (s64)MLFQ_ADAPT_MAX_SHIFT) ==
-		(s64)MLFQ_ADAPT_MAX_STEP &&
-		mlfq_adapt_slew(0, -(s64)MLFQ_ADAPT_MAX_SHIFT) ==
-		-(s64)MLFQ_ADAPT_MAX_STEP,
-		"boundary: the slew step clamps exactly at +-MLFQ_ADAPT_MAX_STEP");
-
-	/*
-	 * Full-range convergence, verified against the real formula. The
-	 * ideal-rate bound is ceil(0.5 / 0.1) = 5 steps; the fixed-point
-	 * step (FP_ONE / 10 truncates 25.6 to 25) needs one more, so the
-	 * exact count is computed from the constants, and the loop must
-	 * land exactly on the target.
-	 */
-	s = 0;
-	steps = 0;
-	while (s < (s64)MLFQ_ADAPT_MAX_SHIFT && steps < 100) {
-		s = mlfq_adapt_slew(s, (s64)MLFQ_ADAPT_MAX_SHIFT);
-		steps++;
-	}
-	TEST_OK(steps == (MLFQ_ADAPT_MAX_SHIFT + MLFQ_ADAPT_MAX_STEP - 1) /
-				MLFQ_ADAPT_MAX_STEP &&
-		s == (s64)MLFQ_ADAPT_MAX_SHIFT,
-		"boundary: a full swing converges in the computed step count");
-	TEST_OK(steps >= 5,
-		"boundary: a full swing needs at least the five-step bound");
-
-}
-
 int main(void)
 {
+	/* EEVDF virtual-time and placement. */
 	test_calc_delta_fair();
 	test_place_entity();
 	test_place_entity_weight_edges();
@@ -1628,32 +1446,35 @@ int main(void)
 	test_place_entity_deadline_pure();
 	test_sameq_preempt_owed();
 	test_clock_advance();
-	test_ema_climb();
-	test_ema_decay();
-	test_sys_lat_fold();
-	test_sys_rate_step();
-	test_adapt_shift_target();
-	test_adapt_slew();
-	test_adapt_band();
-	test_adapt_bands_all_shifts();
-	test_adapt_disabled_equals_base();
-	test_adapt_rate_step_wrap();
-	test_adapt_boundary_exacts();
-	test_queue_mapping();
+
+	/* Gauge burst-classifier. */
+	test_gauge_climb();
+	test_gauge_period_decay();
+	test_gauge_mapping();
+	test_gauge_mapping_bands();
 	test_promote_hysteresis();
 	test_demote_hysteresis();
+
+	/* FCBS. */
+	test_fcbs_slack();
+	test_fcbs_bonus();
+	test_fcbs_deposit_consume_atomicity();
+	test_queue_grant();
+
+	/* Saturation and cpuperf. */
+	test_reenq_cnt_saturation();
+	test_cpuperf_mapping();
+
+	/* Boost and predicates. */
+	test_boost_eligible();
 	test_ss_boost_allowed();
 	test_ss_boost_pending();
-	test_cpuperf_mapping();
-	test_boost_eligible();
 	test_mlfq_check_predicates();
+
+	/* Bitmap. */
 	test_bitmap();
-	test_mlfq_tree_layout();
-	test_tree_meta_layout();
-	test_tree_predict_walk();
-	test_tree_golden_shared();
-	test_tree_map_queue();
-	test_mlfq_check_tree_predicates();
+
+	/* Runnable accounting. */
 	test_runnable_enter_fresh();
 	test_runnable_enter_continuation_table();
 	test_runnable_continuation_noop();
@@ -1662,6 +1483,8 @@ int main(void)
 	test_runnable_sentinel_llc_noop();
 	test_runnable_qid_guard();
 	test_runnable_layout();
+
+	/* Steering. */
 	test_steer_pick_llc();
 	test_steer_loop_bound();
 

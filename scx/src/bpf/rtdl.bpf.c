@@ -156,6 +156,7 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 {
 	struct mlfq_rtdl_state *rt;
 	bool evacuated = false;
+	u32 qid;
 
 	rt = mlfq_lookup_rtdl_state(cpu);
 	if (!rt)
@@ -177,20 +178,30 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	/*
 	 * Nonempty gate: when every DSQ this CPU owns is empty there is
 	 * nothing to evacuate, so the pass is skipped without consuming
-	 * the rate-limit window.
+	 * the rate-limit window.  The queue DSQ scan is looped over
+	 * MLFQ_NR_QUEUES so adding or removing queues needs no manual
+	 * gate update.
 	 */
-	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu)))
-		return;
+	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu)) {
+		bool any_queued = false;
+
+		bpf_for(qid, 1, MLFQ_NR_QUEUES + 1) {
+			if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cpu))) {
+				any_queued = true;
+				break;
+			}
+		}
+		if (!any_queued)
+			return;
+	}
 
 	/*
 	 * The evacuation is version-gated. The local DSQ is reenqueued
 	 * from anywhere only where the call-from-anywhere kfunc exists
 	 * (v6.19+), and the queue DSQs only through the generic
-	 * reenqueue (v7.1+), with three explicit constant-id calls.
-	 * The reenqueue itself re-anchors the tasks in the queue DSQs.
+	 * reenqueue (v7.1+), looped over MLFQ_NR_QUEUES so the drain
+	 * stays queue-count-agnostic. The reenqueue itself re-anchors the
+	 * tasks in the queue DSQs.
 	 * The enqueue redirect then relocates them off the occupied CPU,
 	 * so the drain plus the redirect is what actually evacuates. On
 	 * 6.18 the drain is a no-op by kernel limitation. The local DSQ
@@ -209,9 +220,9 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 		evacuated = true;
 	}
 	if (__COMPAT_has_generic_reenq()) {
-		scx_bpf_dsq_reenq(mlfq_dsq_id(1, cpu), 0);
-		scx_bpf_dsq_reenq(mlfq_dsq_id(2, cpu), 0);
-		scx_bpf_dsq_reenq(mlfq_dsq_id(3, cpu), 0);
+		bpf_for(qid, 1, MLFQ_NR_QUEUES + 1) {
+			scx_bpf_dsq_reenq(mlfq_dsq_id(qid, cpu), 0);
+		}
 		evacuated = true;
 	}
 

@@ -5,7 +5,7 @@
  * Enqueue routing, included by main.bpf.c via #include.
  *
  * The MLFQ enqueue path has four cases.
- *   WAKEUP -> EMA decay + classification, then placement
+ *   WAKEUP -> gauge decay + classification, then placement
  *   RUN-OUT (enq_flags == 0) -> demotion, then placement
  *   other (fork / SCX_ENQ_LAST / class switch) -> counter reset, placement
  *   wall-clock aging check for Q2/Q3 stays, then placement
@@ -86,31 +86,6 @@ static __always_inline void mlfq_stat_placement(u8 qid)
 }
 
 /*
- * mlfq_stamp_enq_at - Start an enqueue-to-run measurement episode.
- * @tctx: The task being inserted.
- * @now: Current time (scx_bpf_now()).
- * @wakeup: True for a wakeup insert (SCX_ENQ_WAKEUP set).
- *
- * Every DSQ insert this scheduler controls stamps the episode start.
- * The wait since it is measured at the first ops.running() of the
- * episode. The global park is the one exception (no stamp, because the
- * parked wait is kernel-side and never attributed to this scheduler). The
- * wakeup flag marks wakeup episodes, so the measured wait feeds the
- * wakeup-latency features and gauges. A non-wakeup re-enqueue (for
- * example a takeover drain) clears it, so only the queue wait is
- * measured there.
- */
-static __always_inline void mlfq_stamp_enq_at(struct task_ctx *tctx, u64 now,
-					      bool wakeup)
-{
-	tctx->enq_at = now;
-	if (wakeup)
-		tctx->flags |= MLFQ_TF_ENQ_WAKEUP;
-	else
-		tctx->flags &= ~MLFQ_TF_ENQ_WAKEUP;
-}
-
-/*
  * A placement into another CPU's queue needs that CPU to run one more
  * scheduling cycle so a queued task is not stranded on a nohz-idle CPU.
  * The idle kick is a cheap flag that is consumed when the CPU next goes
@@ -179,25 +154,19 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	if (wakeup) {
 		mlfq_wakeup_classify(p, tctx, now);
 		/*
-		 * Count the wakeup arrival for the system wakeup-rate
-		 * gauge. The counters are per-CPU map slots (each CPU owns
-		 * its own slot), so the wakeup path needs no locked
-		 * operation on a shared line. Both counters are bumped
-		 * with atomic adds, tear-free for the stats reader and
-		 * race-free against the adaptation fold. total is the
-		 * lifetime sum the stats read adds up, and window is
-		 * consumed and zeroed by the fold with an atomic exchange,
-		 * so every arrival is counted exactly once. A failed map
+		 * Count the wakeup arrival for the system wakeup total.
+		 * The counters are per-CPU map slots (each CPU owns its
+		 * own slot), so the wakeup path needs no locked operation
+		 * on a shared line. The lifetime sum is bumped with an
+		 * atomic add, tear-free for the stats reader. A failed map
 		 * lookup drops the count.
 		 */
-		struct mlfq_wakeup_counters *wc;
 		u32 wakeup_key = 0;
+		u64 *cnt;
 
-		wc = bpf_map_lookup_elem(&mlfq_wakeup_stats, &wakeup_key);
-		if (wc) {
-			__atomic_fetch_add(&wc->total, 1, __ATOMIC_RELAXED);
-			__atomic_fetch_add(&wc->window, 1, __ATOMIC_RELAXED);
-		}
+		cnt = bpf_map_lookup_elem(&mlfq_wakeup_stats, &wakeup_key);
+		if (cnt)
+			__atomic_fetch_add(cnt, 1, __ATOMIC_RELAXED);
 	} else if (runout) {
 		/*
 		 * Slice-exhaustion re-enqueue from put_prev_task_scx().
@@ -274,7 +243,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 
 		/*
 		 * The allowed CPU set may have changed since the last
-		 * placement; the pinned CPU is prev_cpu only when the task
+		 * placement. The pinned CPU is prev_cpu only when the task
 		 * may still run there. A task whose affinity no longer
 		 * includes prev_cpu is parked on the global DSQ, which the
 		 * kernel drains on every dispatch cycle without this
@@ -287,21 +256,12 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * kernel-owned and drained invisibly to this BPF
 			 * program (consume_global_dsq), so no LLC may be
 			 * charged for the parked wait. A task that was
-			 * counted by a previous placement is released now;
+			 * counted by a previous placement is released now.
 			 * ops.running() re-acquires its ownership when the
 			 * kernel hands it a CPU. A task never counted
 			 * (first global park of a fresh task) is a no-op.
 			 */
 			mlfq_runnable_exit(tctx);
-			/*
-			 * The global park also ends the enqueue-to-run
-			 * measurement episode. No stamp is written here (the
-			 * parked wait is kernel-side), and any stamp from an
-			 * earlier enqueue is cleared so the kernel's drain
-			 * cannot measure the park as a schedulable wait.
-			 */
-			tctx->enq_at = 0;
-			tctx->flags &= ~MLFQ_TF_ENQ_WAKEUP;
 			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL,
 					   slice, enq_flags);
 			tctx->wake_cpu_state = 0;
@@ -320,19 +280,26 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			 * real placement, which re-anchors the task under
 			 * the lag clamp.
 			 */
-			__sync_fetch_and_add(&mlfq_stats.enq_pinned_idle, 1);
-			mlfq_runnable_enter(tctx, (u8)qid,
-					    mlfq_llc_of_cpu((u32)prev_cpu));
-			mlfq_stamp_enq_at(tctx, now, wakeup);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-					   slice, enq_flags);
-			mlfq_stat_placement(qid);
-			tctx->wake_cpu_state = 0;
-			goto done;
-		}
+		__sync_fetch_and_add(&mlfq_stats.enq_pinned_idle, 1);
+		mlfq_runnable_enter(tctx, (u8)qid,
+				    mlfq_llc_of_cpu((u32)prev_cpu));
+		{
+			struct queue_ctx *q = mlfq_lookup_queue(qid);
+			u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
 
-		/*
-		 * The pinned CPU is busy. The task is placed into the
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+					   grant, enq_flags);
+			mlfq_stat_placement(qid);
+			tctx->last_grant_ns = grant;
+			if (grant != slice)
+				__sync_fetch_and_add(&mlfq_stats.fcbs_grants, 1);
+		}
+		tctx->wake_cpu_state = 0;
+		goto done;
+	}
+
+	/*
+	 * The pinned CPU is busy. The task is placed into the
 		 * CPU's queue DSQ and shares the CPU by virtual time
 		 * order. The owning CPU drains the queue at every slice
 		 * boundary, so the task is served without ever parking in
@@ -351,11 +318,18 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		__sync_fetch_and_add(&mlfq_stats.enq_pinned_busy, 1);
 		mlfq_runnable_enter(tctx, (u8)qid,
 				    mlfq_llc_of_cpu((u32)prev_cpu));
-		mlfq_stamp_enq_at(tctx, now, wakeup);
-		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
-					 slice, deadline,
-					 enq_flags);
-		mlfq_stat_placement(qid);
+		{
+			struct queue_ctx *q = mlfq_lookup_queue(qid);
+			u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
+
+			scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
+						 grant, deadline,
+						 enq_flags);
+			mlfq_stat_placement(qid);
+			tctx->last_grant_ns = grant;
+			if (grant != slice)
+				__sync_fetch_and_add(&mlfq_stats.fcbs_grants, 1);
+		}
 		tctx->wake_cpu_state = 0;
 		mlfq_idle_kick(prev_cpu);
 		goto done;
@@ -382,11 +356,18 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		mlfq_runnable_enter(tctx, (u8)qid,
 				    mlfq_llc_of_cpu((u32)bpf_get_smp_processor_id()));
-		mlfq_stamp_enq_at(tctx, now, wakeup);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
-				   enq_flags);
-		__sync_fetch_and_add(&mlfq_stats.enq_fastpath, 1);
-		mlfq_stat_placement(qid);
+		{
+			struct queue_ctx *q = mlfq_lookup_queue(qid);
+			u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
+
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, grant,
+					   enq_flags);
+			__sync_fetch_and_add(&mlfq_stats.enq_fastpath, 1);
+			mlfq_stat_placement(qid);
+			tctx->last_grant_ns = grant;
+			if (grant != slice)
+				__sync_fetch_and_add(&mlfq_stats.fcbs_grants, 1);
+		}
 		tctx->wake_cpu_state = 0;
 		goto done;
 	}
@@ -464,7 +445,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	 * comparison and is not committed. Placement is deferred to the
 	 * next real placement, which re-anchors the task under the lag
 	 * clamp. A concurrent affinity change between CPU selection and
-	 * enqueue must not target a CPU outside the allowed set; the
+	 * enqueue must not target a CPU outside the allowed set. The
 	 * local-DSQ insert is a same-rq operation, so the failure is a
 	 * placement violation rather than a fatal error, and the queue
 	 * placement is the correct fallback. The redirect above sets
@@ -504,7 +485,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 					wakee_deadline,
 					prev_state->running_deadline,
 					prev_state->run_start_at,
-					now, mlfq_adapt_state.guard_eff_ns);
+					now, mlfq_sameq_preempt_min_run_ns);
 			}
 		}
 
@@ -525,10 +506,10 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 				preempt_slice = mlfq_preempt_slice_ns;
 			mlfq_runnable_enter(tctx, (u8)qid,
 					    mlfq_llc_of_cpu((u32)prev_cpu));
-			mlfq_stamp_enq_at(tctx, now, wakeup);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
 					   preempt_slice, enq_flags | SCX_ENQ_PREEMPT);
 			__sync_fetch_and_add(&mlfq_stats.preemption_kicks, 1);
+			tctx->last_grant_ns = 0;
 			tctx->wake_cpu_state = 0;
 			goto done;
 		}
@@ -548,10 +529,17 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	__sync_fetch_and_add(&mlfq_stats.enq_regular, 1);
 	mlfq_runnable_enter(tctx, (u8)qid,
 			    mlfq_llc_of_cpu((u32)target_cpu));
-	mlfq_stamp_enq_at(tctx, now, wakeup);
-	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
-				 slice, deadline, enq_flags);
-	mlfq_stat_placement(qid);
+	{
+		struct queue_ctx *q = mlfq_lookup_queue(qid);
+		u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
+
+		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
+					 grant, deadline, enq_flags);
+		mlfq_stat_placement(qid);
+		tctx->last_grant_ns = grant;
+		if (grant != slice)
+			__sync_fetch_and_add(&mlfq_stats.fcbs_grants, 1);
+	}
 
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;

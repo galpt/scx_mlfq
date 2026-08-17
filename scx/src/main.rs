@@ -8,13 +8,11 @@
 //! scx_mlfq, a Multilevel Feedback Queue scheduler for sched_ext.
 //!
 //! Per-CPU, virtual-time-ordered user DSQs (Q1/Q2/Q3 per CPU) over an EEVDF
-//! virtual-time substrate. Tasks are classified into queues by a regression
-//! tree that predicts the next CPU burst from per-task features (see
-//! mlfq_tree.rs), with the EMA interactivity gauge as a tree feature and the
-//! fallback before the first model. The wakeup path is promotion-only,
-//! through the tree, the short-sleep and I/O boost and the band hysteresis.
-//! Demotion flows through the run-out gate. See README.md for the design
-//! overview.
+//! virtual-time substrate. Tasks are classified into queues by a fixed-window
+//! burst gauge that climbs during run segments and decays at wakeup by
+//! CBS-period steps, with the short-sleep and I/O boost and the band
+//! hysteresis. Demotion flows through the run-out gate. See README.md for
+//! the design overview.
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -22,14 +20,10 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 mod config;
-mod mlfq_tree;
 mod stats;
 mod topology;
 mod webui;
 
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::mem::size_of;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
@@ -60,72 +54,21 @@ use scx_utils::uei_report;
 use scx_utils::UserExitInfo;
 
 use config::Config;
-use mlfq_tree::TreeSample;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mlfq";
-
-/* Time units from src/bpf/intf.h, used for the gauge unit conversions. */
-const NSEC_PER_USEC: u64 = crate::bpf_intf::mlfq_consts_NSEC_PER_USEC as u64;
-
-/* MLFQ tree daemon tuning, from src/bpf/intf.h. */
-const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NODES as usize;
-const MLFQ_TREE_MAX_DEPTH: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_DEPTH as usize;
-const MLFQ_TREE_MIN_SAMPLES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MIN_SAMPLES as usize;
-
-/* Compile-time bounds from src/bpf/intf.h, used by the web metrics. */
-const MLFQ_MAX_CPUS: usize = crate::bpf_intf::mlfq_consts_MLFQ_MAX_CPUS as usize;
-
-/*
- * Web-UI runnable gauges. The BPF side maintains `mlfq_llc_runnable`,
- * `mlfq_queue_runnable` and `mlfq_llc_idle` in the bss block directly
- * before `mlfq_stats` (the declaration order keeps the published-tree
- * control line isolated, see main.bpf.c); the generated bss type carries
- * the arrays, so the web metrics read them as typed fields.
- */
-
-/*
- * Training-window cap, in samples. Eight retrain generations at the
- * 2048-sample minimum; a sliding window keeps the model pinned to the
- * recent workload instead of a lifetime aggregate. Daemon-side tuning
- * constant, not a user knob.
- */
-const MLFQ_TREE_WINDOW_MAX: usize = 16384;
-
-/*
- * Per-pid share cap of the training window. The BPF-side emission budget
- * is per task (MLFQ_TREE_PER_TASK_LIMIT_NS), so a process with enough
- * threads can still fill the whole window with its own samples and
- * over-fit the tree to its own behavior; the daemon therefore caps each
- * pid at ~5% of the window (MLFQ_TREE_WINDOW_MAX / 20), drops the excess
- * at ingest and counts the drops separately. Daemon-side security
- * constant, not a user knob.
- */
-const MLFQ_TREE_PER_PID_CAP: u32 = (MLFQ_TREE_WINDOW_MAX / 20) as u32;
-
-/*
- * Minimum number of distinct pids the fit slice must contain before a
- * model may be published: a tree fit on samples from a handful of pids
- * would over-fit those tasks' behavior. A rejected model keeps the
- * previous one committed, and the retrain cadence already prevents a
- * rejection from turning into a per-sample retrain storm. Daemon-side
- * constant, not a user knob.
- */
-const MLFQ_TREE_MIN_PIDS: usize = 8;
-
-/* CART growth caps for the daemon's training runs. */
-const MLFQ_TREE_MIN_LEAF: usize = 32;
-const MLFQ_TREE_RETRAIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /*
  * PM QoS idle-resume-latency cap in microseconds, applied to
  * /dev/cpu_dma_latency for the duration of the run. 10 us bans the deep
  * core and package C-states (18 us and 350 us exits on the target) while
  * keeping C1 (1 us), so wakeup latency is not dominated by deep-state
- * exits. An environmental power/latency tradeoff made automatically, not
- * a user knob.
+ * exits.
  */
 const MLFQ_IDLE_RESUME_LATENCY_US: i32 = 10;
+
+/* Compile-time bounds from src/bpf/intf.h, used by the web metrics. */
+const MLFQ_MAX_CPUS: usize = crate::bpf_intf::mlfq_consts_MLFQ_MAX_CPUS as usize;
 
 fn full_version() -> String {
     build_id::full_version(env!("CARGO_PKG_VERSION"))
@@ -138,7 +81,7 @@ struct Opts {
     #[clap(long)]
     stats: Option<f64>,
 
-    /// Run in statistics monitoring mode; the scheduler is not launched.
+    /// Run in statistics monitoring mode. The scheduler is not launched.
     #[clap(long)]
     monitor: Option<f64>,
 
@@ -150,7 +93,7 @@ struct Opts {
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
-    /// Size of the exit dump buffer in bytes; the kernel fills it with
+    /// Size of the exit dump buffer in bytes. The kernel fills it with
     /// per-CPU and per-task state when the scheduler exits on an error.
     #[clap(long, default_value = "1048576")]
     exit_dump_len: u32,
@@ -169,10 +112,7 @@ struct Opts {
 
     /// Disable the loopback web UI. The UI binds [::1]:50005 (falling
     /// back to 127.0.0.1:50005, then to the /tmp/scx_mlfq.sock unix
-    /// socket when the loader sandbox blocks TCP) and is unauthenticated:
-    /// the loopback address is the localhost trust boundary, and the
-    /// counters it exposes are already world-readable through the stats
-    /// server. This flag skips the thread entirely.
+    /// socket when the loader sandbox blocks TCP) and is unauthenticated.
     #[clap(long = "no-webui", action = clap::ArgAction::SetTrue)]
     no_webui: bool,
 
@@ -180,30 +120,9 @@ struct Opts {
     libbpf: LibbpfOpts,
 }
 
-/// Metadata of the committed MLFQ tree model, reported to the stats
-/// server and the exit log. Defaults describe the untrained state.
-#[derive(Clone, Copy, Debug, Default)]
-struct ModelMeta {
-    /// Monotonic publish generation; 0 while untrained.
-    generation: u64,
-    /// Training samples behind the committed model (the fit slice).
-    nr_samples: usize,
-    /// Nodes of the committed tree.
-    nr_nodes: usize,
-    /// MAE of the tree on the held-out slice of its training window, in
-    /// microseconds.
-    mae_tree_us: u64,
-    /// MAE of the per-sample EMA baseline on the same held-out slice, in
-    /// microseconds.
-    mae_ema_us: u64,
-    /// Pearson correlation of the tree predictions and the labels on the
-    /// held-out slice.
-    corr: f64,
-}
-
 /// The Scheduler facade owns the loaded skeleton, the struct_ops link, the
-/// stats server and the MLFQ tree daemon state; drives the run loop
-/// until shutdown or UEI exit.
+/// stats server and the web UI wiring. Drives the run loop until shutdown
+/// or UEI exit.
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -219,43 +138,20 @@ struct Scheduler<'a> {
     cpu_static: Vec<stats::PerCpuMetrics>,
     /*
      * Per-CPU current-frequency cache for the web UI, refreshed from
-     * sysfs at most once per second in the run loop. The values ride
-     * in the pushed snapshots, so a snapshot never reaches the UI with
-     * a zero current frequency because a refresh was throttled.
+     * sysfs at most once per second in the run loop.
      */
     cur_freq_khz: Vec<u64>,
     freq_read_at: Option<std::time::Instant>,
     started_at: std::time::Instant,
     /*
      * PM QoS idle-latency constraint on /dev/cpu_dma_latency, held for
-     * the run; closing the file restores the previous constraint. The
-     * field is never read: the file is held for its Drop side effect,
-     * which releases the constraint on every exit path.
+     * the run; closing the file restores the previous constraint.
      */
     #[expect(dead_code)]
     pm_qos_fd: Option<std::fs::File>,
-    /*
-     * MLFQ tree daemon state: the sample ring buffer, the parsed-sample
-     * channel the ring-buffer callback fills, the sliding training
-     * window, the retrain cadence, the committed-model metadata and the
-     * training worker channels (the fit runs off the main loop; the
-     * publish stays on it).
-     */
-    rb_mgr: libbpf_rs::RingBuffer<'static>,
-    sample_rx: crossbeam::channel::Receiver<TreeSample>,
-    window: VecDeque<TreeSample>,
-    /*
-     * Per-pid accounting of the training window: the counts track the
-     * admitted samples of each pid so no single task can own more than
-     * MLFQ_TREE_PER_PID_CAP of the window, and the drop counter records
-     * the samples the cap rejected at ingest.
-     */
-    pid_counts: HashMap<u32, u32>,
-    tree_samples_cap_dropped: u64,
-    last_train_at: Option<std::time::Instant>,
-    train_tx: crossbeam::channel::Sender<Vec<TreeSample>>,
-    train_rx: crossbeam::channel::Receiver<Result<TrainResult, anyhow::Error>>,
-    model: ModelMeta,
+    /// Read-only snapshot of the applied scheduling constants, pushed
+    /// with every web metrics update.
+    config_desc: String,
 }
 
 impl<'a> Scheduler<'a> {
@@ -279,6 +175,8 @@ impl<'a> Scheduler<'a> {
         config.apply(&mut skel)?;
         info!("Config: {}", config.describe());
 
+        let config_desc = config.describe();
+
         // Hybrid-capacity, cache-domain and NUMA placement data also goes
         // into rodata pre-load.
         let topology_plan = topology::init_topology(&mut skel)?;
@@ -288,16 +186,6 @@ impl<'a> Scheduler<'a> {
          * for the last runnable task on a CPU, never migrate
          * migration-disabled tasks, and allow queued-wakeup selection of
          * idle CPUs (the idle-CPU fast path depends on the latter two).
-         *
-         * The built-in idle tracking is kept (SCX_OPS_KEEP_BUILTIN_IDLE)
-         * and ops.update_idle is registered to maintain the scheduler's
-         * own idle-CPU count, which lets select_cpu() skip its idle scans
-         * when the system is saturated. The flag gates the callback: a
-         * registered update_idle without the flag would disable the
-         * kernel's built-in idle tracking that scx_bpf_pick_idle_cpu()
-         * and scx_bpf_test_and_clear_cpu_idle() rely on, so on kernels
-         * without the flag the callback is left unregistered and the
-         * lean path stays off (mlfq_idle_tracking remains 0).
          */
         let mut flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
@@ -315,12 +203,6 @@ impl<'a> Scheduler<'a> {
         }
         skel.struct_ops.mlfq_ops_mut().flags = flags;
 
-        /*
-         * Error exits capture the per-CPU and per-task state dump into
-         * the exit report; without a buffer the kernel skips the dump
-         * entirely, so a stall or a placement failure would leave no
-         * evidence of where the task was parked.
-         */
         skel.struct_ops.mlfq_ops_mut().exit_dump_len = opts.exit_dump_len;
 
         /*
@@ -330,11 +212,7 @@ impl<'a> Scheduler<'a> {
          * cannot run, so the optional tracepoint program is
          * force-enabled here; the evacuation branches inside are
          * ksym-gated and self-prune on kernels without the reenqueue
-         * kfuncs. The flip side of forcing it is that a kernel which
-         * rejects the hook at verification fails the whole load
-         * instead of degrading gracefully: the kfunc calls it makes
-         * have been in the tracing kfunc set since 6.18, but any new
-         * kernel that drops one of them must be tested before release.
+         * kfuncs.
          */
         unsafe {
             libbpf_rs::libbpf_sys::bpf_program__set_autoload(
@@ -346,10 +224,7 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 
         // The membership bitmaps are written after load (the maps are only
-        // available on the loaded object). An unpopulated primary bitmap
-        // falls back to all-primary behavior; an empty LLC bitmap yields
-        // no idle candidate there, so a failure only degrades the
-        // placement hint.
+        // available on the loaded object).
         if let Err(e) = topology::write_primary_bitmap(&mut skel, &topology_plan.capacity) {
             log::warn!(
                 "failed to write the primary bitmap, falling back to all-primary placement: {e:#}"
@@ -358,10 +233,6 @@ impl<'a> Scheduler<'a> {
         if let Err(e) = topology::write_llc_bitmaps(&mut skel, &topology_plan.llcs) {
             log::warn!("failed to write the LLC bitmaps, disabling LLC-aware placement: {e:#}");
         }
-        // The per-LLC CPU lists feed the dispatch Tier-A same-LLC steal
-        // scan. A list-write failure degrades *stealing* only: the
-        // placement bitmaps above stay live, so the two fallbacks are
-        // independent and the scheduler keeps its placement hints.
         if let Err(e) = topology::write_llc_cpu_lists(&mut skel, &topology_plan.llcs) {
             log::warn!(
                 "failed to write the per-LLC CPU lists, disabling LLC-aware stealing: {e:#}"
@@ -375,10 +246,7 @@ impl<'a> Scheduler<'a> {
          * /dev/cpu_dma_latency for the duration of the run, so the
          * cpuidle governor keeps the CPUs in the shallowest idle states
          * that fit the cap and wakeup latency is not dominated by the
-         * deep C-state exits. Closing the file on exit restores the
-         * previous latency. The capability check and the write are
-         * best-effort: the scheduler must run regardless, and the BPF-side
-         * placement remains the fallback on a system without PM QoS.
+         * deep C-state exits.
          */
         let pm_qos_fd = if pm::cpu_idle_resume_latency_supported() {
             match pm::update_global_idle_resume_latency(MLFQ_IDLE_RESUME_LATENCY_US) {
@@ -408,8 +276,7 @@ impl<'a> Scheduler<'a> {
          * try_send drops a frame when the buffer is full, so the run
          * loop never blocks and the buffer never grows) feeding a
          * detached server thread that exits on the shared shutdown
-         * flag. The per-CPU static seed is captured once here; with
-         * --no-webui neither the thread nor the seed exist.
+         * flag.
          */
         let (webui_tx, webui_join): (
             Option<crossbeam::channel::Sender<stats::WebMetrics>>,
@@ -430,48 +297,6 @@ impl<'a> Scheduler<'a> {
             topology::web_cpu_static()
         };
 
-        /*
-         * The training-sample ring buffer: the callback parses each
-         * record as the mlfq_tree_sample mirror and forwards it into a
-         * bounded channel the run loop drains. try_send drops the sample
-         * when the channel is full, which the ring-buffer backpressure
-         * absorbs first. TreeSample is a repr(C) POD mirroring the
-         * 68-byte BPF record, so the parse is a plain byte
-         * reinterpretation. The record's version tag is checked before
-         * the record is admitted, so a record from a foreign producer or
-         * a mismatched build is dropped instead of misread.
-         */
-        let (sample_tx, sample_rx) = crossbeam::channel::bounded(4096);
-        let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
-        rb_builder.add(&skel.maps.mlfq_samples, move |data| {
-            if data.len() < size_of::<TreeSample>() {
-                return 0;
-            }
-            // SAFETY: TreeSample is a repr(C) mirror of the 68-byte
-            // mlfq_tree_sample the stopping path submits; reading the
-            // record as the struct is a plain byte reinterpretation of
-            // integer fields.
-            let s = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<TreeSample>()) };
-            if !mlfq_tree::sample_version_matches(&s) {
-                return 0;
-            }
-            let _ = sample_tx.try_send(s);
-            0
-        })?;
-        let rb_mgr = rb_builder.build()?;
-
-        /*
-         * The training worker: the fit and the metrics computation run on
-         * a dedicated thread so a retrain never stalls the main loop's
-         * stats and drain cadence. The main loop hands over a snapshot
-         * of the window (the window is only mutated by the ingest on the
-         * main thread, so taking a snapshot cannot race with the ingest) and
-         * the worker sends the result back over a channel. try_send drops
-         * a kick when the previous fit is still in flight, which the 60 s
-         * cadence makes rare.
-         */
-        let (train_tx, train_rx) = spawn_train_worker();
-
         Ok(Self {
             skel,
             struct_ops: Some(struct_ops),
@@ -483,15 +308,7 @@ impl<'a> Scheduler<'a> {
             freq_read_at: None,
             started_at: std::time::Instant::now(),
             pm_qos_fd,
-            rb_mgr,
-            sample_rx,
-            window: VecDeque::new(),
-            pid_counts: HashMap::new(),
-            tree_samples_cap_dropped: 0,
-            last_train_at: None,
-            train_tx,
-            train_rx,
-            model: ModelMeta::default(),
+            config_desc,
         })
     }
 
@@ -503,8 +320,6 @@ impl<'a> Scheduler<'a> {
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
         let s = &bss_data.mlfq_stats;
-        let g = &bss_data.mlfq_sys_gauge;
-        let a = &bss_data.mlfq_adapt_state;
         Metrics {
             on_cpu: s.on_cpu,
             total_runtime: s.total_runtime,
@@ -530,39 +345,20 @@ impl<'a> Scheduler<'a> {
             enq_pinned_idle: s.enq_pinned_idle,
             enq_pinned_busy: s.enq_pinned_busy,
             enq_pinned_global: s.enq_pinned_global,
-            tree_inference: s.tree_inference,
-            tree_fallback: s.tree_fallback,
-            tree_disagree: s.tree_disagree,
-            tree_samples_emitted: s.tree_samples_emitted,
-            tree_samples_dropped: s.tree_samples_dropped,
             rt_takeovers: s.rt_takeovers,
             rt_evacuations: s.rt_evacuations,
             rt_redirects: s.rt_redirects,
             rt_reenqs: s.rt_reenqs,
+            fcbs_grants: s.fcbs_grants,
+            fcbs_slack_events: s.fcbs_slack_events,
             op_lat: self.read_op_lat(),
-            tree_samples_cap_dropped: self.tree_samples_cap_dropped,
-            tree_model_generation: self.model.generation,
-            tree_model_nodes: self.model.nr_nodes as u64,
-            tree_model_samples: self.model.nr_samples as u64,
-            tree_mae_tree_us: self.model.mae_tree_us,
-            tree_mae_ema_us: self.model.mae_ema_us,
-            tree_corr_milli: (self.model.corr * 1000.0).round() as i64,
-            sys_lat_ema_us: g.lat_ema / NSEC_PER_USEC,
-            sys_rate_ema: g.rate_ema,
-            t_l_eff_us: a.t_l_eff_ns / NSEC_PER_USEC,
-            t_h_eff_us: a.t_h_eff_ns / NSEC_PER_USEC,
-            t_int_eff_us: a.t_int_eff_ns / NSEC_PER_USEC,
-            t_bnd_eff_us: a.t_bnd_eff_ns / NSEC_PER_USEC,
-            guard_eff_us: a.guard_eff_ns / NSEC_PER_USEC,
-            adapt_shift: a.shift_fp,
             wakeup_total: self.read_wakeup_total(),
-            adapt_steps: u64::from(g.adapt_steps),
         }
     }
 
     /// Web-metrics snapshot. The raw scheduler counters plus the per-CPU
     /// state and the runnable gauges, pushed to the web UI every run-loop
-    /// iteration. Gauges only, no interval deltas.
+    /// iteration.
     fn get_web_metrics(&mut self) -> stats::WebMetrics {
         let bss_data = self
             .skel
@@ -571,8 +367,7 @@ impl<'a> Scheduler<'a> {
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
 
-        // Refresh the per-CPU current frequencies at most once per
-        // second, so the sysfs reads cannot grow with the push cadence.
+        // Refresh the per-CPU current frequencies at most once per second.
         let now = std::time::Instant::now();
         if self
             .freq_read_at
@@ -585,10 +380,6 @@ impl<'a> Scheduler<'a> {
             self.freq_read_at = Some(now);
         }
 
-        // Merge the per-CPU dynamic state (running queue, running pid,
-        // realtime occupancy) from the per-CPU maps into the once-per-
-        // attach static seed (freq, LLC, SMT). One entry per CPU in
-        // bss_data.nr_cpu_ids, capped at MLFQ_MAX_CPUS.
         let nr_cpus = (bss_data.nr_cpu_ids as usize).min(MLFQ_MAX_CPUS);
         let mut statics = vec![None; nr_cpus];
         for s in &self.cpu_static {
@@ -616,6 +407,7 @@ impl<'a> Scheduler<'a> {
             per_cpu,
             queue_runnable: self.read_queue_runnable(),
             llc_runnable: self.read_llc_runnable(),
+            config: self.config_desc.clone(),
         }
     }
 
@@ -639,8 +431,9 @@ impl<'a> Scheduler<'a> {
                 running_queue: 0,
                 running_pid: 0,
                 steal_scan_off: 0,
-                cpu_ema: 0,
-                cpu_ema_at: 0,
+                perf_level: 0,
+                busy_win_ns: 0,
+                busy_win_start: 0,
                 running_deadline: 0,
                 run_start_at: 0,
             },
@@ -648,7 +441,7 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Read one CPU's realtime-occupancy state from the per-CPU array
-    /// map; a failed lookup yields an all-zero state (not occupied).
+    /// map. A failed lookup yields an all-zero state (not occupied).
     fn read_rtdl_state(&self, cpu: usize) -> mlfq_rtdl_state {
         let key = (cpu as u32).to_ne_bytes();
         match self
@@ -657,11 +450,9 @@ impl<'a> Scheduler<'a> {
             .rtdl_state_stor
             .lookup(&key, libbpf_rs::MapFlags::ANY)
         {
-            Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_rtdl_state>() => {
-                // SAFETY: as in read_cpu_state: a repr(C) mirror of the
-                // map's value type.
-                unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_rtdl_state>()) }
-            }
+            Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_rtdl_state>() => unsafe {
+                std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_rtdl_state>())
+            },
             _ => mlfq_rtdl_state {
                 flags: 0,
                 pad: 0,
@@ -671,12 +462,6 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Tracked runnable tasks per queue (index 0 unused, 1..3 = Q1..Q3).
-    ///
-    /// The gauge is the BPF-side `mlfq_queue_runnable` bss array, which
-    /// counts the runnable tasks placed in each queue's DSQs (the
-    /// accounting contract is in `intf.h` next to the counters). Read
-    /// through the generated bss type, so a layout change is a compile
-    /// error rather than a silent misread.
     fn read_queue_runnable(&self) -> Vec<u64> {
         let bss_data = self
             .skel
@@ -692,7 +477,6 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Tracked runnable tasks per LLC domain (MLFQ_MAX_LLCS entries).
-    /// Same contract and access path as `read_queue_runnable`.
     fn read_llc_runnable(&self) -> Vec<u64> {
         let bss_data = self
             .skel
@@ -712,9 +496,7 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Sum the per-CPU op-latency histogram into a flat per-op vector
-    /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major). The
-    /// map is per-CPU so the BPF charges never contend. A failed lookup
-    /// or an unexpected value size yields zeros for that entry.
+    /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major).
     fn read_op_lat(&self) -> Vec<u64> {
         let nr_ops = crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize;
         let buckets = crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_BUCKETS as usize;
@@ -741,10 +523,7 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Sum the per-CPU lifetime wakeup totals from the mlfq_wakeup_stats
-    /// map. Each CPU's total is bumped atomically on the wakeup path, so
-    /// this read is tear-free, and the u64 slots cannot wrap. A failed
-    /// lookup yields zero. The observation-only contract holds, so the
-    /// totals grow even while the adaptation is disabled.
+    /// map. Each CPU's total is bumped atomically on the wakeup path.
     fn read_wakeup_total(&self) -> u64 {
         let cpu_values = self
             .skel
@@ -770,18 +549,6 @@ impl<'a> Scheduler<'a> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            /*
-             * Drain the training-sample ring buffer (the callback
-             * forwards the parsed records into the sample channel) and
-             * fold them into the training window before serving the
-             * next stats request.
-             */
-            self.rb_mgr.consume()?;
-            while let Ok(s) = self.sample_rx.try_recv() {
-                self.ingest_sample(s);
-            }
-            self.poll_train_results();
-
             match req_ch.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => {
                     // Push a web snapshot on the stats request too, so
@@ -803,214 +570,46 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        /* One final drain so the exit report sees the latest samples. */
-        self.rb_mgr.consume()?;
-        while let Ok(s) = self.sample_rx.try_recv() {
-            self.ingest_sample(s);
-        }
-        self.poll_train_results();
-
         let m = self.get_metrics();
         log::info!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} steals_same_llc={} steals_cross_llc={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={} wakeups={} adapt_steps={}",
-            m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
-            m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
-            m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
-            m.enq_no_deadline, m.promotions, m.demotions, m.aging_boosts,
-            m.short_sleep_boosts, m.cpuperf_boosts, m.preemption_kicks,
-            m.total_runtime, m.on_cpu, m.steals, m.steals_same_llc,
-            m.steals_cross_llc, m.keep_running,
-            m.rt_takeovers, m.rt_evacuations, m.rt_redirects, m.rt_reenqs,
-            m.tree_model_generation, m.tree_model_nodes, m.tree_model_samples,
-            m.tree_mae_tree_us, m.tree_mae_ema_us, self.model.corr,
-            m.tree_inference, m.tree_fallback, m.tree_disagree,
-            m.tree_samples_emitted, m.tree_samples_dropped,
-            m.tree_samples_cap_dropped, m.wakeup_total, m.adapt_steps
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} \
+             pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} \
+             drop_deadline={} promotions={} demotions={} aging_boosts={} \
+             short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} \
+             runtime={} on_cpu={} steals={} steals_same_llc={} \
+             steals_cross_llc={} keep_running={} rt_takeovers={} \
+             rt_evacuations={} rt_redirects={} rt_reenqs={} wakeups={}",
+            m.q1_placements,
+            m.q2_placements,
+            m.q3_placements,
+            m.enq_fastpath,
+            m.enq_regular,
+            m.enq_pinned_idle,
+            m.enq_pinned_busy,
+            m.enq_pinned_global,
+            m.enq_no_tctx,
+            m.enq_bad_weight,
+            m.enq_no_deadline,
+            m.promotions,
+            m.demotions,
+            m.aging_boosts,
+            m.short_sleep_boosts,
+            m.cpuperf_boosts,
+            m.preemption_kicks,
+            m.total_runtime,
+            m.on_cpu,
+            m.steals,
+            m.steals_same_llc,
+            m.steals_cross_llc,
+            m.keep_running,
+            m.rt_takeovers,
+            m.rt_evacuations,
+            m.rt_redirects,
+            m.rt_reenqs,
+            m.wakeup_total
         );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
-    }
-
-    /// Fold one emitted sample into the sliding training window and
-    /// kick a retrain on the cadence. On the first window that reaches
-    /// the minimum training size, then every MLFQ_TREE_RETRAIN_INTERVAL.
-    ///
-    /// The window admits at most MLFQ_TREE_PER_PID_CAP samples per pid. A pid that already holds its share is dropped here and counted in tree_samples_cap_dropped. The cap check runs before
-    /// the window accounting, so a rejected sample never disturbs the
-    /// per-pid counts, and the eviction bookkeeping below decrements the
-    /// pid of the sample the window actually pops.
-    fn ingest_sample(&mut self, s: TreeSample) {
-        if !tree_admit_pid(&mut self.pid_counts, s.pid) {
-            self.tree_samples_cap_dropped += 1;
-            return;
-        }
-        if self.window.len() == MLFQ_TREE_WINDOW_MAX {
-            let evicted = self
-                .window
-                .pop_front()
-                .expect("a full window pops the oldest sample");
-            tree_evict_pid(&mut self.pid_counts, evicted.pid);
-        }
-        self.window.push_back(s);
-
-        let due = match self.last_train_at {
-            None => self.window.len() >= MLFQ_TREE_MIN_SAMPLES,
-            Some(t) => {
-                t.elapsed() >= MLFQ_TREE_RETRAIN_INTERVAL
-                    && self.window.len() >= MLFQ_TREE_MIN_SAMPLES
-            }
-        };
-        if due {
-            self.kick_training();
-        }
-    }
-
-    /// Hand a snapshot of the window to the training worker.
-    ///
-    /// The retrain cadence counts every kick, so a rejected model cannot
-    /// turn into a per-sample retrain storm. try_send drops the kick when
-    /// the worker is still busy with the previous fit, which the 60 s
-    /// cadence makes rare.
-    fn kick_training(&mut self) {
-        self.last_train_at = Some(std::time::Instant::now());
-        let snapshot: Vec<TreeSample> = self.window.iter().copied().collect();
-        if self.train_tx.try_send(snapshot).is_err() {
-            log::warn!("MLFQ tree training already in flight, skipping this retrain");
-        }
-    }
-
-    /// Collect the finished fits from the training worker and apply the
-    /// publish quality gate to each.
-    fn poll_train_results(&mut self) {
-        while let Ok(res) = self.train_rx.try_recv() {
-            match res {
-                Ok(r) => self.apply_train_result(r),
-                Err(e) => {
-                    log::warn!("MLFQ tree training failed, keeping the previous model: {e:#}");
-                }
-            }
-        }
-    }
-
-    /// Commit a finished fit when it passes validation and the publish
-    /// quality gate; otherwise keep the previous model.
-    ///
-    /// The gate and the meta computation are pure functions in
-    /// mlfq_tree (mlfq_tree::should_publish, mlfq_tree::tree_meta), which
-    /// the unit tests cover.
-    fn apply_train_result(&mut self, res: TrainResult) {
-        if let Err(e) = mlfq_tree::serialize_validate(&res.tree) {
-            log::warn!("MLFQ tree training failed validation, keeping the previous model: {e}");
-            return;
-        }
-
-        let gen = self.model.generation + 1;
-        /*
-         * A tree fit on the behavior of a handful of tasks would
-         * over-fit them, so the publish requires at least
-         * MLFQ_TREE_MIN_PIDS distinct pids in the fit slice; a rejected
-         * model keeps the previous one committed, and the retrain
-         * cadence prevents a rejection from becoming a retrain storm.
-         */
-        if res.nr_pids_train < MLFQ_TREE_MIN_PIDS {
-            log::info!(
-                "MLFQ tree gen {} rejected: fit slice has only {} distinct pids (< {} required), keeping the previous model",
-                gen, res.nr_pids_train, MLFQ_TREE_MIN_PIDS
-            );
-            return;
-        }
-        if !mlfq_tree::should_publish(res.mae_tree, res.mae_ema) {
-            log::info!(
-                "MLFQ tree gen {} rejected: holdout MAE_tree={:.1}us > MAE_ema={:.1}us, keeping the previous model",
-                gen, res.mae_tree / 1e3, res.mae_ema / 1e3
-            );
-            return;
-        }
-
-        if let Err(e) = self.publish_tree(&res.tree, gen) {
-            log::warn!("MLFQ tree publish failed, keeping the previous model: {e:#}");
-            return;
-        }
-
-        self.model = ModelMeta {
-            generation: gen,
-            nr_samples: res.nr_train,
-            nr_nodes: res.tree.nodes.len(),
-            mae_tree_us: (res.mae_tree / 1e3).round() as u64,
-            mae_ema_us: (res.mae_ema / 1e3).round() as u64,
-            corr: res.corr,
-        };
-        info!(
-            "MLFQ tree model gen {}, nodes {}, fit {} samples (holdout {}), MAE_tree={}us MAE_ema={}us corr={:.3}",
-            gen,
-            res.tree.nodes.len(),
-            res.nr_train,
-            res.holdout_len,
-            self.model.mae_tree_us,
-            self.model.mae_ema_us,
-            self.model.corr
-        );
-    }
-
-    /// Publish a validated tree into the inactive map entry and commit
-    /// the meta last.
-    ///
-    /// The full map value is written (live nodes at the front, zeroed
-    /// tail), so a shrinking tree never leaves stale nodes behind the
-    /// new node count. A release fence orders the map-value write before
-    /// the meta write, which flips the active entry, bumps the
-    /// generation and sets the trained bit: a BPF reader that loaded the
-    /// meta once sees either the old tree or the fully committed new
-    /// one, never a partially written one.
-    ///
-    /// The protocol is sound at the 60 s publish cadence: a reader could
-    /// only observe a torn tree if two publishes completed within one
-    /// tree walk, and each walk is a few dozen memory reads while a
-    /// publish moves up to 2048 nodes, so two consecutive publishes
-    /// cannot complete inside one walk. The consequence of the
-    /// theoretical race is one mispredicted burst, which the queue-band
-    /// nets absorb. The walk masks every index to the buffer bound, so
-    /// it is never a memory-safety issue.
-    fn publish_tree(&mut self, tree: &mlfq_tree::SerializedTree, gen: u64) -> Result<()> {
-        let old_meta = {
-            let bss = self
-                .skel
-                .maps
-                .bss_data
-                .as_ref()
-                .expect("bss_data missing, the BPF object has no .bss section");
-            bss.mlfq_tree_ctrl.meta
-        };
-        let old_active = (old_meta >> 1) & 1;
-        let new_active = 1 - old_active;
-        let key = (new_active as u32).to_ne_bytes();
-
-        let node_bytes = unsafe {
-            std::slice::from_raw_parts(
-                tree.nodes.as_ptr().cast::<u8>(),
-                tree.nodes.len() * size_of::<mlfq_tree::TreeNode>(),
-            )
-        };
-        let mut buf = vec![0u8; size_of::<mlfq_tree_store>()];
-        buf[..node_bytes.len()].copy_from_slice(node_bytes);
-        self.skel
-            .maps
-            .mlfq_tree_map
-            .update(&key, &buf, libbpf_rs::MapFlags::ANY)?;
-
-        // Order the map-value write before the meta commit.
-        std::sync::atomic::fence(Ordering::Release);
-
-        {
-            let bss = self
-                .skel
-                .maps
-                .bss_data
-                .as_mut()
-                .expect("bss_data missing, the BPF object has no .bss section");
-            bss.mlfq_tree_ctrl.meta = mlfq_tree::tree_meta(gen, tree.nodes.len(), new_active);
-        }
-        Ok(())
     }
 }
 
@@ -1033,157 +632,6 @@ impl Drop for Scheduler<'_> {
         }
         info!("Unregister {SCHEDULER_NAME} scheduler");
     }
-}
-
-/// Result of one training run, handed back from the worker thread. The
-/// metrics are computed on the held-out slice so the publish gate and
-/// the reported numbers describe out-of-sample error.
-struct TrainResult {
-    tree: mlfq_tree::SerializedTree,
-    /// Samples the tree was fit on.
-    nr_train: usize,
-    /// Distinct pids in the fit slice, the concentration input for the per-pid cap.
-    nr_pids_train: usize,
-    /// Samples of the held-out evaluation slice.
-    holdout_len: usize,
-    /// Tree MAE on the holdout, in nsecs.
-    mae_tree: f64,
-    /// Exact per-sample EMA-baseline MAE on the holdout, in nsecs.
-    mae_ema: f64,
-    /// Pearson correlation of tree predictions and labels on the holdout.
-    corr: f64,
-}
-
-/// Split the window into the fit slice (first 90%) and the held-out
-/// evaluation slice (last 10%). The daemon only trains once the window
-/// holds MLFQ_TREE_MIN_SAMPLES samples, so the holdout is never empty in
-/// production; a window too small for a meaningful 90/10 split (< 20
-/// samples) is an error, which the caller treats as a skipped training
-/// round (log + keep the previous model) instead of silently training
-/// and evaluating on the same slice.
-fn split_holdout(samples: &[TreeSample]) -> Result<(&[TreeSample], &[TreeSample]), String> {
-    if samples.len() >= 20 {
-        let cut = samples.len() - samples.len() / 10;
-        Ok(samples.split_at(cut))
-    } else {
-        Err(format!(
-            "training window holds only {} samples; {} are needed for a 90/10 holdout split",
-            samples.len(),
-            20
-        ))
-    }
-}
-
-/// Admit one sample of `pid` into the window under the per-pid cap. Returns true when the sample is admitted and the pid's count is incremented, false when the pid already holds its
-/// MLFQ_TREE_PER_PID_CAP share and the caller must drop the sample.
-/// Entries are pruned on eviction, not here: a pid at the cap keeps its
-/// entry until the window ages its samples out.
-fn tree_admit_pid(counts: &mut HashMap<u32, u32>, pid: u32) -> bool {
-    let c = counts.entry(pid).or_insert(0);
-    if *c >= MLFQ_TREE_PER_PID_CAP {
-        return false;
-    }
-    *c += 1;
-    true
-}
-
-/// Remove one sample of `pid` from the per-pid accounting when the
-/// window evicts its oldest sample, pruning the entry when the count
-/// reaches zero so the map cannot grow with retired pids.
-fn tree_evict_pid(counts: &mut HashMap<u32, u32>, pid: u32) {
-    if let Some(c) = counts.get_mut(&pid) {
-        *c -= 1;
-        if *c == 0 {
-            counts.remove(&pid);
-        }
-    }
-}
-
-/// Number of distinct pids in a slice, the concentration input for the per-pid cap.
-fn tree_distinct_pids(samples: &[TreeSample]) -> usize {
-    let mut seen = HashSet::new();
-    for s in samples {
-        seen.insert(s.pid);
-    }
-    seen.len()
-}
-
-/// Fit a tree and compute the holdout metrics, on the training worker.
-///
-/// The tree is fit on the first 90% of the window and evaluated on the
-/// last 10%, so the reported MAE and the publish gate describe
-/// out-of-sample error. The EMA baseline is exact. Each sample's
-/// prediction is the captured gauge `feats.ema` (the post-decay gauge at
-/// the capture, as emitted by the BPF side), so
-/// `mae_ema = mean(|feats.ema - label|)` on the same holdout slice and
-/// the tree comparison is honest.
-fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
-    let (train, holdout) = split_holdout(samples)?;
-
-    let tree = mlfq_tree::fit(
-        train,
-        MLFQ_TREE_MAX_DEPTH,
-        MLFQ_TREE_MIN_LEAF,
-        MLFQ_TREE_MAX_NODES,
-        mlfq_tree::DEFAULT_MIN_REL_VAR_REDUCTION,
-    );
-    mlfq_tree::serialize_validate(&tree).map_err(|e| {
-        // A tree that fails the walk invariants must never be
-        // published; the previous model stays committed.
-        format!("tree failed validation: {e}")
-    })?;
-
-    let actuals: Vec<u64> = holdout.iter().map(|s| s.label_ns).collect();
-    let preds: Vec<u64> = holdout
-        .iter()
-        .map(|s| {
-            /* The packed sample is copied out before the walk takes a reference. */
-            let feats = s.feats;
-            mlfq_tree::predict(&tree, &feats)
-        })
-        .collect();
-    let mae_tree = mlfq_tree::mae(&preds, &actuals);
-    let mae_ema = holdout
-        .iter()
-        .map(|s| s.feats.ema.abs_diff(s.label_ns) as u128)
-        .sum::<u128>() as f64
-        / holdout.len() as f64;
-    let corr = mlfq_tree::pearson(&preds, &actuals);
-
-    Ok(TrainResult {
-        tree,
-        nr_train: train.len(),
-        nr_pids_train: tree_distinct_pids(train),
-        holdout_len: holdout.len(),
-        mae_tree,
-        mae_ema,
-        corr,
-    })
-}
-
-/// Spawn the training worker and return its job and result channels.
-///
-/// The worker owns no scheduler state. It receives a snapshot of the
-/// window (the window is only mutated by the ingest on the main thread,
-/// so handing over a snapshot cannot race with the ingest), fits the tree
-/// and computes the holdout metrics, and sends the result back. The
-/// publish stays on the main thread. Dropping the job sender closes the
-/// channel and the worker exits on its next `recv()`.
-fn spawn_train_worker() -> (
-    crossbeam::channel::Sender<Vec<TreeSample>>,
-    crossbeam::channel::Receiver<Result<TrainResult, anyhow::Error>>,
-) {
-    let (job_tx, job_rx) = crossbeam::channel::bounded::<Vec<TreeSample>>(1);
-    let (res_tx, res_rx) = crossbeam::channel::bounded::<Result<TrainResult, anyhow::Error>>(1);
-    std::thread::spawn(move || {
-        while let Ok(samples) = job_rx.recv() {
-            let res = train_model(&samples).map_err(anyhow::Error::msg);
-            if res_tx.send(res).is_err() {
-                break;
-            }
-        }
-    });
-    (job_tx, res_rx)
 }
 
 fn main() -> Result<()> {
@@ -1225,8 +673,7 @@ fn main() -> Result<()> {
             simplelog::ColorChoice::Auto,
         )?;
 
-        // The SMT annotation is appended when the host exposes it. An
-        // unreadable knob omits the suffix rather than guessing.
+        // The SMT annotation is appended when the host exposes it.
         let smt_suffix = match topology::smt_enabled() {
             Some(true) => " SMT on",
             Some(false) => " SMT off",
@@ -1275,10 +722,7 @@ fn main() -> Result<()> {
      * If this run wrote the runtime loader-sandbox unblock (see
      * webui.rs), restore it now: the drop-in is per-boot state under
      * /run, so it must be undone once, at the final exit after the
-     * restart loop, not on every internal restart. The web UI thread
-     * of the last incarnation is joined first, so its unblock-write
-     * flag is visible before the restore decision (the thread exits
-     * within its poll interval of the shutdown flag).
+     * restart loop, not on every internal restart.
      */
     webui::restore_loader_sandbox();
 
@@ -1339,87 +783,5 @@ mod math_test {
             stdout.contains("All tests passed"),
             "native harness did not report success"
         );
-    }
-
-    /// Minimal test sample; pid and label are the only fields the
-    /// daemon-side pure helpers inspect.
-    fn mk_sample(pid: u32, label_ns: u64) -> crate::mlfq_tree::TreeSample {
-        crate::mlfq_tree::TreeSample {
-            pid,
-            version: crate::mlfq_tree::MLFQ_TREE_SAMPLE_VERSION,
-            queue: 1,
-            feats: crate::mlfq_tree::TreeFeats::default(),
-            label_ns,
-        }
-    }
-
-    #[test]
-    fn split_holdout_cut_and_rejection() {
-        let samples: Vec<_> = (0..100).map(|i| mk_sample(i as u32, i as u64)).collect();
-
-        // The 90/10 cut: 100 samples split into 90 + 10.
-        let (train, holdout) = crate::split_holdout(&samples).unwrap();
-        assert_eq!(train.len(), 90);
-        assert_eq!(holdout.len(), 10);
-        let first_train = train[0].label_ns;
-        let first_holdout = holdout[0].label_ns;
-        assert_eq!(first_train, 0);
-        assert_eq!(first_holdout, 90);
-
-        // The 20-sample minimum splits 18 + 2.
-        let (train, holdout) = crate::split_holdout(&samples[..20]).unwrap();
-        assert_eq!(train.len(), 18);
-        assert_eq!(holdout.len(), 2);
-
-        // A window below the minimum is an error (a skipped training
-        // round), not a degenerate same-slice train/holdout fallback.
-        assert!(crate::split_holdout(&samples[..19]).is_err());
-        assert!(crate::split_holdout(&[]).is_err());
-    }
-
-    #[test]
-    fn pid_count_cap_evict_and_prune() {
-        let mut counts = std::collections::HashMap::new();
-
-        // The cap admits MLFQ_TREE_PER_PID_CAP samples of one pid...
-        for _ in 0..crate::MLFQ_TREE_PER_PID_CAP {
-            assert!(crate::tree_admit_pid(&mut counts, 7));
-        }
-        // ...and rejects the next one, which the caller counts separately.
-        assert!(!crate::tree_admit_pid(&mut counts, 7));
-        // Other pids are unaffected by pid 7's cap.
-        assert!(crate::tree_admit_pid(&mut counts, 8));
-
-        // Evicting one pid 7 sample opens the slot again.
-        crate::tree_evict_pid(&mut counts, 7);
-        assert!(crate::tree_admit_pid(&mut counts, 7));
-
-        // Evicting the remaining pid 7 samples prunes the entry, so the
-        // map cannot grow with retired pids.
-        for _ in 0..crate::MLFQ_TREE_PER_PID_CAP {
-            crate::tree_evict_pid(&mut counts, 7);
-        }
-        assert!(!counts.contains_key(&7));
-        assert_eq!(counts.get(&8), Some(&1));
-    }
-
-    #[test]
-    fn distinct_pids_concentration_gate() {
-        assert_eq!(crate::tree_distinct_pids(&[]), 0);
-        assert_eq!(
-            crate::tree_distinct_pids(&[mk_sample(1, 0), mk_sample(1, 1), mk_sample(2, 2)]),
-            2
-        );
-
-        // The publish gate requires MLFQ_TREE_MIN_PIDS distinct pids in
-        // the fit slice; one fewer is rejected, the minimum passes.
-        let few: Vec<_> = (0..crate::MLFQ_TREE_MIN_PIDS - 1)
-            .map(|i| mk_sample(i as u32, i as u64))
-            .collect();
-        assert!(crate::tree_distinct_pids(&few) < crate::MLFQ_TREE_MIN_PIDS);
-        let enough: Vec<_> = (0..crate::MLFQ_TREE_MIN_PIDS)
-            .map(|i| mk_sample(i as u32, i as u64))
-            .collect();
-        assert!(crate::tree_distinct_pids(&enough) >= crate::MLFQ_TREE_MIN_PIDS);
     }
 }
