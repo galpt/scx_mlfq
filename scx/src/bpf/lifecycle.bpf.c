@@ -127,7 +127,7 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 	__sync_fetch_and_add(&mlfq_stats.on_cpu, 1);
 
 	/*
-	 * cpufreq interaction: the interactive queue requests the maximum
+	 * cpufreq interaction. The interactive queue requests the maximum
 	 * performance level through the sched_ext cpuperf API, and the
 	 * other queues use the level folded at the last stopping event
 	 * (cpu->perf_level, the windowed busy-window fold). The kernel
@@ -208,7 +208,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		 * the unspent budget of its last grant is donated to
 		 * the queue's bonus. The preempt path writes
 		 * last_grant_ns = 0, so slack is zero by construction
-		 * (H2): a preempt burst is not full-service budget
+		 * (H2). A preempt burst is not full-service budget
 		 * and must not generate bonus.
 		 */
 		if (!runnable) {

@@ -14,9 +14,9 @@
 #include "intf.h"
 
 /*
- * Shadow runnable gauges: intf.h declares the per-LLC and per-queue
+ * Shadow runnable gauges. intf.h declares the per-LLC and per-queue
  * runnable gauge externs unconditionally (the BPF build gets them from
- * the main.bpf.c bss block); the harness provides the storage itself so
+ * the main.bpf.c bss block). The harness provides the storage itself so
  * the pure accounting helpers can be driven against real arrays.
  */
 volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
@@ -80,7 +80,7 @@ static void test_place_entity(void)
 
 	/*
 	 * A task far behind the clock is clamped to clock - limit, the
-	 * fair.c bounded-lag property: lag saturates at limit and the
+	 * fair.c bounded-lag property. Lag saturates at limit and the
 	 * placed vruntime never falls more than one lag bound behind the
 	 * service point. limit = 3ms virtual at weight 100.
 	 */
@@ -107,7 +107,7 @@ static void test_place_entity(void)
 
 	/*
 	 * An in-band task (within one lag limit behind the clock) keeps
-	 * its vruntime; its lag and deadline follow the placement formulas.
+	 * its vruntime. Its lag and deadline follow the placement formulas.
 	 */
 	q = make_q(1000000, 2000000);
 	memset(&t, 0, sizeof(t));
@@ -131,7 +131,7 @@ static void test_place_entity(void)
 
 	/*
 	 * A wrapped deadline that would compute to zero is bumped to one
-	 * (the sentinel for a failed placement); the position is identical
+	 * (the sentinel for a failed placement). The position is identical
 	 * in the wrapping order the DSQ rbtree uses.
 	 */
 	q = make_q(0ULL - 1000000ULL, 1000000);	/* clock one slice before wrap */
@@ -143,7 +143,7 @@ static void test_place_entity(void)
 }
 
 /*
- * The lag bound scales with the weight: a weight-1 task may lag up to
+ * The lag bound scales with the weight. A weight-1 task may lag up to
  * 100x the request size behind the clock, a weight-10000 task only
  * 1% of it. The clamp holds at both extremes.
  */
@@ -193,7 +193,7 @@ static void test_place_charge_replacement(void)
 		"a task behind the clock does not advance it");
 
 	/*
-	 * The task runs a full slice: the charge is its vruntime plus
+	 * The task runs a full slice. The charge is its vruntime plus
 	 * the slice's virtual time, which lands ahead of the clock.
 	 */
 	t.vruntime += 2000000;
@@ -209,7 +209,7 @@ static void test_place_charge_replacement(void)
 
 /*
  * The read-only deadline form must agree with the committed placement on
- * the same pre-placement state, and must not mutate the task state: the
+ * the same pre-placement state, and must not mutate the task state. The
  * wakeup-preemption path compares the fresh deadline before any placement
  * is committed.
  */
@@ -255,7 +255,7 @@ static void test_sameq_preempt_owed(void)
 	u64 now = 1000000000;
 
 	/*
-	 * Interactive (Q1 onto Q1): the residency guard alone decides, with
+	 * Interactive (Q1 onto Q1). The residency guard alone decides, with
 	 * no deadline comparison.
 	 */
 	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 0, 0, now - 500000, now, 50000),
@@ -268,14 +268,14 @@ static void test_sameq_preempt_owed(void)
 	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 0, 0, now - 500000, now, 50000),
 		"Q1 preemption does not depend on the resident deadline");
 
-	/* Q1 with an unknown run start is conservative: blocked past zero. */
+	/* Q1 with an unknown run start is conservative, treated as blocked past zero. */
 	TEST_OK(!mlfq_sameq_preempt_owed(1, 1, 0, 0, 0, now, 50000),
 		"Q1 with unknown run start is blocked past a zero guard");
 	TEST_OK(mlfq_sameq_preempt_owed(1, 1, 0, 0, 0, now, 0),
 		"Q1 with guard 0 preempts despite the unknown run start");
 
 	/*
-	 * Non-interactive (Q2/Q3) same-queue: the guard gates the deadline
+	 * Non-interactive (Q2/Q3) same-queue. The guard gates the deadline
 	 * rule, the conservative EEVDF test.
 	 */
 	TEST_OK(mlfq_sameq_preempt_owed(2, 2, 500000, 1000000, now - 5000000,
@@ -301,7 +301,7 @@ static void test_sameq_preempt_owed(void)
 		"Q3 unknown run start cannot prove a non-zero guard");
 
 	/*
-	 * Wrapping: a wakeup deadline just before the u64 epoch boundary
+	 * Wrapping. A wakeup deadline just before the u64 epoch boundary
 	 * is earlier than a resident deadline just after it.
 	 */
 	TEST_OK(mlfq_sameq_preempt_owed(2, 2, 0ULL - 100ULL, 1000,
@@ -375,8 +375,8 @@ static void test_gauge_climb(void)
 
 /*
  * The period-step decay subtracts Q_q per full P_q of sleep, with the
- * division implemented as a shift. A zero sleep refunds nothing; a full
- * period refunds exactly Q_q; partial periods floor to zero; and a sleep
+ * division implemented as a shift. A zero sleep refunds nothing. A full
+ * period refunds exactly Q_q. Partial periods floor to zero, and a sleep
  * >= 2*G_MAX refunds the entire gauge. The shift form is bit-identical
  * to the division form for the power-of-two constants.
  */
@@ -390,12 +390,12 @@ static void test_gauge_period_decay(void)
 	u64 p3 = q3 * MLFQ_CBS_PERIOD_MULT;	/* 2^23 ns */
 	u64 g, shift_ns, div_ns;
 
-	/* Zero sleep: no refund. */
+	/* Zero sleep refunds nothing. */
 	g = mlfq_gauge_decay(4000000, 0, q1, p1);
 	TEST_OK(g == 4000000,
 		"gauge decay: zero sleep leaves gauge unchanged");
 
-	/* Partial period (sleep < P_q): floors to zero periods. */
+	/* A partial period (sleep < P_q) floors to zero periods. */
 	g = mlfq_gauge_decay(4000000, p1 - 1, q1, p1);
 	TEST_OK(g == 4000000,
 		"gauge decay: sub-period sleep in Q1 refunds nothing");
@@ -408,7 +408,7 @@ static void test_gauge_period_decay(void)
 	TEST_OK(g == 4000000,
 		"gauge decay: sub-period sleep in Q3 refunds nothing");
 
-	/* Exactly one full period: refund exactly Q_q. */
+	/* Exactly one full period refunds exactly Q_q. */
 	g = mlfq_gauge_decay(4000000, p1, q1, p1);
 	TEST_OK(g == 4000000 - q1,
 		"gauge decay: one P1 period refunds exactly Q1");
@@ -421,12 +421,12 @@ static void test_gauge_period_decay(void)
 	TEST_OK(g == 8000000 - q3,
 		"gauge decay: one P3 period refunds exactly Q3");
 
-	/* Two periods: refund 2*Q_q. */
+	/* Two periods refund 2*Q_q. */
 	g = mlfq_gauge_decay(4000000, 2 * p1, q1, p1);
 	TEST_OK(g == 4000000 - 2 * q1,
 		"gauge decay: two P1 periods refund 2*Q1");
 
-	/* Guarded subtraction: gauge smaller than the step floors to 0. */
+	/* With guarded subtraction, a gauge smaller than the step floors to 0. */
 	g = mlfq_gauge_decay(q1 - 1, p1, q1, p1);
 	TEST_OK(g == 0,
 		"gauge decay: gauge < step floors to zero");
@@ -452,13 +452,13 @@ static void test_gauge_period_decay(void)
 		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q3");
 
 	/*
-	 * Shift-vs-division bit-identity: the shift form must agree with
+	 * Shift-vs-division bit-identity. The shift form must agree with
 	 * a plain integer division for every queue at every meaningful
 	 * sleep value. P_q is a power of two, so the shift is exact.
 	 */
 	for (shift_ns = 0; shift_ns <= 20000000; shift_ns += 500000) {
 		div_ns = mlfq_gauge_decay(6000000, shift_ns, q1, p1);
-		/* shift form uses >> log2(p1); the division form is
+		/* shift form uses >> log2(p1). The division form is
 		 * the same computation with / instead of >>, but since
 		 * p1 is a power of two they are bit-identical.
 		 * We verify the shift-form result is self-consistent.
@@ -476,7 +476,7 @@ static void test_gauge_period_decay(void)
 
 /*
  * The base queue mapping from the burst gauge. The band shape is the
- * same as 1.3.5's EMA band: g <= T_L -> Q1; g >= T_H -> Q3; else Q2.
+ * same as 1.3.5's EMA band (g <= T_L -> Q1, g >= T_H -> Q3, else Q2).
  * This function is used ONLY for the run-out cpu-bound test (g >= T_H)
  * and the select_cpu mirror, never as a wakeup assignment (H1).
  */
@@ -502,7 +502,7 @@ static void test_gauge_mapping(void)
 }
 
 /*
- * Boundary values for the gauge band mapping: the edges T_L and T_H
+ * Boundary values for the gauge band mapping. The edges T_L and T_H
  * must land on the correct queues, and values just inside and just
  * outside each band must classify as expected.
  */
@@ -595,18 +595,18 @@ static void test_demote_hysteresis(void)
 {
 	struct task_ctx t;
 
-	/* Non-CPU-bound: g < T_H, single run-out does not demote. */
+	/* For non-CPU-bound tasks (g < T_H), a single run-out does not demote. */
 	t = (struct task_ctx){ .queue = 1, .g = 500000 };
 	mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 1 && t.queue == 1,
 		"demote: single run-out with g < T_H does not demote Q1->Q2");
 
-	/* Two run-outs with g < T_H: still no demotion. */
+	/* Two run-outs with g < T_H. Still no demotion. */
 	mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 2 && t.queue == 1,
 		"demote: two run-outs with g < T_H do not demote Q1->Q2");
 
-	/* CPU-bound: g >= T_H, seven run-outs do not demote. */
+	/* For CPU-bound tasks (g >= T_H), seven run-outs do not demote. */
 	t = (struct task_ctx){ .queue = 1, .g = MLFQ_T_H_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
@@ -640,28 +640,28 @@ static void test_demote_hysteresis(void)
 }
 
 /*
- * FCBS slack: the unspent budget from an early completion. grant > delta
- * yields the difference; grant == delta yields zero; grant < delta yields
+ * FCBS slack is the unspent budget from an early completion. grant > delta
+ * yields the difference, grant == delta yields zero, and grant < delta yields
  * zero (guarded). When last_grant_ns is zero (the preemption path, H2),
  * the slack is zero by construction.
  */
 static void test_fcbs_slack(void)
 {
-	/* grant > delta: unspent budget donated. */
+	/* grant > delta donates the unspent budget. */
 	TEST_OK(mlfq_fcbs_slack(2000000, 1000000) == 1000000,
 		"fcbs slack: grant > delta yields the difference");
 	TEST_OK(mlfq_fcbs_slack(4000000, 500000) == 3500000,
 		"fcbs slack: grant >> delta yields the full remainder");
 
-	/* grant == delta: no slack. */
+	/* grant == delta yields no slack. */
 	TEST_OK(mlfq_fcbs_slack(2000000, 2000000) == 0,
 		"fcbs slack: grant == delta yields zero");
 
-	/* grant < delta: guarded subtraction, result is zero. */
+	/* grant < delta. Guarded subtraction, the result is zero. */
 	TEST_OK(mlfq_fcbs_slack(500000, 1000000) == 0,
 		"fcbs slack: grant < delta yields zero (guarded)");
 
-	/* Preempt path: grant == 0, slack is always zero. */
+	/* Preempt path. grant == 0, slack is always zero. */
 	TEST_OK(mlfq_fcbs_slack(0, 1000000) == 0,
 		"fcbs slack: preempt path (grant 0) yields zero");
 	TEST_OK(mlfq_fcbs_slack(0, 0) == 0,
@@ -673,7 +673,7 @@ static void test_fcbs_slack(void)
 }
 
 /*
- * FCBS bonus deposit and grant: the deposit is clamped to the queue's
+ * FCBS bonus deposit and grant. The deposit is clamped to the queue's
  * max slice (B_q <= Q_q), the idle decay reduces the bonus by wall
  * time, and the grant is bounded by 2*Q_q.
  */
@@ -682,7 +682,7 @@ static void test_fcbs_bonus(void)
 	struct queue_ctx q;
 	u64 grant;
 
-	/* Deposit cap: a deposit exceeding Q_q is clamped. */
+	/* Deposit cap. A deposit exceeding Q_q is clamped. */
 	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
 				.max_slice_ns = MLFQ_Q1_SLICE_NS };
 	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS / 2,
@@ -701,7 +701,7 @@ static void test_fcbs_bonus(void)
 	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS,
 		"fcbs bonus: second deposit stays capped at Q1");
 
-	/* Consume: the bonus is exchanged to zero. */
+	/* Consume. The bonus is exchanged to zero. */
 	q = (struct queue_ctx){ .bonus_ns = MLFQ_Q1_SLICE_NS / 2,
 				.bonus_since = 0,
 				.max_slice_ns = MLFQ_Q1_SLICE_NS };
@@ -710,7 +710,7 @@ static void test_fcbs_bonus(void)
 		q.bonus_ns == 0,
 		"fcbs bonus: consume exchanges bonus to zero and returns grant");
 
-	/* No bonus: grant is just the slice. */
+	/* No bonus. The grant is just the slice. */
 	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
 				.max_slice_ns = MLFQ_Q1_SLICE_NS };
 	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
@@ -725,7 +725,7 @@ static void test_fcbs_bonus(void)
 	TEST_OK(grant == 2 * MLFQ_Q1_SLICE_NS,
 		"fcbs bonus: max grant is 2*Q_q");
 
-	/* Idle decay: bonus reduced by wall time since deposit. */
+	/* Idle decay. The bonus is reduced by wall time since deposit. */
 	q = (struct queue_ctx){
 		.bonus_ns = MLFQ_Q1_SLICE_NS,
 		.bonus_since = 1000000000ULL,	/* 1 s ago */
@@ -762,7 +762,7 @@ static void test_fcbs_bonus(void)
 }
 
 /*
- * Deposit/consume interleaving: as far as a single-threaded harness
+ * Deposit/consume interleaving. As far as a single-threaded harness
  * can verify, the exchange-to-zero at consume prevents resurrection
  * of a consumed bonus. The true cross-CPU race needs a code-review
  * gate or a stress run (noted explicitly, H3).
@@ -772,7 +772,7 @@ static void test_fcbs_deposit_consume_atomicity(void)
 	struct queue_ctx q;
 	u64 grant;
 
-	/* Deposit, consume, deposit, consume: no ghost bonus. */
+	/* Deposit, consume, deposit, consume. No ghost bonus. */
 	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
 				.max_slice_ns = MLFQ_Q2_SLICE_NS };
 	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q2_SLICE_NS / 4,
@@ -789,7 +789,7 @@ static void test_fcbs_deposit_consume_atomicity(void)
 	TEST_OK(grant == MLFQ_Q2_SLICE_NS && q.bonus_ns == 0,
 		"fcbs atomicity: second consume yields no bonus (no resurrection)");
 
-	/* Deposit again after a consume: clean slate. */
+	/* Deposit again after a consume. Clean slate. */
 	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q2_SLICE_NS / 2,
 			  q.max_slice_ns);
 	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
@@ -800,7 +800,7 @@ static void test_fcbs_deposit_consume_atomicity(void)
 }
 
 /*
- * Queue grant: identity without bonus, additive with bonus.
+ * Queue grant. Identity without bonus, additive with bonus.
  */
 static void test_queue_grant(void)
 {
@@ -834,12 +834,12 @@ static void test_reenq_cnt_saturation(void)
 	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS - 1,
 		"reenq saturation: counter reaches MLFQ_DEMOTE_EXHAUSTIONS - 1");
 
-	/* One more step: reaches MLFQ_DEMOTE_EXHAUSTIONS. */
+	/* One more step. It reaches MLFQ_DEMOTE_EXHAUSTIONS. */
 	cnt = mlfq_reenq_cnt_step(cnt);
 	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS,
 		"reenq saturation: counter reaches MLFQ_DEMOTE_EXHAUSTIONS");
 
-	/* One more step: stays at 8, does not wrap. */
+	/* One more step. It stays at 8, does not wrap. */
 	cnt = mlfq_reenq_cnt_step(cnt);
 	TEST_OK(cnt == MLFQ_DEMOTE_EXHAUSTIONS,
 		"reenq saturation: counter stays at MLFQ_DEMOTE_EXHAUSTIONS");
@@ -867,11 +867,11 @@ static void test_cpuperf_mapping(void)
 {
 	u32 one = MLFQ_CPUPERF_Q1;
 
-	/* Idle window: zero busy time. */
+	/* Idle window. Zero busy time. */
 	TEST_OK(mlfq_cpuperf_level(0) == 0,
 		"cpuperf: zero busy time requests minimum level");
 
-	/* Full window (busy_ns == CPUPERF_WINDOW_NS): max level. */
+	/* Full window (busy_ns == CPUPERF_WINDOW_NS). Max level. */
 	TEST_OK(mlfq_cpuperf_level(MLFQ_CPUPERF_WINDOW_NS) == one,
 		"cpuperf: full window requests maximum level");
 
@@ -993,7 +993,7 @@ static void test_ss_boost_pending(void)
 
 /*
  * The invariant predicates under MLFQ_CHECK. The gauge bounds predicate
- * replaces the old EMA bounds check; the queue, weight and vlag checks
+ * replaces the old EMA bounds check. The queue, weight and vlag checks
  * are unchanged.
  */
 static void test_mlfq_check_predicates(void)
@@ -1109,7 +1109,7 @@ static void test_runnable_enter_fresh(void)
  * Continuation enters. The task is already counted, so the call only
  * moves its ownership. The table drives one task through the moves and
  * checks the gauge deltas and the invariant that the total counted
- * stays 1: only a changed LLC or queue moves a unit between indexes.
+ * stays 1. Only a changed LLC or queue moves a unit between indexes.
  */
 static void test_runnable_enter_continuation_table(void)
 {
@@ -1170,7 +1170,7 @@ static void test_runnable_continuation_noop(void)
 
 /*
  * Exit releases the task from both gauges and returns the ownership
- * record to the unowned state; a second exit and an exit of a task
+ * record to the unowned state. A second exit and an exit of a task
  * never counted are no-ops (the release is idempotent against a racing
  * double-release).
  */
@@ -1196,7 +1196,7 @@ static void test_runnable_exit(void)
 }
 
 /*
- * The global-park cycle: a task parked on the kernel-owned global DSQ
+ * The global-park cycle. A task parked on the kernel-owned global DSQ
  * is not counted (its enqueue released any prior ownership), and its
  * runnable episode is observed at ops.running() as a fresh enter. The
  * exit then releases the episode.
@@ -1207,13 +1207,13 @@ static void test_runnable_global_park_cycle(void)
 
 	rn_state_reset();
 
-	/* First episode: counted at its enqueue, released at quiescent. */
+	/* First episode. Counted at its enqueue, released at quiescent. */
 	mlfq_runnable_enter(&t, 1, 0);
 	mlfq_runnable_exit(&t);
 	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0,
 		"sleep after a counted episode releases everything");
 
-	/* Global park: the enqueue releases, so no gauge moves. */
+	/* Global park. The enqueue releases, so no gauge moves. */
 	mlfq_runnable_enter(&t, 2, 0);
 	mlfq_runnable_exit(&t);		/* the pinned-global release */
 	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0 &&
@@ -1256,8 +1256,8 @@ static void test_runnable_sentinel_llc_noop(void)
 
 /*
  * The queue-index guard is defense in depth. An out-of-range queue id
- * never moves the queue gauge (the LLC gauge still counts the episode;
- * callers always pass 1..3).
+ * never moves the queue gauge (the LLC gauge still counts the episode,
+ * and callers always pass 1..3).
  */
 static void test_runnable_qid_guard(void)
 {
@@ -1305,11 +1305,11 @@ static void test_steer_pick_llc(void)
 	memset(runnable, 0, sizeof(runnable));
 	memset(idle, 0, sizeof(idle));
 
-	/* Empty: no populated domains. */
+	/* Empty. No populated domains. */
 	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 0, 0, 0) == MLFQ_MAX_LLCS,
 		"steer: nr_llcs 0 yields the sentinel");
 
-	/* Single: the only eligible domain is chosen. */
+	/* Single. The only eligible domain is chosen. */
 	idle[0] = 1;
 	runnable[0] = 3;
 	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 2, 1, 0) == 0,
@@ -1351,7 +1351,7 @@ static void test_steer_pick_llc(void)
 		"steer: no idle-populated domain yields the sentinel");
 
 	/*
-	 * nr_llcs bounds the candidate set: a domain at or above it is
+	 * nr_llcs bounds the candidate set. A domain at or above it is
 	 * never a candidate even when its gauges look populated.
 	 */
 	idle[2] = 1;
@@ -1362,7 +1362,7 @@ static void test_steer_pick_llc(void)
 		"steer: the same domain is a candidate within nr_llcs");
 
 	/*
-	 * A visited domain is excluded: the same state with domain 2
+	 * A visited domain is excluded. The same state with domain 2
 	 * visited leaves nothing eligible.
 	 */
 	TEST_OK(mlfq_steer_pick_llc(runnable, idle, 3, 0, 1ULL << 2) ==
@@ -1389,7 +1389,7 @@ static void test_steer_loop_bound(void)
 	memset(idle, 0, sizeof(idle));
 
 	/*
-	 * Six idle-populated domains with distinct loads; domain 5 is the
+	 * Six idle-populated domains with distinct loads. Domain 5 is the
 	 * waker's, so the picks must descend 4 -> 1 and the bound cuts the
 	 * tail (the sixth domain, 0, is never reached).
 	 */

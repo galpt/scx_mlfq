@@ -49,13 +49,13 @@
  * The insert does not consume a deadline, so placement is deferred to the
  * next real placement, which re-anchors the task under the lag clamp.
  *
- * Runnable accounting: every insert below calls
+ * Runnable accounting. Every insert below calls
  * mlfq_runnable_enter() with the owning CPU's LLC and the final queue,
  * so the per-LLC/per-queue runnable gauges track each tracked task's
  * ownership from its first enqueue (wakeup, fork, class-switch-in) to
  * its leave-runnable release in ops.quiescent. Continuation re-enqueues
  * (run-out, preemption of the displaced resident, REENQ, ENQ_LAST) do
- * not re-count: the helper only moves the ownership when the LLC or the
+ * not re-count. The helper only moves the ownership when the LLC or the
  * queue changed. The pinned-global path is the one release here. A task
  * parked on the kernel-owned global DSQ leaves LLC ownership, and
  * ops.running() re-acquires it when the kernel hands it a CPU.
@@ -175,7 +175,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		mlfq_runout_classify(p, tctx);
 	} else {
-		/* fork, SCX_ENQ_LAST or class switch: reset the counters. */
+		/* fork, SCX_ENQ_LAST or class switch reset the counters. */
 		tctx->wake_cnt = 0;
 		tctx->reenq_cnt = 0;
 		/*
@@ -208,7 +208,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Aging: a stay of >= MLFQ_AGING_PERIOD_NS of continuous Q2/Q3
+	 * Aging. A stay of >= MLFQ_AGING_PERIOD_NS of continuous Q2/Q3
 	 * wall-clock time is elevated to a Q1 placement. queued_at re-arms
 	 * at every wakeup, queue change and run-out, so a continuously
 	 * running task never accumulates aging wall-clock time. Only a task
@@ -308,7 +308,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		deadline = mlfq_place_task(qid, tctx, p->pid);
 		if (!deadline) {
-			/* Unreachable for valid inputs; see the header note. */
+			/* Unreachable for valid inputs. See the header note. */
 			__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 			scx_bpf_error("pid %d pinned-busy placement failed",
 				      p->pid);
@@ -350,7 +350,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 * so placement is deferred to the next real placement,
 		 * which re-anchors the task under the lag clamp. The
 		 * occupied guard closes the window between the idle claim
-		 * and this insert: a realtime task taking the CPU over in
+		 * and this insert. A realtime task taking the CPU over in
 		 * between would otherwise strand the wakeup in its local
 		 * DSQ until the takeover drain.
 		 */
@@ -422,7 +422,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Wakeup preemption: a wakeup outranks the task running on the CPU
+	 * Wakeup preemption. A wakeup outranks the task running on the CPU
 	 * it was last running on when it belongs to a higher queue (the
 	 * check_preempt_wakeup semantics of the fair scheduler, where the
 	 * higher-priority arrival preempts), or when it belongs to the
@@ -493,7 +493,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 			u64 preempt_slice = slice;
 
 			/*
-			 * Cap the grant: a preempting wakeup displaces a
+			 * Cap the grant. A preempting wakeup displaces a
 			 * running task, so it runs a bounded burst
 			 * (MLFQ_PREEMPT_SLICE_NS) and then yields, so the
 			 * displaced task (typically the waker, whose early
@@ -515,10 +515,10 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 	}
 
-	/* Regular path: into the owning CPU's queue vtime DSQ. */
+	/* Regular path, into the owning CPU's queue vtime DSQ. */
 	deadline = mlfq_place_task(qid, tctx, p->pid);
 	if (!deadline) {
-		/* Unreachable for valid inputs; see the header note. */
+		/* Unreachable for valid inputs. See the header note. */
 		__sync_fetch_and_add(&mlfq_stats.enq_no_deadline, 1);
 		scx_bpf_error("pid %d regular placement failed",
 			      p->pid);

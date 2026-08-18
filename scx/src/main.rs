@@ -128,7 +128,7 @@ struct Scheduler<'a> {
     struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
     /*
-     * Web UI plumbing: the metrics sender (None when --no-webui, in
+     * Web UI plumbing. The metrics sender (None when --no-webui, in
      * which case the webui thread is never spawned and the metrics are
      * never collected) and the once-per-attach per-CPU static seed
      * (freq, LLC, SMT) the web metrics merge the dynamic BPF state into.
@@ -145,7 +145,7 @@ struct Scheduler<'a> {
     started_at: std::time::Instant,
     /*
      * PM QoS idle-latency constraint on /dev/cpu_dma_latency, held for
-     * the run; closing the file restores the previous constraint.
+     * the run. Closing the file restores the previous constraint.
      */
     #[expect(dead_code)]
     pm_qos_fd: Option<std::fs::File>,
@@ -165,7 +165,7 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, mlfq_ops, open_opts)?;
 
-        // Write the validated constants into rodata before load; the rodata
+        // Write the validated constants into rodata before load. The rodata
         // section becomes read-only once the object is loaded.
         let config = Config::default();
         config.validate()?;
@@ -177,7 +177,7 @@ impl<'a> Scheduler<'a> {
         let topology_plan = topology::init_topology(&mut skel)?;
 
         /*
-         * Ops flags: honor exiting tasks, receive the SCX_ENQ_LAST enqueue
+         * Ops flags. Honor exiting tasks, receive the SCX_ENQ_LAST enqueue
          * for the last runnable task on a CPU, never migrate
          * migration-disabled tasks, and allow queued-wakeup selection of
          * idle CPUs (the idle-CPU fast path depends on the latter two).
@@ -205,7 +205,7 @@ impl<'a> Scheduler<'a> {
          * attempts the takeover drain. It is needed on every kernel.
          * The occupancy flag drives placement even where the drain
          * cannot run, so the optional tracepoint program is
-         * force-enabled here; the evacuation branches inside are
+         * force-enabled here. The evacuation branches inside are
          * ksym-gated and self-prune on kernels without the reenqueue
          * kfuncs.
          */
@@ -237,7 +237,7 @@ impl<'a> Scheduler<'a> {
         let struct_ops = scx_ops_attach!(skel, mlfq_ops)?;
 
         /*
-         * PM QoS: hold a global idle-resume-latency constraint on
+         * PM QoS. Hold a global idle-resume-latency constraint on
          * /dev/cpu_dma_latency for the duration of the run, so the
          * cpuidle governor keeps the CPUs in the shallowest idle states
          * that fit the cap and wakeup latency is not dominated by the
@@ -267,9 +267,9 @@ impl<'a> Scheduler<'a> {
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
         /*
-         * The web UI: a small bounded metrics channel (capacity 16;
+         * The web UI is a small bounded metrics channel with capacity 16.
          * try_send drops a frame when the buffer is full, so the run
-         * loop never blocks and the buffer never grows) feeding a
+         * loop never blocks and the buffer never grows. It feeds a
          * detached server thread that exits on the shared shutdown
          * flag.
          */
@@ -416,7 +416,7 @@ impl<'a> Scheduler<'a> {
         {
             Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_cpu_state>() => {
                 // SAFETY: mlfq_cpu_state is the repr(C) bindgen mirror of
-                // the map's value type; reading the value bytes as the
+                // the map's value type. Reading the value bytes as the
                 // struct is a plain reinterpretation of integer fields.
                 unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_cpu_state>()) }
             }
@@ -616,8 +616,8 @@ impl Drop for Scheduler<'_> {
          */
         /*
          * Join the web UI thread so its unblock-write flag (see
-         * webui.rs) is visible before the caller's restore decision;
-         * the thread exits within its poll interval of the shutdown
+         * webui.rs) is visible before the caller's restore decision. The
+         * thread exits within its poll interval of the shutdown
          * flag, so the join is bounded.
          */
         if let Some(jh) = self.webui_join.take() {
@@ -713,7 +713,7 @@ fn main() -> Result<()> {
 
     /*
      * If this run wrote the runtime loader-sandbox unblock (see
-     * webui.rs), restore it now: the drop-in is per-boot state under
+     * webui.rs), restore it now. The drop-in is per-boot state under
      * /run, so it must be undone once, at the final exit after the
      * restart loop, not on every internal restart.
      */

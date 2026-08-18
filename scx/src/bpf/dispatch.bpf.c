@@ -9,7 +9,7 @@
  * loop in ext.c), so this callback only fills the local DSQ from the
  * per-CPU queue DSQs. Each CPU serves its own three queue DSQs in Q1..Q3
  * priority order, each queue bounded by dispatch_max_batch. A queue's own
- * DSQ is consumed first, directly from its head: the kernel keeps each
+ * DSQ is consumed first, directly from its head. The kernel keeps each
  * vtime DSQ's list in deadline order (scx_dsq_priq_less), so every
  * scx_bpf_dsq_move_to_local() pops the min-deadline head without a peek
  * or a scan, and the kernel re-validates affinity on the move. When the
@@ -28,11 +28,11 @@
  * mlfq_nr_llcs == 0) Tier A is skipped and Tier B degrades to today's
  * plain window, including its same-LLC probing. In both tiers the
  * earliest eligible remote deadline wins. The kernel enforces affinity
- * on the move itself: consume_dispatch_q() in ext.c skips heads that
+ * on the move itself. consume_dispatch_q() in ext.c skips heads that
  * cannot run on the consuming CPU, so the BPF pre-check only prefers the
  * earliest eligible head and avoids wasted moves.
  *
- * The three quotas are served by bounded loops: every queue consumes its
+ * The three quotas are served by bounded loops. Every queue consumes its
  * own DSQ with a quota-bounded move loop, then scans at most the
  * init-clamped mlfq_steal_scan cross-LLC candidates (Tier B), after a
  * flat MLFQ_LLC_SCAN_MAX window over the own-LLC list (Tier A), both
@@ -132,7 +132,7 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  *	MLFQ_MAX_LLCS) exactly when @own_llc_list is non-NULL. The
  *	validated same-domain filter for Tier B.
  *
- * Each slot serves the queue's own head first: scx_bpf_dsq_move_to_local()
+ * Each slot serves the queue's own head first. scx_bpf_dsq_move_to_local()
  * pops the min-deadline head of the own DSQ (the kernel keeps a vtime
  * DSQ's list in deadline order, scx_dsq_priq_less) and re-validates
  * affinity on the move, so no peek or scan is needed for the local work.
@@ -212,7 +212,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		bool tier_a_ran = false;
 
 		/*
-		 * Own head first: move_to_local pops the min-deadline head
+		 * Own head first. move_to_local pops the min-deadline head
 		 * of the own DSQ and returns false when the DSQ is empty
 		 * or nothing can run on this CPU, which then proceeds
 		 * to the steal scan. The move is same-LLC by construction.
@@ -324,7 +324,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 				    mlfq_cpu_llc[cand & (MLFQ_MAX_CPUS - 1)] == own_llc)
 					continue;
 				/*
-				 * Gate on nr_queued first: a cheap lockless
+				 * Gate on nr_queued first. A cheap lockless
 				 * read that skips the peek for empty DSQs.
 				 */
 				if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
@@ -352,7 +352,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			break;
 
 		/*
-		 * The move is not guaranteed to succeed: the kernel
+		 * The move is not guaranteed to succeed. The kernel
 		 * re-validates affinity on the move, so a concurrent
 		 * cpuset change can fail it. Only a successful move
 		 * counts and adjusts the runnable-ownership record.
@@ -432,7 +432,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * Hoist the own-LLC CPU list lookup once per dispatch call, not
-	 * per slot: the consuming CPU's domain membership fixes the
+	 * per slot. The consuming CPU's domain membership fixes the
 	 * Tier-A same-LLC steal window for all three queues. The map
 	 * value is immutable after load, so the single lookup is valid
 	 * for the whole call (the same contract as the primary-bitmap
@@ -452,7 +452,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * Advance the rotating scan start once per dispatch call. All
-	 * three queues share the same bounded window: every slot scans at
+	 * three queues share the same bounded window. Every slot scans at
 	 * most the init-clamped mlfq_steal_scan candidates. On machines at
 	 * or below the scan cap the window covers every CPU, so the offset
 	 * rotation only matters on larger machines, where per-call rotation
@@ -497,7 +497,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * classification gauge under-counts its run until the freeze ends.
 	 *
 	 * Before keeping, the queue DSQ heads of one remote CPU (the
-	 * rotating scan candidate) are probed: a CPU whose own queues are
+	 * rotating scan candidate) are probed. A CPU whose own queues are
 	 * empty should still pull the most-owed remote task instead of
 	 * running the previous task for a full slice. The probe is gated
 	 * on nr_queued and loops over MLFQ_NR_QUEUES.
@@ -530,7 +530,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 				}
 			if (!remote_work) {
 				/*
-				 * FCBS: the keep-path consumes the
+				 * FCBS. The keep-path consumes the
 				 * queue's bonus, so a solo early-
 				 * completing task of queue q can collect
 				 * q's bonus and sustain ~2*Q_q grants.

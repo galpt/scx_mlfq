@@ -176,7 +176,7 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 		return;
 
 	/*
-	 * Nonempty gate: when every DSQ this CPU owns is empty there is
+	 * Nonempty gate. When every DSQ this CPU owns is empty there is
 	 * nothing to evacuate, so the pass is skipped without consuming
 	 * the rate-limit window.  The queue DSQ scan is looped over
 	 * MLFQ_NR_QUEUES so adding or removing queues needs no manual

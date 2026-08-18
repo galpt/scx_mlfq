@@ -45,7 +45,7 @@ typedef int pid_t;
 #ifndef __VMLINUX_H__
 #ifndef bpf_for
 /*
- * Harness-only stand-in for the kernel's iterator loop: the native
+ * Harness-only stand-in for the kernel's iterator loop. The native
  * unit-test build has no BPF iterator machinery, and the call sites
  * pass a plain loop variable, which is the iterator contract (the
  * first argument is always a fresh scalar). The BPF build uses the
@@ -292,7 +292,7 @@ enum mlfq_task_flags {
 /*
  * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
  * ids are 0..MLFQ_MAX_LLCS-1 (0..31), which fit in a u8. 0xFF marks a
- * task that is not counted in the per-LLC runnable gauges: it is not
+ * task that is not counted in the per-LLC runnable gauges. It is not
  * runnable, or it is parked on the kernel-owned global DSQ where no LLC
  * owns it.
  */
@@ -470,12 +470,12 @@ struct mlfq_stats {
 	u64 short_sleep_boosts;
 	u64 preemption_kicks;
 	u64 cpuperf_boosts;
-	/* Dispatch-path counters: remote-DSQ moves and solo-task keep grants. */
+	/* Dispatch-path counters, remote-DSQ moves and solo-task keep grants. */
 	u64 steals;
 	u64 steals_same_llc;		/* steals within one LLC domain */
 	u64 steals_cross_llc;		/* steals across LLC domains */
 	u64 keep_running;
-	/* Enqueue-path diagnostics: the early-return drop counters. */
+	/* Enqueue-path diagnostics, the early-return drop counters. */
 	u64 enq_no_tctx;
 	u64 enq_bad_weight;
 	u64 enq_no_deadline;
@@ -571,7 +571,7 @@ static __always_inline void mlfq_bitmap_set_cpu(struct mlfq_bitmap *bm, u32 cpu)
  * @a: First comparable as u64.
  * @b: Second comparable as u64.
  *
- * Same convention as fair.c vruntime_cmp()/time_before64(): the kernel
+ * Same convention as fair.c vruntime_cmp()/time_before64(). The kernel
  * DSQ orders by min deadline with the same wrapping semantics.
  *
  * Return: true if @a is before @b.
@@ -587,7 +587,7 @@ static __always_inline bool mlfq_time_before(u64 a, u64 b)
  * @now: Current time.
  * @rate_limit: Minimum spacing between boosts (MLFQ_SHORT_SLEEP_RATE_LIMIT_NS).
  *
- * At most one short-sleep boost per task per @rate_limit window: the boost
+ * At most one short-sleep boost per task per @rate_limit window. The boost
  * fires only once the previous window has fully elapsed, so a wakeup burst
  * cannot chain boosts. The first boost (never boosted before) is always
  * allowed.
@@ -754,7 +754,7 @@ mlfq_place_entity_deadline(const struct queue_ctx *q,
 
 	/*
 	 * The lag is measured in the wrapping order of the virtual-time
-	 * clock: a task ahead of the clock sits at it (fair.c
+	 * clock. A task ahead of the clock sits at it (fair.c
 	 * DELAY_ZERO), a task behind is clamped to the clock minus
 	 * the bound. The wrapping-aware comparison keeps the u64 epoch
 	 * boundary indistinguishable from any other point.
@@ -766,7 +766,7 @@ mlfq_place_entity_deadline(const struct queue_ctx *q,
 	vruntime_new = clock - lag;
 
 	vslice = calc_delta_fair_bpf(q->max_slice_ns, (u32)w);
-	/* fair.c PLACE_DEADLINE_INITIAL: new tasks start with half a slice. */
+	/* fair.c PLACE_DEADLINE_INITIAL. New tasks start with half a slice. */
 	if (tctx->flags & MLFQ_TF_FIRST_RUN)
 		vslice /= 2;
 
@@ -817,7 +817,7 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
 	u64 lag, vruntime_new, deadline;
 
 	/*
-	 * The commit of the mlfq_place_entity_deadline() formula: the
+	 * The commit of the mlfq_place_entity_deadline() formula. The
 	 * deadline is computed first from the pre-placement state, then
 	 * the clamped lag and its vruntime are committed.
 	 */
@@ -850,13 +850,13 @@ static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
  *
  * There are two same-queue rules.
  *
- * - Interactive (Q1 onto Q1): the residency guard alone decides.
+ * - Interactive (Q1 onto Q1). The residency guard alone decides.
  *   Interactive wakeups need immediate service. The virtual-time order
  *   still governs the queue DSQ ordering, while the preemption is the
  *   wakeup-latency mechanism. The guard protects the waker's own run
  *   (the wake-all walk executes in the first tens of microseconds of the
  *   waker's run) and prevents preemption thrash.
- * - Non-interactive (Q2/Q3): the guard gates the deadline rule, where a
+ * - Non-interactive (Q2/Q3). The guard gates the deadline rule, where a
  *   dispatch pass over the queue would already have picked the wakeup
  *   first (an earlier fresh deadline than the resident's). The resident
  *   must have a known deadline. An unknown wakeup deadline (failed
@@ -1004,7 +1004,7 @@ static __always_inline u8 mlfq_reenq_cnt_step(u8 cnt)
  * FCBS slack is the difference between the budget granted and the budget
  * consumed. When the task blocks before using its full grant, the
  * remainder is donated back to the queue's bonus. When last_grant_ns is
- * zero (the preemption path, H2), the slack is zero by construction: a
+ * zero (the preemption path, H2), the slack is zero by construction. A
  * preempt burst is not full-service budget and must not generate bonus.
  * The subtraction is guarded.
  *
@@ -1016,7 +1016,7 @@ static __always_inline u64 mlfq_fcbs_slack(u64 grant, u64 delta)
 }
 
 /**
- * mlfq_queue_grant - FCBS grant: slice plus bonus.
+ * mlfq_queue_grant - FCBS grant, slice plus bonus.
  * @slice: The queue's CBS budget (Q_q).
  * @bonus: The consumed bonus, after idle decay and exchange.
  *
@@ -1043,7 +1043,7 @@ static __always_inline u64 mlfq_queue_grant(u64 slice, u64 bonus)
  * happens-before any later deposit, so a racing deposit cannot
  * restore a value already exchanged away (H3).
  *
- * The deposit is within-queue only: cross-queue lag conservation
+ * The deposit is within-queue only. Cross-queue lag conservation
  * remains absent.
  */
 static __always_inline void mlfq_fcbs_deposit(volatile u64 *bonus_ns,
@@ -1063,7 +1063,7 @@ static __always_inline void mlfq_fcbs_deposit(volatile u64 *bonus_ns,
  * @slice: The base grant (Q_q).
  * @now: Current time (scx_bpf_now()).
  *
- * Read-first-conditional (perf F3): a plain read of bonus_ns. When
+ * Read-first-conditional (perf F3). A plain read of bonus_ns. When
  * non-zero, the idle decay is computed from bonus_since and the
  * bonus is atomically exchanged to zero. The returned grant is
  * slice + decayed bonus, bounded by 2*Q_q (structural from B_q
@@ -1187,7 +1187,7 @@ static __always_inline void mlfq_reset_classification(struct task_ctx *tctx)
 
 #if MLFQ_CHECK
 /*
- * Invariant predicates. Compiled only under MLFQ_CHECK; the
+ * Invariant predicates. Compiled only under MLFQ_CHECK. The
  * BPF side reports violations via scx_bpf_error() at the natural points.
  */
 
@@ -1337,7 +1337,7 @@ extern volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
  * @llc: The LLC domain id.
  * @delta: +1 to count, -1 to un-count.
  *
- * The index is validated against the hard array bound; an out-of-range
+ * The index is validated against the hard array bound. An out-of-range
  * id (the MLFQ_MAX_LLCS sentinel the call sites pass for an unpopulated
  * domain) is a no-op. The gauge is advisory, so a lost update under
  * contention is absorbed by the next RMW.
@@ -1354,10 +1354,10 @@ static __always_inline void mlfq_llc_add(u32 llc, s64 delta)
 
 /**
  * mlfq_queue_add - One atomic step on the per-queue runnable gauge.
- * @qid: The queue id (1..3; index 0 is unused).
+ * @qid: The queue id (1..3, index 0 unused).
  * @delta: +1 to count, -1 to un-count.
  *
- * The index is validated against the queue range; an out-of-range id is
+ * The index is validated against the queue range. An out-of-range id is
  * a no-op (defense in depth on top of the classification range checks).
  */
 static __always_inline void mlfq_queue_add(u32 qid, s64 delta)
@@ -1391,7 +1391,7 @@ static __always_inline void mlfq_runnable_enter(struct task_ctx *tctx,
 						u8 qid, u32 llc)
 {
 	/*
-	 * The llc guard is the populated-state gate: the call sites pass
+	 * The llc guard is the populated-state gate. The call sites pass
 	 * mlfq_llc_of_cpu(), which yields the MLFQ_MAX_LLCS sentinel for
 	 * an unknown domain or when nr_llcs == 0. The whole call is a
 	 * no-op then, counters and ownership record alike.
@@ -1407,7 +1407,7 @@ static __always_inline void mlfq_runnable_enter(struct task_ctx *tctx,
 		return;
 	}
 
-	/* Continuation: the task is counted, only its ownership moves. */
+	/* Continuation. The task is counted, only its ownership moves. */
 	if (tctx->last_llc != (u8)llc) {
 		mlfq_llc_add(tctx->last_llc, -1);
 		mlfq_llc_add(llc, 1);
@@ -1444,7 +1444,7 @@ static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
  * mlfq_steer_pick_llc - Least-loaded eligible LLC selection.
  * @runnable: Per-LLC runnable gauge (advisory, stale-tolerant).
  * @idle: Per-LLC idle-CPU gate. A zero entry excludes the domain.
- * @nr_llcs: Number of populated LLC domains; domains at or above it are
+ * @nr_llcs: Number of populated LLC domains. Domains at or above it are
  *	excluded (defense in depth on top of the idle gate, which already
  *	keeps the unpopulated-domain gauges at zero).
  * @waker_llc: The waker's own domain, always excluded.
@@ -1453,21 +1453,21 @@ static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
  *
  * One min-selection pass over the eligible domains (idle-populated,
  * other than @waker_llc, not visited), returning the one with the lowest
- * runnable count; ties are broken by ascending domain id, so the
+ * runnable count. Ties are broken by ascending domain id, so the
  * selection is deterministic. The caller repeats the pass up to
  * MLFQ_STEER_LLC_MAX times, marking each returned domain visited, so at
  * most MLFQ_STEER_LLC_MAX distinct domains are ever probed and the
  * bitmap walks (the expensive part) stay bounded.
  *
- * The step is advisory: a stale runnable count costs one suboptimal
+ * The step is advisory. A stale runnable count costs one suboptimal
  * (still idle) placement in a race window, never a correctness issue.
  * This is the same trust model as the idle-count saturation fast path. The
  * empty state (nr_llcs == 0, or every idle gauge zero) yields the
- * sentinel and the step dies; placement then proceeds unchanged.
+ * sentinel and the step dies. Placement then proceeds unchanged.
  *
  * The scan is compile-time bounded (MLFQ_MAX_LLCS iterations) and uses
  * the iterator form (bpf_for) so the verifier explores the pass once
- * instead of re-walking a plain loop until its states converge; the
+ * instead of re-walking a plain loop until its states converge. The
  * native harness drives the same code through the fallback macro above.
  *
  * Return: The chosen domain id, or MLFQ_MAX_LLCS when no domain is

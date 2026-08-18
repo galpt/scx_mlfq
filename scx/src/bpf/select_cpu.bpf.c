@@ -59,7 +59,7 @@ static __always_inline bool mlfq_is_primary(const struct mlfq_bitmap *bm,
  * restricted to primary cores (@primary_bm is the hoisted primary bitmap,
  * NULL when every CPU is primary).
  *
- * One map lookup, then a compile-time-bounded scan: word-major over
+ * One map lookup, then a compile-time-bounded scan. Word-major over
  * MLFQ_BITMAP_WORDS words, bit-minor over 64 bits per word. For each set
  * candidate the scan tests task affinity, idleness (clearing the idle
  * mark) and, when requested, primary membership, returning the first
@@ -101,7 +101,7 @@ static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 }
 
 /*
- * Global primary-core scan: pick an idle primary CPU, or -ENOENT. The
+ * Global primary-core scan. Pick an idle primary CPU, or -ENOENT. The
  * primary bitmap holds only primary cores, so the require_primary
  * restriction is unnecessary here.
  */
@@ -198,7 +198,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
-	 * Hoist the primary-core bitmap lookup: it is immutable after load,
+	 * Hoist the primary-core bitmap lookup. It is immutable after load,
 	 * so one lookup serves the whole scan (see mlfq_pick_idle_in_bitmap).
 	 */
 	primary_bm = mlfq_get_primary_bitmap();
@@ -423,7 +423,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 				cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 		}
 	} else {
-		/* Q2/Q3: any idle CPU. */
+		/* Q2/Q3 take any idle CPU. */
 		cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	}
 

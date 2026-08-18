@@ -70,7 +70,7 @@ const RUNTIME_DROPIN: &str = "/run/systemd/system/scx_loader.service.d/mlfq-webu
 /*
  * Linux errno values used to classify a TCP bind failure. The loader's
  * seccomp filters surface as EPERM (SocketBindDeny), EAFNOSUPPORT
- * (RestrictAddressFamilies) or EACCES; a taken port is EADDRINUSE, the
+ * (RestrictAddressFamilies) or EACCES. A taken port is EADDRINUSE, the
  * common bind failure that must never trigger the unblock.
  */
 const EPERM: i32 = 1;
@@ -225,7 +225,7 @@ fn boxed_io_error<'a>(
 /// serves the unix socket. Returns true when the drop-in was actually
 /// written (the exit path then restores it).
 fn try_unblock_loader_sandbox() -> bool {
-    // The systemd runtime tree must already exist: it is root-owned and
+    // The systemd runtime tree must already exist. It is root-owned and
     // maintained by PID 1, so without it no runtime unit manager would
     // ever load a drop-in written below it. Everything after this point
     // needs root, so the create/write failures below also serve as the
@@ -245,10 +245,10 @@ fn try_unblock_loader_sandbox() -> bool {
         return false;
     }
 
-    // Atomic write: a temp file in the target directory, chmod 0644,
-    // then rename over the final path. A leftover tmp file (on failure)
-    // is removed; systemd ignores non-.conf files in the drop-in dir
-    // anyway.
+    // Atomic write. The new content is written to a temp file in the target
+    // directory, chmod 0644, then renamed over the final path. A leftover
+    // tmp file (on failure) is removed. systemd ignores non-.conf files in
+    // the drop-in dir anyway.
     let content = runtime_dropin_content();
     let tmp = format!("{RUNTIME_DROPIN}.tmp.{}", std::process::id());
     if let Err(e) = std::fs::write(&tmp, &content) {
@@ -278,10 +278,10 @@ fn try_unblock_loader_sandbox() -> bool {
         return false;
     }
 
-    // Best-effort reload: the file itself is the state, and systemd
+    // Best-effort reload. The file itself is the state, and systemd
     // picks it up at the next daemon-reload or boot even when the
     // reload below fails. systemctl talks to PID 1 over a unix socket,
-    // which the sandbox keeps available; the absolute path sidesteps a
+    // which the sandbox keeps available. The absolute path sidesteps a
     // minimal loader PATH.
     match std::process::Command::new("/usr/bin/systemctl")
         .arg("daemon-reload")
@@ -348,7 +348,7 @@ pub fn restore_loader_sandbox() {
         return;
     }
 
-    // Best-effort reload, as in the unblock path: the removal is the
+    // Best-effort reload, as in the unblock path. The removal is the
     // state, and systemd applies it at the next daemon-reload or boot.
     match std::process::Command::new("/usr/bin/systemctl")
         .arg("daemon-reload")
@@ -380,7 +380,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         metrics: WebMetrics::default(),
     }));
 
-    // The metrics consumer: keep the newest snapshot behind the mutex.
+    // The metrics consumer. Keep the newest snapshot behind the mutex.
     // A timeout keeps the loop parked for at most POLL_INTERVAL, so the
     // shutdown flag is observed within that budget.
     let state_clone = state.clone();
@@ -403,7 +403,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
     let mut server: Option<tiny_http::Server> = None;
     let mut tcp_addr = String::new();
 
-    // Keep the last TCP bind error: when both binds fail, its errno
+    // Keep the last TCP bind error. When both binds fail, its errno
     // decides whether the loader sandbox caused it (and the runtime
     // unblock may help) or whether the port is simply taken.
     let mut bind_err: Option<Box<dyn std::error::Error + Send + Sync + 'static>> = None;
@@ -477,7 +477,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         // TCP is blocked (the loader sandbox denies inet sockets), so
         // serve the same routes over the unix socket, which AF_UNIX
         // keeps available. Before the fallback, classify the last bind
-        // error: only a seccomp-style errno (a sandbox denial, not a
+        // error. Only a seccomp-style errno (a sandbox denial, not a
         // busy port) earns the runtime unblock for the NEXT scheduler
         // start. This run stays on the unix socket. The seccomp filter
         // is per-process and inherited, so it cannot be lifted in place,
@@ -512,7 +512,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
             }
         };
 
-        // Root-only connect: the socket is the same trust boundary as
+        // Root-only connect. The socket is the same trust boundary as
         // the loopback TCP binds, so only root (or whatever root lets
         // in) may read the scheduler's metrics through it.
         if let Err(e) = std::fs::set_permissions(
@@ -541,7 +541,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         while !shutdown.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    // Bound the first read: a client that connects and
+                    // Bound the first read. A client that connects and
                     // sends nothing must not hold a handler thread
                     // forever, so the 5 s read timeout on the request
                     // line ends the handler (the error path in
@@ -579,7 +579,7 @@ mod tests {
     fn runtime_dropin_content_bytes() {
         let content = runtime_dropin_content();
 
-        // The scheduler's own marker: ownership and the remove-on-exit
+        // The scheduler's own marker. Ownership and the remove-on-exit
         // contract are stated in the file itself.
         assert!(content.contains("Owned by the scx_mlfq scheduler"));
         assert!(content.contains("removed on exit"));

@@ -8,7 +8,7 @@
 //! Userspace configuration, validated scheduling constants written into
 //! BPF rodata.
 //!
-//! `Config` is the single validated set of scheduling constants; the BPF side
+//! `Config` is the single validated set of scheduling constants. The BPF side
 //! reads them from `const volatile` rodata globals declared in
 //! `src/bpf/main.bpf.c` (see `src/bpf/intf.h` for the compile-time
 //! defaults, which are the source of truth for every value here).
@@ -26,7 +26,7 @@ const NSEC_PER_USEC: u64 = 1_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 /*
- * Defaults must match `enum mlfq_consts` in `src/bpf/intf.h`; the BPF
+ * Defaults must match `enum mlfq_consts` in `src/bpf/intf.h`. The BPF
  * compile-time values are the contract. The defaults are therefore derived
  * from the bindgen-generated constants (the same source `topology.rs`
  * cross-checks its constants against), so an intf.h change propagates here

@@ -150,7 +150,7 @@ struct {
 } mlfq_llc_cpus SEC(".maps");
 
 /*
- * Constants: rodata. The declared defaults match the constants in
+ * Constants land in rodata. The declared defaults match the constants in
  * intf.h and are written by the Rust front-end before load. The section
  * is read-only afterwards, and the compiler must not fold them as
  * compile-time constants. The veristat configs supply the same values
@@ -301,7 +301,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * Clamp the Q2/Q3 steal-scan window to the CPU count: on a machine
+	 * Clamp the Q2/Q3 steal-scan window to the CPU count. On a machine
 	 * with fewer CPUs than the cap, an unscaled window would re-peek
 	 * the same remote DSQs multiple times per slot.
 	 */
@@ -310,7 +310,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 
 	/*
 	 * Create the per-CPU vtime-ordered queue DSQs. bpf_for() is an
-	 * iterator-backed loop: the bound is a runtime value (the checked
+	 * iterator-backed loop. The bound is a runtime value (the checked
 	 * CPU count) and the iterator contract lets the verifier bound the
 	 * iteration without unrolling it.
 	 */

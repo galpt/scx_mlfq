@@ -19,7 +19,7 @@ static __always_inline struct queue_ctx *mlfq_lookup_queue(u32 qid)
 
 /*
  * Place @tctx into queue @qid against the queue's virtual clock. No lock
- * is taken: the clock is updated only through the monotone advance, and
+ * is taken. The clock is updated only through the monotone advance, and
  * the placement clamp bounds any error a momentarily stale
  * clock can introduce, so the bounded-lag safety properties hold without
  * mutual exclusion.
