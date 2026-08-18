@@ -38,7 +38,8 @@ const Q1_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q1_SLICE_NS as u64;
 const Q2_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q2_SLICE_NS as u64;
 const Q3_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q3_SLICE_NS as u64;
 
-/// Burst gauge ceiling, replacing the former EMA budget_max.
+/// Burst gauge ceiling. The gauge saturates at this value and the
+/// CPU-bound threshold T_H must be strictly below it.
 const GAUGE_MAX_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_GAUGE_MAX_NS as u64;
 
 /// Classification thresholds.

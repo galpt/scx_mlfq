@@ -429,8 +429,8 @@ struct mlfq_rtdl_state {
  * wall time its callback spends running into one of eight buckets that
  * delimit the elapsed microseconds. The buckets are [0, 2), [2, 5), [5, 10), [10, 20),
  * [20, 50), [50, 100), [100, 250) and [250, inf). The preemption path is
- * healthy when its charges stay in the first few buckets. A regression
- * shows up as a visible shift toward the tail.
+ * healthy when its charges stay in the first few buckets. A performance
+ * shift toward the tail indicates a change in workload behavior.
  */
 enum mlfq_op_lat_slots {
 	MLFQ_OP_LAT_STOPPING		= 0,

@@ -43,7 +43,7 @@
  * Every placement calls mlfq_place_task(), which can only fail when the
  * queue map lookup fails. The queue maps are static and in-range, so a
  * failed placement is unreachable for valid inputs. The error call on
- * each failure path turns a future regression into a scheduler exit into
+ * each failure path triggers a scheduler exit into
  * bypass instead of a silently stranded task. The two FIFO local-DSQ
  * paths (pinned-idle and the idle-CPU fast path) skip placement entirely.
  * The insert does not consume a deadline, so placement is deferred to the
