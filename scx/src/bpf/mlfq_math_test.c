@@ -338,171 +338,50 @@ static void test_clock_advance(void)
 
 /* ---- Gauge burst-classifier tests ---- */
 
-/*
- * The burst gauge g climbs additively by the run delta and saturates at
- * MLFQ_GAUGE_MAX_NS. A zero-start task climbs to the exact delta, and a
- * task already at the ceiling stays there regardless of the delta.
- */
-static void test_gauge_climb(void)
+static void test_ema_climb(void)
 {
-	u64 g;
-
-	/* Zero start: g' = min(0 + delta, G_MAX). */
-	g = mlfq_gauge_decay(0, 0, MLFQ_Q1_SLICE_NS,
-			     MLFQ_Q1_SLICE_NS * MLFQ_CBS_PERIOD_MULT);
-	TEST_OK(g == 0,
-		"gauge climb: zero sleep leaves zero gauge unchanged (decay path)");
-
-	/*
-	 * Climb is done by the caller (stopping) as g = min(g + delta,
-	 * G_MAX).  We test the bound and saturation here directly.
-	 */
-	g = 0 + 500000;	/* 0.5 ms run */
-	TEST_OK(g == 500000,
-		"gauge climb: 0 + 0.5ms = 0.5ms");
-
-	g = MLFQ_GAUGE_MAX_NS - 1000000 + 2000000;
-	TEST_OK(g > MLFQ_GAUGE_MAX_NS,
-		"gauge climb: overflow past G_MAX (caller clamps)");
-
-	/* Saturation at G_MAX. */
-	g = MLFQ_GAUGE_MAX_NS;
-	g = g + 1000000 > MLFQ_GAUGE_MAX_NS ? MLFQ_GAUGE_MAX_NS : g + 1000000;
-	TEST_OK(g == MLFQ_GAUGE_MAX_NS,
-		"gauge climb: saturation at G_MAX");
-
-	g = MLFQ_GAUGE_MAX_NS;
-	g = g + 0 > MLFQ_GAUGE_MAX_NS ? MLFQ_GAUGE_MAX_NS : g + 0;
-	TEST_OK(g == MLFQ_GAUGE_MAX_NS,
-		"gauge climb: already at G_MAX stays at G_MAX");
+	TEST_OK(mlfq_ema_climb(0, 250000, 6000000, 3072) == 3000000,
+		"0 + 250us run -> half the gauge");
+	TEST_OK(mlfq_ema_climb(0, 1000000, 6000000, 3072) == 6000000,
+		"0 + 1ms run saturates the gauge (step clamped)");
+	TEST_OK(mlfq_ema_climb(3000000, 250000, 6000000, 3072) == 4500000,
+		"half gauge + 250us -> three quarters");
+	TEST_OK(mlfq_ema_climb(6000000, 1000000, 6000000, 3072) == 6000000,
+		"gauge never exceeds budget max");
 }
 
-/*
- * The period-step decay subtracts Q_q per full P_q of sleep, with the
- * division implemented as a shift. A zero sleep refunds nothing. A full
- * period refunds exactly Q_q. Partial periods floor to zero, and a sleep
- * >= 2*G_MAX refunds the entire gauge. The shift form is bit-identical
- * to the division form for the power-of-two constants.
- */
-static void test_gauge_period_decay(void)
+static void test_ema_decay(void)
 {
-	u64 q1 = MLFQ_Q1_SLICE_NS;		/* 2^20 ns */
-	u64 p1 = q1 * MLFQ_CBS_PERIOD_MULT;	/* 2^21 ns */
-	u64 q2 = MLFQ_Q2_SLICE_NS;		/* 2^21 ns */
-	u64 p2 = q2 * MLFQ_CBS_PERIOD_MULT;	/* 2^22 ns */
-	u64 q3 = MLFQ_Q3_SLICE_NS;		/* 2^22 ns */
-	u64 p3 = q3 * MLFQ_CBS_PERIOD_MULT;	/* 2^23 ns */
-	u64 g, shift_ns, div_ns;
+	u64 d;
 
-	/* Zero sleep refunds nothing. */
-	g = mlfq_gauge_decay(4000000, 0, q1, p1);
-	TEST_OK(g == 4000000,
-		"gauge decay: zero sleep leaves gauge unchanged");
+	TEST_OK(mlfq_ema_decay(6000000, 24000000, 24000000) == 3000000,
+		"one half-life halves the gauge");
+	TEST_OK(mlfq_ema_decay(6000000, 120000000, 24000000) == 187500,
+		"five half-lives divide by 32");
+	TEST_OK(mlfq_ema_decay(6000000, 24ULL * 64 * 1000000, 24000000) == 0,
+		"64 periods zero the gauge");
 
-	/* A partial period (sleep < P_q) floors to zero periods. */
-	g = mlfq_gauge_decay(4000000, p1 - 1, q1, p1);
-	TEST_OK(g == 4000000,
-		"gauge decay: sub-period sleep in Q1 refunds nothing");
-
-	g = mlfq_gauge_decay(4000000, p2 - 1, q2, p2);
-	TEST_OK(g == 4000000,
-		"gauge decay: sub-period sleep in Q2 refunds nothing");
-
-	g = mlfq_gauge_decay(4000000, p3 - 1, q3, p3);
-	TEST_OK(g == 4000000,
-		"gauge decay: sub-period sleep in Q3 refunds nothing");
-
-	/* Exactly one full period refunds exactly Q_q. */
-	g = mlfq_gauge_decay(4000000, p1, q1, p1);
-	TEST_OK(g == 4000000 - q1,
-		"gauge decay: one P1 period refunds exactly Q1");
-
-	g = mlfq_gauge_decay(4000000, p2, q2, p2);
-	TEST_OK(g == 4000000 - q2,
-		"gauge decay: one P2 period refunds exactly Q2");
-
-	g = mlfq_gauge_decay(8000000, p3, q3, p3);
-	TEST_OK(g == 8000000 - q3,
-		"gauge decay: one P3 period refunds exactly Q3");
-
-	/* Two periods refund 2*Q_q. */
-	g = mlfq_gauge_decay(4000000, 2 * p1, q1, p1);
-	TEST_OK(g == 4000000 - 2 * q1,
-		"gauge decay: two P1 periods refund 2*Q1");
-
-	/* With guarded subtraction, a gauge smaller than the step floors to 0. */
-	g = mlfq_gauge_decay(q1 - 1, p1, q1, p1);
-	TEST_OK(g == 0,
-		"gauge decay: gauge < step floors to zero");
-
-	g = mlfq_gauge_decay(100, p3, q3, p3);
-	TEST_OK(g == 0,
-		"gauge decay: small gauge below one Q3 step floors to zero");
-
-	/* Full refund at 2*G_MAX (the nominal "16 ms" threshold). */
-	g = mlfq_gauge_decay(MLFQ_GAUGE_MAX_NS,
-			     2 * MLFQ_GAUGE_MAX_NS, q1, p1);
-	TEST_OK(g == 0,
-		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q1");
-
-	g = mlfq_gauge_decay(MLFQ_GAUGE_MAX_NS,
-			     2 * MLFQ_GAUGE_MAX_NS, q2, p2);
-	TEST_OK(g == 0,
-		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q2");
-
-	g = mlfq_gauge_decay(MLFQ_GAUGE_MAX_NS,
-			     2 * MLFQ_GAUGE_MAX_NS, q3, p3);
-	TEST_OK(g == 0,
-		"gauge decay: sleep >= 2*G_MAX zeroes gauge in Q3");
-
-	/*
-	 * Shift-vs-division bit-identity. The shift form must agree with
-	 * a plain integer division for every queue at every meaningful
-	 * sleep value. P_q is a power of two, so the shift is exact.
-	 */
-	for (shift_ns = 0; shift_ns <= 20000000; shift_ns += 500000) {
-		div_ns = mlfq_gauge_decay(6000000, shift_ns, q1, p1);
-		/* shift form uses >> log2(p1). The division form is
-		 * the same computation with / instead of >>, but since
-		 * p1 is a power of two they are bit-identical.
-		 * We verify the shift-form result is self-consistent.
-		 */
-		TEST_OK(div_ns <= 6000000,
-			"gauge decay: shift result <= initial gauge at sleep %lu",
-			(unsigned long)shift_ns);
-	}
-
-	/* Zeroed gauge stays zero. */
-	g = mlfq_gauge_decay(0, p1, q1, p1);
-	TEST_OK(g == 0,
-		"gauge decay: zero gauge stays zero after a full-period sleep");
+	d = mlfq_ema_decay(6000000, 36000000, 24000000); /* 1.5 periods */
+	TEST_OK(d < 3000000 && d >= 1500000,
+		"1.5-period decay lands between one and two periods");
+	TEST_OK(mlfq_ema_decay(6000000, 1000000, 24000000) < 6000000,
+		"sub-period Taylor residual decays strictly");
 }
 
-/*
- * The base queue mapping from the burst gauge. The band shape is the
- * same as 1.3.5's EMA band (g <= T_L -> Q1, g >= T_H -> Q3, else Q2).
- * This function is used ONLY for the run-out cpu-bound test (g >= T_H)
- * and the select_cpu mirror, never as a wakeup assignment (H1).
- */
-static void test_gauge_mapping(void)
+static void test_queue_mapping(void)
 {
-	TEST_OK(mlfq_queue_from_gauge(0, MLFQ_T_L_NS, MLFQ_T_H_NS) == 1,
-		"gauge 0 -> Q1");
-	TEST_OK(mlfq_queue_from_gauge(MLFQ_T_L_NS, MLFQ_T_L_NS,
-				      MLFQ_T_H_NS) == 1,
-		"gauge == T_L -> Q1");
-	TEST_OK(mlfq_queue_from_gauge(MLFQ_T_L_NS + 1, MLFQ_T_L_NS,
-				      MLFQ_T_H_NS) == 2,
-		"gauge just above T_L -> Q2");
-	TEST_OK(mlfq_queue_from_gauge(1000000, MLFQ_T_L_NS,
-				      MLFQ_T_H_NS) == 2,
-		"gauge 1ms -> Q2");
-	TEST_OK(mlfq_queue_from_gauge(MLFQ_T_H_NS, MLFQ_T_L_NS,
-				      MLFQ_T_H_NS) == 3,
-		"gauge == T_H -> Q3");
-	TEST_OK(mlfq_queue_from_gauge(5000000, MLFQ_T_L_NS,
-				      MLFQ_T_H_NS) == 3,
-		"gauge 5ms -> Q3");
+	TEST_OK(mlfq_queue_from_ema(0, 250000, 2000000) == 1,
+		"ema 0 -> Q1");
+	TEST_OK(mlfq_queue_from_ema(250000, 250000, 2000000) == 1,
+		"ema == T_L -> Q1");
+	TEST_OK(mlfq_queue_from_ema(250001, 250000, 2000000) == 2,
+		"ema just above T_L -> Q2");
+	TEST_OK(mlfq_queue_from_ema(1000000, 250000, 2000000) == 2,
+		"ema 1ms -> Q2");
+	TEST_OK(mlfq_queue_from_ema(2000000, 250000, 2000000) == 3,
+		"ema == T_H -> Q3");
+	TEST_OK(mlfq_queue_from_ema(5000000, 250000, 2000000) == 3,
+		"ema 5ms -> Q3");
 }
 
 /*
@@ -510,57 +389,57 @@ static void test_gauge_mapping(void)
  * must land on the correct queues, and values just inside and just
  * outside each band must classify as expected.
  */
-static void test_gauge_mapping_bands(void)
+static void test_queue_mapping_bands(void)
 {
 	u64 t_l = MLFQ_T_L_NS;
 	u64 t_h = MLFQ_T_H_NS;
 
 	/* Just below T_L: Q1. */
-	TEST_OK(mlfq_queue_from_gauge(t_l - 1, t_l, t_h) == 1,
-		"band boundary: gauge T_L - 1 -> Q1");
+	TEST_OK(mlfq_queue_from_ema(t_l - 1, t_l, t_h) == 1,
+		"band boundary: ema T_L - 1 -> Q1");
 	/* Exactly T_L: Q1. */
-	TEST_OK(mlfq_queue_from_gauge(t_l, t_l, t_h) == 1,
-		"band boundary: gauge T_L -> Q1");
+	TEST_OK(mlfq_queue_from_ema(t_l, t_l, t_h) == 1,
+		"band boundary: ema T_L -> Q1");
 	/* Just above T_L: Q2. */
-	TEST_OK(mlfq_queue_from_gauge(t_l + 1, t_l, t_h) == 2,
-		"band boundary: gauge T_L + 1 -> Q2");
+	TEST_OK(mlfq_queue_from_ema(t_l + 1, t_l, t_h) == 2,
+		"band boundary: ema T_L + 1 -> Q2");
 
 	/* Just below T_H: Q2. */
-	TEST_OK(mlfq_queue_from_gauge(t_h - 1, t_l, t_h) == 2,
-		"band boundary: gauge T_H - 1 -> Q2");
+	TEST_OK(mlfq_queue_from_ema(t_h - 1, t_l, t_h) == 2,
+		"band boundary: ema T_H - 1 -> Q2");
 	/* Exactly T_H: Q3. */
-	TEST_OK(mlfq_queue_from_gauge(t_h, t_l, t_h) == 3,
-		"band boundary: gauge T_H -> Q3");
+	TEST_OK(mlfq_queue_from_ema(t_h, t_l, t_h) == 3,
+		"band boundary: ema T_H -> Q3");
 	/* Just above T_H: Q3. */
-	TEST_OK(mlfq_queue_from_gauge(t_h + 1, t_l, t_h) == 3,
-		"band boundary: gauge T_H + 1 -> Q3");
+	TEST_OK(mlfq_queue_from_ema(t_h + 1, t_l, t_h) == 3,
+		"band boundary: ema T_H + 1 -> Q3");
 
 	/* Extremes. */
-	TEST_OK(mlfq_queue_from_gauge(0, t_l, t_h) == 1,
-		"band boundary: gauge 0 -> Q1");
-	TEST_OK(mlfq_queue_from_gauge(MLFQ_GAUGE_MAX_NS, t_l, t_h) == 3,
-		"band boundary: gauge G_MAX -> Q3");
+	TEST_OK(mlfq_queue_from_ema(0, t_l, t_h) == 1,
+		"band boundary: ema 0 -> Q1");
+	TEST_OK(mlfq_queue_from_ema(MLFQ_BUDGET_MAX_NS, t_l, t_h) == 3,
+		"band boundary: ema B_MAX -> Q3");
 }
 
 /*
- * Wakeup promotion uses gauge-gated hysteresis: g < T_L/2 with two
- * consecutive short sleeps promotes Q2->Q1, and g < T_H/2 with two
- * short sleeps promotes Q3->Q2. The gauge replaces the EMA tests.
+ * Wakeup promotion uses gauge-gated hysteresis: ema < T_L/2 with two
+ * consecutive short sleeps promotes Q2->Q1, and ema < T_H/2 with two
+ * short sleeps promotes Q3->Q2.
  */
 static void test_promote_hysteresis(void)
 {
-	struct task_ctx t = { .queue = 2, .g = 0 };
+	struct task_ctx t = { .queue = 2, .ema = 0 };
 
 	/* Single short sleep does not promote. */
 	mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS, MLFQ_T_H_NS, 4000000);
 	TEST_OK(t.wake_cnt == 1 && t.queue == 2,
 		"promote: single short sleep does not promote Q2->Q1");
 
-	/* Two short sleeps with g == 0 (< T_L/2) promote Q2->Q1. */
+	/* Two short sleeps with ema == 0 (< T_L/2) promote Q2->Q1. */
 	TEST_OK(mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS,
 				       MLFQ_T_H_NS, 4000000) &&
 		t.queue == 1 && t.wake_cnt == 0,
-		"promote: two short sleeps with low gauge promote Q2->Q1");
+		"promote: two short sleeps with low ema promote Q2->Q1");
 
 	/* Long sleep resets wake_cnt, Q1 stays. */
 	mlfq_promote_on_wakeup(&t, 10000000, MLFQ_T_L_NS, MLFQ_T_H_NS,
@@ -568,55 +447,55 @@ static void test_promote_hysteresis(void)
 	TEST_OK(t.wake_cnt == 0 && t.queue == 1,
 		"promote: long sleep resets wake_cnt, Q1 stays");
 
-	/* Q3->Q2 with two short sleeps and g == 0 (< T_H/2). */
+	/* Q3->Q2 with two short sleeps and ema == 0 (< T_H/2). */
 	t.queue = 3;
-	t.g = 0;
+	t.ema = 0;
 	t.wake_cnt = 0;
 	mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS, MLFQ_T_H_NS,
 			       4000000);
 	TEST_OK(mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS,
 				       MLFQ_T_H_NS, 4000000) &&
 		t.queue == 2,
-		"promote: two short sleeps with low gauge promote Q3->Q2");
+		"promote: two short sleeps with low ema promote Q3->Q2");
 
-	/* g >= T_H/2 blocks Q3->Q2 despite two short sleeps. */
+	/* ema >= T_H/2 blocks Q3->Q2 despite two short sleeps. */
 	t.queue = 3;
-	t.g = MLFQ_T_H_NS;	/* >= T_H/2 */
+	t.ema = MLFQ_T_H_NS;	/* >= T_H/2 */
 	t.wake_cnt = 0;
 	mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS, MLFQ_T_H_NS,
 			       4000000);
 	TEST_OK(!mlfq_promote_on_wakeup(&t, 1000000, MLFQ_T_L_NS,
 					MLFQ_T_H_NS, 4000000) &&
 		t.queue == 3,
-		"promote: high gauge blocks Q3->Q2 despite two short sleeps");
+		"promote: high ema blocks Q3->Q2 despite two short sleeps");
 }
 
 /*
- * The demotion gate uses the gauge: g >= T_H is the CPU-bound test,
+ * The demotion gate uses the gauge: ema >= T_H is the CPU-bound test,
  * and reenq_cnt >= 8 gates the band crossing. Q3 is never demoted.
  */
 static void test_demote_hysteresis(void)
 {
 	struct task_ctx t;
 
-	/* For non-CPU-bound tasks (g < T_H), a single run-out does not demote. */
-	t = (struct task_ctx){ .queue = 1, .g = 500000 };
+	/* For non-CPU-bound tasks (ema < T_H), a single run-out does not demote. */
+	t = (struct task_ctx){ .queue = 1, .ema = 500000 };
 	mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 1 && t.queue == 1,
-		"demote: single run-out with g < T_H does not demote Q1->Q2");
+		"demote: single run-out with ema < T_H does not demote Q1->Q2");
 
-	/* Two run-outs with g < T_H. Still no demotion. */
+	/* Two run-outs with ema < T_H. Still no demotion. */
 	mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 2 && t.queue == 1,
-		"demote: two run-outs with g < T_H do not demote Q1->Q2");
+		"demote: two run-outs with ema < T_H do not demote Q1->Q2");
 
-	/* For CPU-bound tasks (g >= T_H), seven run-outs do not demote. */
-	t = (struct task_ctx){ .queue = 1, .g = MLFQ_T_H_NS };
+	/* For CPU-bound tasks (ema >= T_H), seven run-outs do not demote. */
+	t = (struct task_ctx){ .queue = 1, .ema = MLFQ_T_H_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
 		mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 1,
-		"demote: seven run-outs with g >= T_H do not demote Q1->Q2");
+		"demote: seven run-outs with ema >= T_H do not demote Q1->Q2");
 
 	/* Eighth run-out demotes Q1->Q2 and resets reenq_cnt. */
 	TEST_OK(mlfq_demote_on_reenq(&t, MLFQ_T_H_NS) &&
@@ -624,18 +503,18 @@ static void test_demote_hysteresis(void)
 		"demote: eight run-outs demote Q1->Q2 and reset reenq_cnt");
 
 	/* Q2->Q3 path. */
-	t = (struct task_ctx){ .queue = 2, .g = MLFQ_T_H_NS };
+	t = (struct task_ctx){ .queue = 2, .ema = MLFQ_T_H_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 7; i++)
 		mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
 	TEST_OK(t.reenq_cnt == 7 && t.queue == 2,
-		"demote: seven run-outs with g >= T_H do not demote Q2->Q3");
+		"demote: seven run-outs with ema >= T_H do not demote Q2->Q3");
 	TEST_OK(mlfq_demote_on_reenq(&t, MLFQ_T_H_NS) &&
 		t.queue == 3 && t.reenq_cnt == 0,
 		"demote: eight run-outs demote Q2->Q3 and reset reenq_cnt");
 
 	/* Q3 is never demoted by the exhaustion gate. */
-	t = (struct task_ctx){ .queue = 3, .g = MLFQ_GAUGE_MAX_NS };
+	t = (struct task_ctx){ .queue = 3, .ema = MLFQ_BUDGET_MAX_NS };
 	t.reenq_cnt = 0;
 	for (int i = 0; i < 8; i++)
 		mlfq_demote_on_reenq(&t, MLFQ_T_H_NS);
@@ -643,182 +522,6 @@ static void test_demote_hysteresis(void)
 		"demote: Q3 is never demoted by the exhaustion gate");
 }
 
-/*
- * FCBS slack is the unspent budget from an early completion. grant > delta
- * yields the difference, grant == delta yields zero, and grant < delta yields
- * zero (guarded). When last_grant_ns is zero (the preemption path, H2),
- * the slack is zero by construction.
- */
-static void test_fcbs_slack(void)
-{
-	/* grant > delta donates the unspent budget. */
-	TEST_OK(mlfq_fcbs_slack(2000000, 1000000) == 1000000,
-		"fcbs slack: grant > delta yields the difference");
-	TEST_OK(mlfq_fcbs_slack(4000000, 500000) == 3500000,
-		"fcbs slack: grant >> delta yields the full remainder");
-
-	/* grant == delta yields no slack. */
-	TEST_OK(mlfq_fcbs_slack(2000000, 2000000) == 0,
-		"fcbs slack: grant == delta yields zero");
-
-	/* grant < delta. Guarded subtraction, the result is zero. */
-	TEST_OK(mlfq_fcbs_slack(500000, 1000000) == 0,
-		"fcbs slack: grant < delta yields zero (guarded)");
-
-	/* Preempt path. grant == 0, slack is always zero. */
-	TEST_OK(mlfq_fcbs_slack(0, 1000000) == 0,
-		"fcbs slack: preempt path (grant 0) yields zero");
-	TEST_OK(mlfq_fcbs_slack(0, 0) == 0,
-		"fcbs slack: preempt path with zero delta yields zero");
-
-	/* Full burst (grant == Q1 slice, delta == full grant). */
-	TEST_OK(mlfq_fcbs_slack(MLFQ_Q1_SLICE_NS, MLFQ_Q1_SLICE_NS) == 0,
-		"fcbs slack: full Q1 burst consumes all budget");
-}
-
-/*
- * FCBS bonus deposit and grant. The deposit is clamped to the queue's
- * max slice (B_q <= Q_q), the idle decay reduces the bonus by wall
- * time, and the grant is bounded by 2*Q_q.
- */
-static void test_fcbs_bonus(void)
-{
-	struct queue_ctx q;
-	u64 grant;
-
-	/* Deposit cap. A deposit exceeding Q_q is clamped. */
-	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
-				.max_slice_ns = MLFQ_Q1_SLICE_NS };
-	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS / 2,
-			  q.max_slice_ns);
-	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS / 2,
-		"fcbs bonus: deposit half Q1 stays at half Q1");
-
-	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS,
-			  q.max_slice_ns);
-	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS,
-		"fcbs bonus: deposit capped at Q1 slice");
-
-	/* Excess deposit is clamped, not overflowed. */
-	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q1_SLICE_NS,
-			  q.max_slice_ns);
-	TEST_OK(q.bonus_ns == MLFQ_Q1_SLICE_NS,
-		"fcbs bonus: second deposit stays capped at Q1");
-
-	/* Consume. The bonus is exchanged to zero. */
-	q = (struct queue_ctx){ .bonus_ns = MLFQ_Q1_SLICE_NS / 2,
-				.bonus_since = 0,
-				.max_slice_ns = MLFQ_Q1_SLICE_NS };
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
-	TEST_OK(grant == MLFQ_Q1_SLICE_NS + MLFQ_Q1_SLICE_NS / 2 &&
-		q.bonus_ns == 0,
-		"fcbs bonus: consume exchanges bonus to zero and returns grant");
-
-	/* No bonus. The grant is just the slice. */
-	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
-				.max_slice_ns = MLFQ_Q1_SLICE_NS };
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
-	TEST_OK(grant == MLFQ_Q1_SLICE_NS,
-		"fcbs bonus: no bonus yields slice-only grant");
-
-	/* Grant bound: Q_q + B_q <= 2*Q_q (B_q <= Q_q by deposit). */
-	q = (struct queue_ctx){ .bonus_ns = MLFQ_Q1_SLICE_NS,
-				.bonus_since = 0,
-				.max_slice_ns = MLFQ_Q1_SLICE_NS };
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
-	TEST_OK(grant == 2 * MLFQ_Q1_SLICE_NS,
-		"fcbs bonus: max grant is 2*Q_q");
-
-	/* Idle decay. The bonus is reduced by wall time since deposit. */
-	q = (struct queue_ctx){
-		.bonus_ns = MLFQ_Q1_SLICE_NS,
-		.bonus_since = 1000000000ULL,	/* 1 s ago */
-		.max_slice_ns = MLFQ_Q1_SLICE_NS
-	};
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS,
-					1000000000ULL + MLFQ_Q1_SLICE_NS);
-	TEST_OK(grant == MLFQ_Q1_SLICE_NS + (MLFQ_Q1_SLICE_NS - MLFQ_Q1_SLICE_NS) &&
-		q.bonus_ns == 0,
-		"fcbs bonus: full idle decay zeroes bonus");
-
-	/* Partial idle decay. */
-	q = (struct queue_ctx){
-		.bonus_ns = MLFQ_Q1_SLICE_NS,
-		.bonus_since = 1000000000ULL,
-		.max_slice_ns = MLFQ_Q1_SLICE_NS
-	};
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS,
-					1000000000ULL + MLFQ_Q1_SLICE_NS / 2);
-	TEST_OK(grant == MLFQ_Q1_SLICE_NS + MLFQ_Q1_SLICE_NS / 2,
-		"fcbs bonus: partial idle decay halves the bonus");
-
-	/* Read-first: a second consume yields no bonus. */
-	q = (struct queue_ctx){
-		.bonus_ns = MLFQ_Q1_SLICE_NS,
-		.bonus_since = 0,
-		.max_slice_ns = MLFQ_Q1_SLICE_NS
-	};
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
-	(void)grant;
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q1_SLICE_NS, 1000000000ULL);
-	TEST_OK(grant == MLFQ_Q1_SLICE_NS && q.bonus_ns == 0,
-		"fcbs bonus: second consume without deposit yields slice-only");
-}
-
-/*
- * Deposit/consume interleaving. As far as a single-threaded harness
- * can verify, the exchange-to-zero at consume prevents resurrection
- * of a consumed bonus. The true cross-CPU race needs a code-review
- * gate or a stress run (noted explicitly, H3).
- */
-static void test_fcbs_deposit_consume_atomicity(void)
-{
-	struct queue_ctx q;
-	u64 grant;
-
-	/* Deposit, consume, deposit, consume. No ghost bonus. */
-	q = (struct queue_ctx){ .bonus_ns = 0, .bonus_since = 0,
-				.max_slice_ns = MLFQ_Q2_SLICE_NS };
-	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q2_SLICE_NS / 4,
-			  q.max_slice_ns);
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
-					2000000000ULL);
-	TEST_OK(grant == MLFQ_Q2_SLICE_NS + MLFQ_Q2_SLICE_NS / 4 &&
-		q.bonus_ns == 0,
-		"fcbs atomicity: first consume takes the bonus");
-
-	/* A second consume after the first yields no bonus. */
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
-					2000000000ULL);
-	TEST_OK(grant == MLFQ_Q2_SLICE_NS && q.bonus_ns == 0,
-		"fcbs atomicity: second consume yields no bonus (no resurrection)");
-
-	/* Deposit again after a consume. Clean slate. */
-	mlfq_fcbs_deposit(&q.bonus_ns, MLFQ_Q2_SLICE_NS / 2,
-			  q.max_slice_ns);
-	grant = mlfq_fcbs_consume_bonus(&q, MLFQ_Q2_SLICE_NS,
-					3000000000ULL);
-	TEST_OK(grant == MLFQ_Q2_SLICE_NS + MLFQ_Q2_SLICE_NS / 2 &&
-		q.bonus_ns == 0,
-		"fcbs atomicity: deposit after consume is a clean deposit");
-}
-
-/*
- * Queue grant. Identity without bonus, additive with bonus.
- */
-static void test_queue_grant(void)
-{
-	TEST_OK(mlfq_queue_grant(MLFQ_Q1_SLICE_NS, 0) == MLFQ_Q1_SLICE_NS,
-		"queue grant: no bonus returns the slice unchanged");
-	TEST_OK(mlfq_queue_grant(MLFQ_Q1_SLICE_NS, MLFQ_Q1_SLICE_NS / 2) ==
-		MLFQ_Q1_SLICE_NS + MLFQ_Q1_SLICE_NS / 2,
-		"queue grant: bonus adds to the slice");
-	TEST_OK(mlfq_queue_grant(MLFQ_Q2_SLICE_NS, MLFQ_Q2_SLICE_NS) ==
-		2 * MLFQ_Q2_SLICE_NS,
-		"queue grant: max bonus yields 2*Q_q");
-	TEST_OK(mlfq_queue_grant(MLFQ_Q3_SLICE_NS, 0) == MLFQ_Q3_SLICE_NS,
-		"queue grant: Q3 with no bonus is Q3 slice");
-}
 
 /*
  * The reenq_cnt counter saturates at MLFQ_DEMOTE_EXHAUSTIONS. A Q3
@@ -964,7 +667,7 @@ static void test_ss_boost_allowed(void)
  */
 static void test_ss_boost_pending(void)
 {
-	struct task_ctx t = { .g = 0, .last_ss_boost_at = 0 };
+	struct task_ctx t = { .ema = 0, .last_ss_boost_at = 0 };
 	u64 now = 1000000000;
 
 	TEST_OK(mlfq_ss_boost_pending(&t, 10000, false, now,
@@ -996,19 +699,19 @@ static void test_ss_boost_pending(void)
 }
 
 /*
- * The invariant predicates under MLFQ_CHECK. The gauge bounds predicate
- * replaces the old EMA bounds check. The queue, weight and vlag checks
- * are unchanged.
+ * The invariant predicates under MLFQ_CHECK. The EMA bounds predicate
+ * checks the gauge ceiling. The queue, weight and vlag checks are
+ * unchanged.
  */
 static void test_mlfq_check_predicates(void)
 {
-	TEST_OK(mlfq_check_gauge_bounds(MLFQ_GAUGE_MAX_NS, MLFQ_GAUGE_MAX_NS),
-		"gauge at G_MAX is in bounds");
-	TEST_OK(!mlfq_check_gauge_bounds(MLFQ_GAUGE_MAX_NS + 1,
-					 MLFQ_GAUGE_MAX_NS),
-		"gauge above G_MAX is out of bounds");
-	TEST_OK(mlfq_check_gauge_bounds(0, MLFQ_GAUGE_MAX_NS),
-		"zero gauge is in bounds");
+	TEST_OK(mlfq_check_ema_bounds(MLFQ_BUDGET_MAX_NS, MLFQ_BUDGET_MAX_NS),
+		"ema at B_MAX is in bounds");
+	TEST_OK(!mlfq_check_ema_bounds(MLFQ_BUDGET_MAX_NS + 1,
+				       MLFQ_BUDGET_MAX_NS),
+		"ema above B_MAX is out of bounds");
+	TEST_OK(mlfq_check_ema_bounds(0, MLFQ_BUDGET_MAX_NS),
+		"zero ema is in bounds");
 	TEST_OK(mlfq_check_queue(1) && mlfq_check_queue(3),
 		"queues 1 and 3 are valid");
 	TEST_OK(!mlfq_check_queue(0) && !mlfq_check_queue(4),
@@ -1017,13 +720,6 @@ static void test_mlfq_check_predicates(void)
 		"weight >= 1 invariant");
 	TEST_OK(mlfq_check_queued_vlag(0) && !mlfq_check_queued_vlag(-1),
 		"queued lag >= 0 invariant");
-	TEST_OK(mlfq_check_bonus_bounds(0, MLFQ_Q1_SLICE_NS),
-		"zero bonus is in bounds");
-	TEST_OK(mlfq_check_bonus_bounds(MLFQ_Q1_SLICE_NS, MLFQ_Q1_SLICE_NS),
-		"bonus at Q1 slice is in bounds");
-	TEST_OK(!mlfq_check_bonus_bounds(MLFQ_Q1_SLICE_NS + 1,
-					 MLFQ_Q1_SLICE_NS),
-		"bonus above Q1 slice is out of bounds");
 }
 
 static void test_bitmap(void)
@@ -1451,19 +1147,13 @@ int main(void)
 	test_sameq_preempt_owed();
 	test_clock_advance();
 
-	/* Gauge burst-classifier. */
-	test_gauge_climb();
-	test_gauge_period_decay();
-	test_gauge_mapping();
-	test_gauge_mapping_bands();
+	/* EMA burst-classifier. */
+	test_ema_climb();
+	test_ema_decay();
+	test_queue_mapping();
+	test_queue_mapping_bands();
 	test_promote_hysteresis();
 	test_demote_hysteresis();
-
-	/* FCBS. */
-	test_fcbs_slack();
-	test_fcbs_bonus();
-	test_fcbs_deposit_consume_atomicity();
-	test_queue_grant();
 
 	/* Saturation and cpuperf. */
 	test_reenq_cnt_saturation();

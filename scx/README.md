@@ -7,11 +7,11 @@ scx_mlfq is a user-defined scheduler for Linux, written in Rust with a BPF core,
 
 Tasks are classified into three per-CPU queues. Q1 holds interactive tasks with 1 ms slices, Q2 holds unclassified tasks with 2 ms slices, and Q3 holds CPU-bound tasks with 4 ms slices. All queues serve in virtual-deadline order within a bounded dispatch batch.
 
-Classification uses a per-task burst gauge. The gauge climbs by run time and decays at wakeup by a fixed-window step. A task that has run more than it slept accumulates gauge and crosses the CPU-bound threshold. A task that sleeps enough zeroes the gauge.
+Classification uses a per-task EMA interactivity gauge. The gauge climbs by run time and decays at wakeup by a half-life step. A task that has run more than it slept accumulates gauge and crosses the CPU-bound threshold. A task that sleeps enough zeroes the gauge.
 
 Queue moves happen only at period boundaries. Wakeup promotes, run-out demotes. An 8-exhaustion gate demotes tasks that repeatedly exhaust their slices. Aging elevates any task that has sat in Q2 or Q3 for one second back to Q1. The scheduler never demotes at wakeup.
 
-Each queue is a CBS server with a 50% soft reservation. Early-completing tasks donate unspent budget to the next task in the same queue. The scheduler also implements cache-aware stealing, placement tiers, keep-path dispatch, a guaranteed Q3 share of every dispatch batch, and RT/DL kernel-side avoidance. Every placement clamps a task's lag to within one lag bound of its queue's virtual clock. The details live in the code comments.
+The scheduler also implements cache-aware stealing, placement tiers, keep-path dispatch, a guaranteed Q3 share of every dispatch batch, and RT/DL kernel-side avoidance. Every placement clamps a task's lag to within one lag bound of its queue's virtual clock. The details live in the code comments.
 
 
 ## Production Ready?

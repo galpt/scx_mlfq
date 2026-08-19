@@ -8,11 +8,11 @@
 //! scx_mlfq, a Multilevel Feedback Queue scheduler for sched_ext.
 //!
 //! Per-CPU, virtual-time-ordered user DSQs (Q1/Q2/Q3 per CPU) over an EEVDF
-//! virtual-time substrate. Tasks are classified into queues by a fixed-window
-//! burst gauge that climbs during run segments and decays at wakeup by
-//! CBS-period steps, with the short-sleep and I/O boost and the band
-//! hysteresis. Demotion flows through the run-out gate. See README.md for
-//! the design overview.
+//! virtual-time substrate. Tasks are classified into queues by an EMA
+//! interactivity gauge that climbs during run segments and decays at
+//! wakeup by the half-life step, with the short-sleep and I/O boost and
+//! the band hysteresis. Demotion flows through the run-out gate. See
+//! README.md for the design overview.
 
 mod bpf_skel;
 pub use bpf_skel::*;
@@ -320,8 +320,6 @@ impl<'a> Scheduler<'a> {
             rt_evacuations: s[24],
             rt_redirects: s[25],
             rt_reenqs: s[26],
-            fcbs_grants: s[27],
-            fcbs_slack_events: s[28],
             op_lat: self.read_op_lat(),
             wakeup_total: self.read_wakeup_total(),
         }
@@ -469,7 +467,7 @@ impl<'a> Scheduler<'a> {
     /// field order (see struct mlfq_stats in src/bpf/intf.h). Each CPU
     /// bumps its own slot non-atomically on its own cache line, so the
     /// sum is the system-wide counter.
-    fn read_mlfq_stats(&self) -> [u64; 29] {
+    fn read_mlfq_stats(&self) -> [u64; 27] {
         let cpu_values = self
             .skel
             .maps
@@ -478,9 +476,9 @@ impl<'a> Scheduler<'a> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let mut total = [0u64; 29];
+        let mut total = [0u64; 27];
         for chunk in cpu_values {
-            for (i, slot) in chunk.chunks_exact(8).take(29).enumerate() {
+            for (i, slot) in chunk.chunks_exact(8).take(27).enumerate() {
                 total[i] = total[i].wrapping_add(u64::from_ne_bytes(
                     slot.try_into().expect("an 8-byte mlfq_stats slot"),
                 ));

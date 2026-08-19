@@ -4,17 +4,17 @@
  *
  * Classification, the wakeup promotion and run-out demotion paths.
  *
- * The burst gauge is the classification input. It climbs per run
- * segment in stopping() and decays per sleep at wakeup by the CBS
- * period step (see mlfq_gauge_decay() in intf.h). The decay is
- * sampled per task: it runs at most once per MLFQ_CLASSIFY_INTERVAL_NS,
- * so a wakeup burst pays only the boost and hysteresis on the interleaved
- * wakeups. Queue changes are asymmetric. The wakeup path is
- * promotion-only. The short-sleep and I/O boost and the gauge-gated
- * hysteresis raise the queue, and no wakeup can ever demote a task.
- * Demotions flow through the run-out gate, whose consecutive-exhaustion
- * counter (mlfq_demote_on_reenq in intf.h) implements the demotion
- * hysteresis.
+ * The EMA interactivity gauge is the classification input. It climbs
+ * per run segment in stopping() and decays per sleep at wakeup by the
+ * half-life step (see mlfq_ema_climb()/mlfq_ema_decay() in intf.h).
+ * The decay is sampled per task: it runs at most once per
+ * MLFQ_CLASSIFY_INTERVAL_NS, so a wakeup burst pays only the boost and
+ * hysteresis on the interleaved wakeups. Queue changes are asymmetric.
+ * The wakeup path is promotion-only. The short-sleep and I/O boost and
+ * the gauge-gated hysteresis raise the queue, and no wakeup can ever
+ * demote a task. Demotions flow through the run-out gate, whose
+ * consecutive-exhaustion counter (mlfq_demote_on_reenq in intf.h)
+ * implements the demotion hysteresis.
  */
 
 #include <bpf/bpf_core_read.h>
@@ -85,6 +85,23 @@ static __always_inline bool mlfq_apply_sched_idle(const struct task_struct *p,
 }
 
 /*
+ * Climb the EMA gauge for a run segment (stopping path). The delta is
+ * clamped by mlfq_ema_climb(), so a CPU-bound task saturates the gauge
+ * and the classification thresholds keep it out of Q1.
+ */
+static __always_inline void mlfq_ema_climb_task(struct task_ctx *tctx,
+						u64 delta_ns)
+{
+	tctx->ema = mlfq_ema_climb(tctx->ema, delta_ns, mlfq_budget_max_ns,
+				   mlfq_alpha);
+#if MLFQ_CHECK
+	if (!mlfq_check_ema_bounds(tctx->ema, mlfq_budget_max_ns))
+		scx_bpf_error("ema %llu exceeds budget max after climb",
+			      tctx->ema);
+#endif
+}
+
+/*
  * mlfq_wakeup_classify - Wakeup classification.
  * @p: The task.
  * @tctx: The task context.
@@ -93,24 +110,24 @@ static __always_inline bool mlfq_apply_sched_idle(const struct task_struct *p,
  * The wakeup path is promotion-only. The boost and the hysteresis are
  * the only queue moves, so a single wakeup can never demote a task and
  * bypass the exhaustion hysteresis. The base band mapping
- * (mlfq_queue_from_gauge) is deliberately not applied here. A task
- * that qualifies for neither the boost nor the hysteresis keeps its
- * current queue.
+ * (mlfq_queue_from_ema) is deliberately not applied here except after a
+ * long sleep, which collapses the gauge and re-adopts the base mapping
+ * so an interactive task cannot be stuck in Q3. A task that qualifies
+ * for neither the boost nor the hysteresis keeps its current queue.
  *
- * The gauge decay runs at most once per MLFQ_CLASSIFY_INTERVAL_NS per
+ * The EMA decay runs at most once per MLFQ_CLASSIFY_INTERVAL_NS per
  * task. The interleaved wakeups pay only the boost and hysteresis
- * comparisons. The decay is deferred until the window elapses and is then
- * applied to the whole sleep that accumulated since the last decay, so the
- * band edge is reached on the same total sleep; only the division is
- * amortized. A wrap-guarded sleep delta computes to zero and leaves the
- * gauge untouched, which is directionally conservative toward CPU-bound.
- * The decay uses the pre-wakeup queue, the server the task was last
- * served by.
+ * comparisons. The decay is deferred until the window elapses and is
+ * then applied to the whole sleep that accumulated since the last
+ * decay, so the band edge is reached on the same total sleep; only the
+ * division is amortized. A wrap-guarded sleep delta computes to zero
+ * and leaves the gauge untouched, which is directionally conservative
+ * toward CPU-bound.
  */
 static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
-					 struct task_ctx *tctx, u64 now)
+						 struct task_ctx *tctx, u64 now)
 {
-	u64 sleep_ns = 0;
+	u64 sleep_ns = 0, base_q;
 	bool io_wait = mlfq_task_io_wait(p);
 
 	if (mlfq_time_before(tctx->last_sleep_at, now))
@@ -120,19 +137,13 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 		goto samples;
 
 	if (tctx->last_sleep_at && mlfq_time_before(tctx->last_sleep_at, now)) {
-		struct queue_ctx *q = mlfq_lookup_queue(tctx->queue);
-
-		if (q && q->max_slice_ns) {
-			u64 q_i = q->max_slice_ns;
-			u64 p_i = q_i * MLFQ_CBS_PERIOD_MULT;
-
-			tctx->g = mlfq_gauge_decay(tctx->g, sleep_ns, q_i, p_i);
+		tctx->ema = mlfq_ema_decay(tctx->ema, sleep_ns,
+					   mlfq_ema_half_life_ns);
 #if MLFQ_CHECK
-			if (!mlfq_check_gauge_bounds(tctx->g, mlfq_gauge_max_ns))
-				scx_bpf_error("pid %d gauge %llu out of bounds "
-					      "after decay", p->pid, tctx->g);
+		if (!mlfq_check_ema_bounds(tctx->ema, mlfq_budget_max_ns))
+			scx_bpf_error("pid %d ema %llu out of bounds after decay",
+				      p->pid, tctx->ema);
 #endif
-		}
 	}
 	tctx->last_sleep_at = 0;
 	tctx->reenq_cnt = 0;
@@ -169,6 +180,19 @@ samples:
 				   mlfq_t_l_ns, mlfq_t_h_ns,
 				   mlfq_hysteresis_sleep_ns))
 		mlfq_stat_add(promotions, 1);
+
+	/*
+	 * A long sleep collapses the gauge; re-adopt the base mapping so
+	 * an interactive task cannot be stuck in Q3.
+	 */
+	if (sleep_ns > mlfq_long_sleep_ns) {
+		base_q = mlfq_queue_from_ema(tctx->ema, mlfq_t_l_ns,
+					     mlfq_t_h_ns);
+		if (base_q < tctx->queue) {
+			tctx->queue = base_q;
+			mlfq_stat_add(promotions, 1);
+		}
+	}
 }
 
 /*
@@ -181,8 +205,8 @@ samples:
  * the scx equivalent of the tick/demotion path. It is the only enqueue
  * without flag bits, which identifies it at the routing in enqueue(). The
  * consecutive-exhaustion counter saturates at MLFQ_DEMOTE_EXHAUSTIONS
- * and gates the band crossing, the gauge test g >= T_H is the CPU-bound
- * test, and uclamp_min tasks keep their queue.
+ * and gates the band crossing, the gauge test ema >= T_H is the
+ * CPU-bound test, and uclamp_min tasks keep their queue.
  */
 static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 						 struct task_ctx *tctx)

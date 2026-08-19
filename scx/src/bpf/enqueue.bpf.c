@@ -283,17 +283,10 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		mlfq_stat_add(enq_pinned_idle, 1);
 		mlfq_runnable_enter(tctx, (u8)qid,
 				    mlfq_llc_of_cpu((u32)prev_cpu));
-		{
-			struct queue_ctx *q = mlfq_lookup_queue(qid);
-			u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
-
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
-					   grant, enq_flags);
-			mlfq_stat_placement(qid);
-			tctx->last_grant_ns = grant;
-			if (grant != slice)
-				mlfq_stat_add(fcbs_grants, 1);
-		}
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)prev_cpu,
+				   slice, enq_flags);
+		mlfq_stat_placement(qid);
+		tctx->last_grant_ns = slice;
 		tctx->wake_cpu_state = 0;
 		goto done;
 	}
@@ -318,18 +311,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		mlfq_stat_add(enq_pinned_busy, 1);
 		mlfq_runnable_enter(tctx, (u8)qid,
 				    mlfq_llc_of_cpu((u32)prev_cpu));
-		{
-			struct queue_ctx *q = mlfq_lookup_queue(qid);
-			u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
-
-			scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
-						 grant, deadline,
-						 enq_flags);
-			mlfq_stat_placement(qid);
-			tctx->last_grant_ns = grant;
-			if (grant != slice)
-				mlfq_stat_add(fcbs_grants, 1);
-		}
+		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, prev_cpu),
+					 slice, deadline,
+					 enq_flags);
+		mlfq_stat_placement(qid);
+		tctx->last_grant_ns = slice;
 		tctx->wake_cpu_state = 0;
 		mlfq_idle_kick(prev_cpu);
 		goto done;
@@ -356,18 +342,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		mlfq_runnable_enter(tctx, (u8)qid,
 				    mlfq_llc_of_cpu((u32)bpf_get_smp_processor_id()));
-		{
-			struct queue_ctx *q = mlfq_lookup_queue(qid);
-			u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
-
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, grant,
-					   enq_flags);
-			mlfq_stat_add(enq_fastpath, 1);
-			mlfq_stat_placement(qid);
-			tctx->last_grant_ns = grant;
-			if (grant != slice)
-				mlfq_stat_add(fcbs_grants, 1);
-		}
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
+				   enq_flags);
+		mlfq_stat_add(enq_fastpath, 1);
+		mlfq_stat_placement(qid);
+		tctx->last_grant_ns = slice;
 		tctx->wake_cpu_state = 0;
 		goto done;
 	}
@@ -536,17 +515,10 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	mlfq_stat_add(enq_regular, 1);
 	mlfq_runnable_enter(tctx, (u8)qid,
 			    mlfq_llc_of_cpu((u32)target_cpu));
-	{
-		struct queue_ctx *q = mlfq_lookup_queue(qid);
-		u64 grant = q ? mlfq_fcbs_consume_bonus(q, slice, now) : slice;
-
-		scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
-					 grant, deadline, enq_flags);
-		mlfq_stat_placement(qid);
-		tctx->last_grant_ns = grant;
-		if (grant != slice)
-			mlfq_stat_add(fcbs_grants, 1);
-	}
+	scx_bpf_dsq_insert_vtime(p, mlfq_dsq_id(qid, target_cpu),
+				 slice, deadline, enq_flags);
+	mlfq_stat_placement(qid);
+	tctx->last_grant_ns = slice;
 
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;

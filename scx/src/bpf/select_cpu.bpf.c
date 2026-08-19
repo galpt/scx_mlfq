@@ -126,7 +126,7 @@ mlfq_pick_idle_primary(const struct task_struct *p,
  * @now: Current time (scx_bpf_now()).
  *
  * The queue recorded in the task context reflects the previous run,
- * while the short-sleep boost and gauge decay run in ops.enqueue(),
+ * while the short-sleep boost and EMA decay run in ops.enqueue(),
  * after the CPU selection. The CPU selection must treat a wakeup that
  * is about to be promoted as interactive already, so the primary-core
  * preference applies to it from the start. SCHED_IDLE tasks are
@@ -134,9 +134,9 @@ mlfq_pick_idle_primary(const struct task_struct *p,
  *
  * The interactive signal fires when any of three conditions holds:
  * the task is already in Q1, the short-sleep boost will promote it
- * to Q1, or the decayed burst gauge maps to the interactive band
- * (gauge <= T_L). The gauge mirror uses the shared pure helper
- * mlfq_gauge_decayed() so the CPU selection and the enqueue
+ * to Q1, or the decayed EMA gauge maps to the interactive band
+ * (ema <= T_L). The gauge mirror uses the shared pure helper
+ * mlfq_ema_decay() so the CPU selection and the enqueue
  * classification agree on the same decayed gauge value.
  *
  * Return: true if the wakeup is or will become interactive.
@@ -146,26 +146,17 @@ mlfq_interactive_on_wakeup(const struct task_struct *p,
 			   const struct task_ctx *tctx, u64 now)
 {
 	u64 sleep_ns = 0;
-	u64 q_i, p_i;
 
 	if (tctx->last_sleep_at && mlfq_time_before(tctx->last_sleep_at, now))
 		sleep_ns = now - tctx->last_sleep_at;
-
-	if (tctx->queue == 1)
-		q_i = mlfq_q1_slice_ns;
-	else if (tctx->queue == 2)
-		q_i = mlfq_q2_slice_ns;
-	else
-		q_i = mlfq_q3_slice_ns;
-	p_i = q_i * MLFQ_CBS_PERIOD_MULT;
 
 	return tctx->queue == 1 ||
 	       (p->policy != MLFQ_SCHED_IDLE &&
 		(mlfq_ss_boost_pending(tctx, sleep_ns, mlfq_task_io_wait(p),
 				      now, mlfq_short_sleep_ns,
 				      mlfq_short_sleep_rate_limit_ns) ||
-		 mlfq_gauge_decayed(tctx, sleep_ns, q_i, p_i) <=
-		 mlfq_t_l_ns));
+		 mlfq_ema_decay(tctx->ema, sleep_ns,
+				mlfq_ema_half_life_ns) <= mlfq_t_l_ns));
 }
 
 s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,

@@ -72,8 +72,8 @@ enum mlfq_consts {
 
 	/*
 	 * Per-queue request sizes. The values are powers of two in nsecs
-	 * (nominal 1/2/4 ms, exact 2^20/2^21/2^22 ns) so the CBS period
-	 * decay and the cpuperf fold are pure shifts.
+	 * (nominal 1/2/4 ms, exact 2^20/2^21/2^22 ns) so the cpuperf fold
+	 * is a pure shift.
 	 */
 	MLFQ_Q1_SLICE_NS		= (1ULL << 20),
 	MLFQ_Q2_SLICE_NS		= (1ULL << 21),
@@ -87,26 +87,18 @@ enum mlfq_consts {
 	 */
 	MLFQ_TICK_NS			= (1ULL * NSEC_PER_MSEC),
 
-	/*
-	 * Ceiling of the per-task burst gauge, in nsecs. The gauge is the
-	 * clamped excess of run time over the CBS-period refunded sleep,
-	 * and the ceiling is 2^23 ns (about 8.4 ms, nominal "8 ms"), four
-	 * times the T_H threshold, so a saturated gauge sits well past the
-	 * CPU-bound edge.
-	 */
-	MLFQ_GAUGE_MAX_NS		= (1ULL << 23),
+	/* EMA interactivity gauge. */
+	MLFQ_BUDGET_MAX_NS		= (6ULL * NSEC_PER_MSEC),
+	FP_SHIFT			= 8,
+	FP_ONE				= (1ULL << FP_SHIFT),
+	MLFQ_ALPHA			= 3072ULL,
 
 	/* Classification thresholds. */
 	MLFQ_T_L_NS			= (250ULL * NSEC_PER_USEC),
-	MLFQ_T_H_NS			= (4ULL * NSEC_PER_MSEC),
+	MLFQ_T_H_NS			= (2ULL * NSEC_PER_MSEC),
 
-	/*
-	 * CBS server period multiplier. Each queue's server is (Q_q, P_q)
-	 * with P_q = MLFQ_CBS_PERIOD_MULT * Q_q, a 50 % soft reservation.
-	 * The period is a power of two because the slice is, so the period
-	 * decay is a pure shift.
-	 */
-	MLFQ_CBS_PERIOD_MULT		= 2,
+	/* EMA decay half-life. */
+	MLFQ_EMA_HALF_LIFE_NS		= (24ULL * NSEC_PER_MSEC),
 
 	/*
 	 * Consecutive slice exhaustions that gate a demotion. The run-out
@@ -131,6 +123,13 @@ enum mlfq_consts {
 
 	/* Aging. */
 	MLFQ_AGING_PERIOD_NS		= (1ULL * NSEC_PER_SEC),
+
+	/*
+	 * A sleep longer than this collapses the gauge to near zero, so
+	 * the wakeup re-adopts the base mapping. Five EMA half-lives is
+	 * 120 ms.
+	 */
+	MLFQ_LONG_SLEEP_NS		= (120ULL * NSEC_PER_MSEC),
 
 	/*
 	 * Minimum residency before a same-queue wakeup may preempt the
@@ -315,14 +314,14 @@ enum mlfq_task_flags {
  * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
  * nsecs. vruntime is on the owning queue's virtual-time clock and is
  * re-anchored to the queue's clock at every placement. The struct is
- * 96 bytes. g is the burst gauge, the classification input, and
- * last_grant_ns is the last slice grant, the FCBS slack donor.
+ * 96 bytes. ema is the EMA interactivity gauge, the classification
+ * input.
  */
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
 	s64 vlag;			/* clamped lag at placement, >= 0 */
 	u64 deadline;			/* last computed virtual deadline */
-	u64 g;				/* burst gauge [0, MLFQ_GAUGE_MAX_NS] */
+	u64 ema;			/* EMA interactivity gauge [0, MLFQ_BUDGET_MAX_NS] */
 	u64 last_run_at;		/* scx_bpf_now() at ops.running() */
 	u64 last_sleep_at;		/* scx_bpf_now() at stopping(!runnable) */
 	u64 queued_at;			/* start of the current Q2/Q3 stay */
@@ -353,10 +352,9 @@ struct task_ctx {
 	u8  last_qid;			/* queue of the last placement, 0 if none */
 	u8  pad[2];
 	/*
-	 * The last slice grant, in nsecs. Every grant path writes it, and
-	 * the FCBS slack donation at ops.stopping() compares it against
-	 * the run segment. The preempt path writes zero, so a preempt
-	 * burst never donates slack.
+	 * The last slice grant, in nsecs. Every grant path writes it. The
+	 * preempt path writes zero, so a preempt burst is not treated as a
+	 * full-service grant.
 	 */
 	u64 last_grant_ns;
 };
@@ -384,16 +382,7 @@ struct queue_ctx {
 	 */
 	u64 clock;
 	u64 max_slice_ns;		/* per-queue request size */
-	/*
-	 * FCBS reclaim bonus. bonus_ns is the unspent budget donated by
-	 * early-completing tasks, clamped to max_slice_ns, and the next
-	 * task granted a slice of this queue consumes it. bonus_since is
-	 * the scx_bpf_now() of the last deposit, the idle-decay anchor.
-	 * Both are bss-zeroed by default.
-	 */
-	u64 bonus_ns;
-	u64 bonus_since;
-	u64 pad[4];			/* one queue_ctx per cacheline */
+	u64 pad[6];			/* one queue_ctx per cacheline */
 };
 
 /*
@@ -521,11 +510,8 @@ struct mlfq_stats {
 	u64 rt_evacuations;		/* DSQ evacuation passes that ran */
 	u64 rt_redirects;		/* wakeups redirected off occupied CPUs */
 	u64 rt_reenqs;			/* SCX_ENQ_REENQ re-enqueues counted */
-	/* FCBS within-queue reclaim diagnostics. */
-	u64 fcbs_grants;		/* bonus grants consumed */
-	u64 fcbs_slack_events;		/* slack deposits made */
 	/*
-	 * The counter struct is 29 u64s = 232 bytes. The pad is a
+	 * The counter struct is 27 u64s = 216 bytes. The pad is a
 	 * zero-length marker that keeps the field count explicit.
 	 */
 	u64 pad[0];
@@ -948,90 +934,92 @@ static __always_inline bool mlfq_sameq_preempt_owed(u8 qid, u8 running_queue,
 }
 
 /**
- * mlfq_log2_pow2 - Binary logarithm of a power of two.
- * @v: A power of two.
+ * mlfq_ema_climb - Advance the EMA gauge for a run segment.
+ * @ema: Current gauge value.
+ * @delta: Physical run time in nsecs.
+ * @budget_max: Gauge ceiling (MLFQ_BUDGET_MAX_NS).
+ * @alpha: Climb aggressiveness (MLFQ_ALPHA).
  *
- * The bit position of the single set bit. The CBS period is a power of
- * two, so the period count of a sleep is a pure shift by this amount.
- * __builtin_ctzll lowers to inline bit math on both the BPF and the
- * host targets, with no division and no libcall.
+ * Saturating exponential climb:
  *
- * Return: log2(@v).
- */
-static __always_inline u32 mlfq_log2_pow2(u64 v)
-{
-	return __builtin_ctzll(v);
-}
-
-/**
- * mlfq_gauge_decay - Decay the burst gauge for a sleep.
- * @g: Current gauge value.
- * @sleep_ns: Physical sleep time in nsecs.
- * @q_i: The queue's CBS budget (the slice).
- * @p_i: The queue's CBS period (MLFQ_CBS_PERIOD_MULT * q_i).
+ *   step = (budget_max - ema) * delta * alpha / (budget_max * FP_ONE)
+ *   ema += min(step, budget_max - ema)
  *
- * The period-step decay of the burst gauge. Each full server period of
- * sleep refunds one budget, so the step is
- *
- *   periods = sleep_ns / p_i
- *   d = periods * q_i
- *   g' = g > d ? g - d : 0
- *
- * with the division implemented as a shift because p_i is a power of
- * two. The step is quantized to multiples of q_i, so a sleep shorter
- * than one period refunds nothing. A sleep of at least two gauge
- * ceilings refunds the whole gauge in every queue. The subtraction is
- * guarded, so the result is never negative.
+ * with delta clamped to budget_max. The step factorizes the remaining
+ * gap, so a CPU-bound task converges to budget_max; the rate is
+ * 1/tau_climb with tau_climb = budget_max * FP_ONE / alpha.
  *
  * Return: The updated gauge.
  */
-static __always_inline u64 mlfq_gauge_decay(u64 g, u64 sleep_ns, u64 q_i,
-					    u64 p_i)
+static __always_inline u64 mlfq_ema_climb(u64 ema, u64 delta, u64 budget_max,
+					  u64 alpha)
 {
-	u64 periods = sleep_ns >> mlfq_log2_pow2(p_i);
-	u64 d = periods * q_i;
+	u64 gap, step;
 
-	return g > d ? g - d : 0;
+	if (delta > budget_max)
+		delta = budget_max;
+	gap = budget_max - ema;
+	if (gap == 0)
+		return ema;
+
+	step = gap * delta * alpha / (budget_max * FP_ONE);
+	if (step > gap)
+		step = gap;
+	return ema + step;
 }
 
 /**
- * mlfq_gauge_decayed - Read-only gauge decay for a wakeup.
- * @tctx: The task.
+ * mlfq_ema_decay - Decay the EMA gauge for a sleep.
+ * @ema: Current gauge value.
  * @sleep_ns: Physical sleep time in nsecs.
- * @q_i: The queue's CBS budget (the slice).
- * @p_i: The queue's CBS period (MLFQ_CBS_PERIOD_MULT * q_i).
+ * @half_life: Gauge half-life (MLFQ_EMA_HALF_LIFE_NS).
  *
- * The decayed gauge value without the commit. The CPU-selection mirror
- * uses it to predict the classification result before ops.enqueue()
- * runs, so the placement and the classification agree on the same
- * decayed gauge.
+ * Shift decay with a 2nd-order Taylor residual for the sub-period:
+ * whole half-lives shift the gauge right; the fractional period is
+ * approximated by 2^-x ~= 1 - x*ln2 + (x*ln2)^2/2 in FP_ONE fixed
+ * point (relative error < 10% for x in [0,1)). The gauge is zeroed at
+ * or beyond 64 half-lives.
  *
- * Return: The gauge the wakeup classification would commit.
+ * Return: The updated gauge.
  */
-static __always_inline u64 mlfq_gauge_decayed(const struct task_ctx *tctx,
-					      u64 sleep_ns, u64 q_i, u64 p_i)
+static __always_inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
 {
-	return mlfq_gauge_decay(tctx->g, sleep_ns, q_i, p_i);
+	u64 periods, sub, x_fp, a_fp, factor_fp, decayed;
+
+	if (sleep_ns >= (half_life << 6))	/* >= 64 periods -> zero */
+		return 0;
+
+	periods = sleep_ns / half_life;
+	sub = sleep_ns % half_life;
+	decayed = ema >> periods;
+
+	if (sub == 0 || decayed == 0)
+		return decayed;
+
+	x_fp = sub * FP_ONE / half_life;
+	a_fp = x_fp * 177 / FP_ONE;		/* 177 ~= FP_ONE * ln(2) */
+	factor_fp = FP_ONE - a_fp + (a_fp * a_fp) / (FP_ONE << 1);
+	return decayed * factor_fp / FP_ONE;
 }
 
 /**
- * mlfq_queue_from_gauge - Base queue mapping from the burst gauge.
- * @g: The gauge value.
+ * mlfq_queue_from_ema - Base queue mapping from the EMA gauge.
+ * @ema: The gauge value.
  * @t_l: Interactive threshold (MLFQ_T_L_NS).
  * @t_h: CPU-bound threshold (MLFQ_T_H_NS).
  *
- * The base mapping is g <= T_L -> Q1, g >= T_H -> Q3, else Q2. The
- * mapping is never applied as a queue assignment at wakeup, where the
- * classification is promotion-only. It serves the run-out cpu-bound
- * test (g >= T_H) and the CPU-selection mirror.
+ * The base mapping is ema <= T_L -> Q1, ema >= T_H -> Q3, else Q2.
+ * The mapping is never applied as a queue assignment at wakeup, where
+ * the classification is promotion-only. It serves the run-out
+ * cpu-bound test (ema >= T_H) and the CPU-selection mirror.
  *
  * Return: 1, 2 or 3.
  */
-static __always_inline u8 mlfq_queue_from_gauge(u64 g, u64 t_l, u64 t_h)
+static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
 {
-	if (g <= t_l)
+	if (ema <= t_l)
 		return 1;
-	if (g >= t_h)
+	if (ema >= t_h)
 		return 3;
 	return 2;
 }
@@ -1049,100 +1037,6 @@ static __always_inline u8 mlfq_queue_from_gauge(u64 g, u64 t_l, u64 t_h)
 static __always_inline u8 mlfq_reenq_cnt_step(u8 cnt)
 {
 	return cnt < MLFQ_DEMOTE_EXHAUSTIONS ? cnt + 1 : MLFQ_DEMOTE_EXHAUSTIONS;
-}
-
-/**
- * mlfq_fcbs_slack - Unspent budget from an early completion.
- * @grant: The last grant given to the task (slice or Q_q + B_q).
- * @delta: The run segment length (time from running to stopping).
- *
- * FCBS slack is the difference between the budget granted and the budget
- * consumed. When the task blocks before using its full grant, the
- * remainder is donated back to the queue's bonus. When last_grant_ns is
- * zero (the preemption path, H2), the slack is zero by construction. A
- * preempt burst is not full-service budget and must not generate bonus.
- * The subtraction is guarded.
- *
- * Return: The unspent budget in nsecs.
- */
-static __always_inline u64 mlfq_fcbs_slack(u64 grant, u64 delta)
-{
-	return grant > delta ? grant - delta : 0;
-}
-
-/**
- * mlfq_queue_grant - FCBS grant, slice plus bonus.
- * @slice: The queue's CBS budget (Q_q).
- * @bonus: The consumed bonus, after idle decay and exchange.
- *
- * The bonus is bounded by Q_q (the deposit clamp), so the grant
- * is bounded by 2*Q_q. No runtime clamping is needed. The bound
- * is structural.
- *
- * Return: slice + bonus.
- */
-static __always_inline u64 mlfq_queue_grant(u64 slice, u64 bonus)
-{
-	return slice + bonus;
-}
-
-/**
- * mlfq_fcbs_deposit - Atomic FCBS bonus deposit into a queue.
- * @bonus_ns: Pointer to the queue's bonus accumulator.
- * @s: The slack to deposit (unspent budget from an early completion).
- * @q_i: The queue's max slice (Q_q), the deposit cap.
- *
- * Atomic read-modify-write: __atomic_fetch_add with a post-clamp
- * (a guarded subtract when the sum exceeds q_i). A consumed bonus
- * can never be resurrected. The exchange-to-zero at consume time
- * happens-before any later deposit, so a racing deposit cannot
- * restore a value already exchanged away (H3).
- *
- * The deposit is within-queue only. Cross-queue lag conservation
- * remains absent.
- */
-static __always_inline void mlfq_fcbs_deposit(volatile u64 *bonus_ns,
-					       u64 s, u64 q_i)
-{
-	u64 old = __atomic_fetch_add(bonus_ns, s, __ATOMIC_RELAXED);
-	u64 new_val = old + s;
-
-	if (new_val > q_i)
-		__atomic_fetch_sub(bonus_ns, new_val - q_i,
-				   __ATOMIC_RELAXED);
-}
-
-/**
- * mlfq_fcbs_consume_bonus - Consume the queue's FCBS bonus.
- * @q: The queue whose bonus to consume.
- * @slice: The base grant (Q_q).
- * @now: Current time (scx_bpf_now()).
- *
- * Read-first-conditional (perf F3). A plain read of bonus_ns. When
- * non-zero, the idle decay is computed from bonus_since and the
- * bonus is atomically exchanged to zero. The returned grant is
- * slice + decayed bonus, bounded by 2*Q_q (structural from B_q
- * <= Q_q).
- *
- * Return: The grant (slice + bonus, or slice alone when no bonus).
- */
-static __always_inline u64 mlfq_fcbs_consume_bonus(struct queue_ctx *q,
-						    u64 slice, u64 now)
-{
-	u64 cur = q->bonus_ns;	/* plain read, perf F3 */
-
-	if (!cur)
-		return slice;
-
-	u64 idle = 0;
-
-	if (q->bonus_since && mlfq_time_before(q->bonus_since, now))
-		idle = now - q->bonus_since;
-
-	u64 bonus = cur > idle ? cur - idle : 0;
-
-	__atomic_exchange_n(&q->bonus_ns, 0, __ATOMIC_RELAXED);
-	return mlfq_queue_grant(slice, bonus);
 }
 
 /**
@@ -1172,10 +1066,10 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
 	else
 		tctx->wake_cnt = 0;
 
-	if (tctx->queue == 2 && tctx->g < t_l / 2 && tctx->wake_cnt >= 2) {
+	if (tctx->queue == 2 && tctx->ema < t_l / 2 && tctx->wake_cnt >= 2) {
 		tctx->queue = 1;
 		promoted = true;
-	} else if (tctx->queue == 3 && tctx->g < t_h / 2 &&
+	} else if (tctx->queue == 3 && tctx->ema < t_h / 2 &&
 		   tctx->wake_cnt >= 2) {
 		tctx->queue = 2;
 		promoted = true;
@@ -1196,7 +1090,7 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * slice exhaustions accumulate in reenq_cnt, which saturates at
  * MLFQ_DEMOTE_EXHAUSTIONS and gates the band crossings.
  *
- * The CPU-bound test is the gauge test g >= T_H. Demotion requires a
+ * The CPU-bound test is the gauge test ema >= T_H. Demotion requires a
  * sustained run without sleeping. Eight consecutive exhaustions (about
  * 8 ms at the interactive slice) must accumulate while the task is
  * CPU-bound. A task that sleeps between bursts is re-boosted at its
@@ -1215,7 +1109,7 @@ static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
 	tctx->reenq_cnt = mlfq_reenq_cnt_step(tctx->reenq_cnt);
 
 	if ((tctx->queue == 1 || tctx->queue == 2) &&
-	    tctx->g >= t_h && tctx->reenq_cnt >= MLFQ_DEMOTE_EXHAUSTIONS) {
+	    tctx->ema >= t_h && tctx->reenq_cnt >= MLFQ_DEMOTE_EXHAUSTIONS) {
 		tctx->queue++;
 		demoted = true;
 	}
@@ -1233,7 +1127,7 @@ static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
  */
 static __always_inline void mlfq_reset_classification(struct task_ctx *tctx)
 {
-	tctx->g = 0;
+	tctx->ema = 0;
 	tctx->queue = 2;
 	tctx->reenq_cnt = 0;
 	tctx->wake_cnt = 0;
@@ -1246,9 +1140,9 @@ static __always_inline void mlfq_reset_classification(struct task_ctx *tctx)
  * BPF side reports violations via scx_bpf_error() at the natural points.
  */
 
-static __always_inline bool mlfq_check_gauge_bounds(u64 g, u64 gauge_max)
+static __always_inline bool mlfq_check_ema_bounds(u64 ema, u64 budget_max)
 {
-	return g <= gauge_max;
+	return ema <= budget_max;
 }
 
 static __always_inline bool mlfq_check_queue(u8 queue)
@@ -1264,11 +1158,6 @@ static __always_inline bool mlfq_check_weight(u32 weight)
 static __always_inline bool mlfq_check_queued_vlag(s64 vlag)
 {
 	return vlag >= 0;
-}
-
-static __always_inline bool mlfq_check_bonus_bounds(u64 bonus_ns, u64 q_i)
-{
-	return bonus_ns <= q_i;
 }
 #endif /* MLFQ_CHECK */
 

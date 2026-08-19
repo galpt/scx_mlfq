@@ -198,9 +198,12 @@ struct {
 const volatile u64 mlfq_q1_slice_ns = MLFQ_Q1_SLICE_NS;
 const volatile u64 mlfq_q2_slice_ns = MLFQ_Q2_SLICE_NS;
 const volatile u64 mlfq_q3_slice_ns = MLFQ_Q3_SLICE_NS;
-const volatile u64 mlfq_gauge_max_ns = MLFQ_GAUGE_MAX_NS;
+const volatile u64 mlfq_budget_max_ns = MLFQ_BUDGET_MAX_NS;
+const volatile u64 mlfq_alpha = MLFQ_ALPHA;
+const volatile u64 mlfq_ema_half_life_ns = MLFQ_EMA_HALF_LIFE_NS;
 const volatile u64 mlfq_t_l_ns = MLFQ_T_L_NS;
 const volatile u64 mlfq_t_h_ns = MLFQ_T_H_NS;
+const volatile u64 mlfq_long_sleep_ns = MLFQ_LONG_SLEEP_NS;
 const volatile u64 mlfq_aging_period_ns = MLFQ_AGING_PERIOD_NS;
 const volatile u64 mlfq_short_sleep_ns = MLFQ_SHORT_SLEEP_NS;
 const volatile u64 mlfq_short_sleep_rate_limit_ns = MLFQ_SHORT_SLEEP_RATE_LIMIT_NS;
@@ -386,10 +389,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	 * reachable and the gauge can never saturate past it. A
 	 * configuration that violates the order is rejected outright.
 	 */
-	if (mlfq_t_l_ns >= mlfq_t_h_ns || mlfq_t_h_ns >= mlfq_gauge_max_ns) {
+	if (mlfq_t_l_ns >= mlfq_t_h_ns || mlfq_t_h_ns >= mlfq_budget_max_ns) {
 		scx_bpf_error("thresholds out of order: T_L=%llu T_H=%llu "
-			      "G_MAX=%llu",
-			      mlfq_t_l_ns, mlfq_t_h_ns, mlfq_gauge_max_ns);
+			      "B_MAX=%llu",
+			      mlfq_t_l_ns, mlfq_t_h_ns, mlfq_budget_max_ns);
 		return -EINVAL;
 	}
 
@@ -406,9 +409,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * Initialize the per-queue request slices. The FCBS bonus state
-	 * (bonus_ns, bonus_since) is bss-zeroed by default, which is the
-	 * empty state, so the slice loop only writes the slice.
+	 * Initialize the per-queue request slices. The queue state is
+	 * bss-zeroed by default, which is the empty state, so the slice
+	 * loop only writes the slice.
 	 */
 	for (key = 1; key <= MLFQ_NR_QUEUES; key++) {
 		q = mlfq_lookup_queue(key);

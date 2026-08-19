@@ -7,7 +7,7 @@
  * init_task and enable initialize the task context. running() records
  * the running task's queue, pid, deadline and run start, the
  * wakeup-preemption inputs, and sets the cpuperf target. stopping()
- * charges vruntime, climbs the burst gauge, folds the per-CPU busy
+ * charges vruntime, climbs the EMA gauge, folds the per-CPU busy
  * window for cpuperf, and advances the owning queue's virtual clock
  * with the virtual time just charged. update_idle() maintains the
  * scheduler's idle-CPU count and per-CPU idle timestamps. exit_task()
@@ -46,7 +46,6 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 	 */
 	tctx->last_llc = MLFQ_LLC_UNOWNED;
 	tctx->last_qid = 0;
-	tctx->g = 0;
 	tctx->last_grant_ns = 0;
 	mlfq_reset_classification(tctx);
 }
@@ -173,14 +172,12 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		mlfq_update_vruntime(tctx, delta);
 
 		/*
-		 * Burst gauge climb. The segment delta adds to the gauge,
-		 * which saturates at G_MAX. The gauge is the sole
-		 * classification input, and the saturation prevents overflow
-		 * under any segment length.
+		 * EMA gauge climb. The segment delta climbs the gauge
+		 * toward the ceiling (mlfq_ema_climb saturates), so a
+		 * CPU-bound task converges to the ceiling and the
+		 * classification thresholds keep it out of Q1.
 		 */
-		tctx->g += delta;
-		if (tctx->g > MLFQ_GAUGE_MAX_NS)
-			tctx->g = MLFQ_GAUGE_MAX_NS;
+		mlfq_ema_climb_task(tctx, delta);
 
 		/*
 		 * Per-CPU busy-window fold. The window rolls when the
@@ -202,32 +199,6 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 			}
 			cpu->busy_win_ns += delta;
 			cpu->perf_level = mlfq_cpuperf_level(cpu->busy_win_ns);
-		}
-
-		/*
-		 * FCBS within-queue reclaim. When the task stops
-		 * without being runnable (early completion or sleep),
-		 * the unspent budget of its last grant is donated to
-		 * the queue's bonus. The preempt path writes
-		 * last_grant_ns = 0, so slack is zero by construction
-		 * (H2). A preempt burst is not full-service budget
-		 * and must not generate bonus.
-		 */
-		if (!runnable) {
-			u64 slack = mlfq_fcbs_slack(tctx->last_grant_ns,
-						    delta);
-
-			if (slack > 0) {
-				q = mlfq_lookup_queue(tctx->queue);
-				if (q) {
-					mlfq_fcbs_deposit(&q->bonus_ns,
-							  slack,
-							  q->max_slice_ns);
-					if (!q->bonus_since)
-						q->bonus_since = now;
-					mlfq_stat_add(fcbs_slack_events, 1);
-				}
-			}
 		}
 
 		/*

@@ -86,10 +86,6 @@ pub struct Metrics {
     pub rt_redirects: u64,
     #[stat(desc = "SCX_ENQ_REENQ re-enqueues counted at enqueue")]
     pub rt_reenqs: u64,
-    #[stat(desc = "FCBS bonus grants consumed from queue bonuses")]
-    pub fcbs_grants: u64,
-    #[stat(desc = "FCBS slack deposits from early-completing tasks")]
-    pub fcbs_slack_events: u64,
     #[stat(
         desc = "Per-op callback latency histogram, 4 ops x 8 buckets in microseconds (stopping, dispatch, enqueue, cpu_release)"
     )]
@@ -182,8 +178,7 @@ impl Metrics {
             "[{}] run={} runtime_ns={} uptime_ns={} \
              placements: Q1={} Q2={} Q3={} \
              promotions={} demotions={} aging_boosts={} short_sleep_boosts={} \
-             preemption_kicks={} cpuperf_boosts={} wakeups={} \
-             fcbs_grants={} fcbs_slack={}",
+             preemption_kicks={} cpuperf_boosts={} wakeups={}",
             crate::SCHEDULER_NAME,
             self.on_cpu,
             self.total_runtime,
@@ -198,8 +193,6 @@ impl Metrics {
             self.preemption_kicks,
             self.cpuperf_boosts,
             self.wakeup_total,
-            self.fcbs_grants,
-            self.fcbs_slack_events,
         )?;
         writeln!(
             w,
@@ -250,8 +243,6 @@ impl Metrics {
             rt_evacuations: self.rt_evacuations.wrapping_sub(rhs.rt_evacuations),
             rt_redirects: self.rt_redirects.wrapping_sub(rhs.rt_redirects),
             rt_reenqs: self.rt_reenqs.wrapping_sub(rhs.rt_reenqs),
-            fcbs_grants: self.fcbs_grants.wrapping_sub(rhs.fcbs_grants),
-            fcbs_slack_events: self.fcbs_slack_events.wrapping_sub(rhs.fcbs_slack_events),
             op_lat: self
                 .op_lat
                 .iter()

@@ -485,7 +485,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * placement and accounting resume naturally.
 	 *
 	 * The keep is an accounting freeze. While it repeats, no context
-	 * switch happens, so vruntime, the queue clock, the burst gauge
+	 * switch happens, so vruntime, the queue clock, the EMA gauge
 	 * and the cpuperf busy window see none of the real time that
 	 * passes. The freeze is bounded by competition arrival or by
 	 * @prev sleeping (the gate requires all queue DSQs empty,
@@ -527,24 +527,8 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 					remote_work = mlfq_remote_work_probe(cand, cpu);
 				}
 			if (!remote_work) {
-				/*
-				 * FCBS. The keep-path consumes the
-				 * queue's bonus, so a solo early-
-				 * completing task of queue q can collect
-				 * q's bonus and sustain ~2*Q_q grants.
-				 * The preemption path (150 us cap)
-				 * deliberately does not consume bonus.
-				 */
-				struct queue_ctx *q = mlfq_lookup_queue(qid);
-				u64 grant = q ?
-					mlfq_fcbs_consume_bonus(q, slice,
-								scx_bpf_now()) :
-					slice;
-
-				scx_bpf_task_set_slice(prev, grant);
-				tctx->last_grant_ns = grant;
-				if (grant != slice)
-					mlfq_stat_add(fcbs_grants, 1);
+				scx_bpf_task_set_slice(prev, slice);
+				tctx->last_grant_ns = slice;
 				mlfq_stat_add(keep_running, 1);
 				mlfq_op_lat_charge(MLFQ_OP_LAT_DISPATCH,
 						  op_lat_start);

@@ -9,14 +9,14 @@ holds CPU-bound tasks with 4 ms slices. Each queue is a vtime-ordered
 dispatch queue, where the virtual deadline of a task is the insertion key,
 so the kernel dispatch queue rbtree provides
 earliest-virtual-deadline-first selection. Task classification uses a
-per-task burst gauge. The gauge climbs by run time and decays at wakeup by
-a fixed-window step, so a task that has run more than it slept accumulates
-gauge and crosses the CPU-bound threshold, while a task that sleeps enough
-zeroes it. Queue moves happen only at period boundaries. Wakeup promotes,
-run-out demotes, an 8-exhaustion gate demotes tasks that repeatedly exhaust
-their slices, and an aging pass re-classifies tasks that wait in the lower
-queues for more than a second. The scheduler never demotes at wakeup. See
-`scx/README.md` for an overview of the design.
+per-task EMA interactivity gauge. The gauge climbs by run time and decays
+at wakeup by a half-life step, so a task that has run more than it slept
+accumulates gauge and crosses the CPU-bound threshold, while a task that
+sleeps enough zeroes it. Queue moves happen only at period boundaries.
+Wakeup promotes, run-out demotes, an 8-exhaustion gate demotes tasks that
+repeatedly exhaust their slices, and an aging pass re-classifies tasks
+that wait in the lower queues for more than a second. The scheduler never
+demotes at wakeup. See `scx/README.md` for an overview of the design.
 
 RT and DL tasks are scheduled by the kernel rt and dl classes. sched_ext
 sits below the fair class, so this scheduler handles non-RT tasks only.

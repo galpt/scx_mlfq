@@ -40,7 +40,16 @@ const Q3_SLICE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_Q3_SLICE_NS as u64;
 
 /// Burst gauge ceiling. The gauge saturates at this value and the
 /// CPU-bound threshold T_H must be strictly below it.
-const GAUGE_MAX_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_GAUGE_MAX_NS as u64;
+const BUDGET_MAX_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_BUDGET_MAX_NS as u64;
+
+/// EMA gauge parameters. The gauge climbs toward the ceiling with the
+/// fixed aggressiveness and decays with the half-life.
+const ALPHA: u64 = crate::bpf_intf::mlfq_consts_MLFQ_ALPHA as u64;
+const EMA_HALF_LIFE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_EMA_HALF_LIFE_NS as u64;
+
+/// A sleep longer than this collapses the gauge to near zero, so the
+/// wakeup re-adopts the base mapping.
+const LONG_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_LONG_SLEEP_NS as u64;
 
 /// Classification thresholds.
 const T_L_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_T_L_NS as u64;
@@ -86,8 +95,14 @@ pub struct Config {
     pub q2_slice_ns: u64,
     /// Q3 request size (batch), nsecs.
     pub q3_slice_ns: u64,
-    /// Burst gauge ceiling, nsecs (T_L < T_H < gauge_max).
-    pub gauge_max_ns: u64,
+    /// Burst gauge ceiling, nsecs (T_L < T_H < budget_max).
+    pub budget_max_ns: u64,
+    /// EMA climb aggressiveness.
+    pub alpha: u64,
+    /// EMA decay half-life, nsecs.
+    pub ema_half_life_ns: u64,
+    /// Sleep longer than this collapses the gauge, nsecs.
+    pub long_sleep_ns: u64,
     /// Interactive threshold T_L, nsecs.
     pub t_l_ns: u64,
     /// CPU-bound threshold T_H, nsecs.
@@ -121,7 +136,10 @@ impl Default for Config {
             q1_slice_ns: Q1_SLICE_NS,
             q2_slice_ns: Q2_SLICE_NS,
             q3_slice_ns: Q3_SLICE_NS,
-            gauge_max_ns: GAUGE_MAX_NS,
+            budget_max_ns: BUDGET_MAX_NS,
+            alpha: ALPHA,
+            ema_half_life_ns: EMA_HALF_LIFE_NS,
+            long_sleep_ns: LONG_SLEEP_NS,
             t_l_ns: T_L_NS,
             t_h_ns: T_H_NS,
             aging_period_ns: AGING_PERIOD_NS,
@@ -155,8 +173,8 @@ impl Config {
                 self.q3_slice_ns
             );
         }
-        if self.gauge_max_ns == 0 {
-            bail!("gauge_max must be non-zero");
+        if self.budget_max_ns == 0 {
+            bail!("budget_max must be non-zero");
         }
         if self.t_l_ns == 0 {
             bail!("T_L must be non-zero");
@@ -168,11 +186,11 @@ impl Config {
                 self.t_h_ns
             );
         }
-        if self.t_h_ns >= self.gauge_max_ns {
+        if self.t_h_ns >= self.budget_max_ns {
             bail!(
-                "T_H ({}) must be strictly below gauge_max ({})",
+                "T_H ({}) must be strictly below budget_max ({})",
                 self.t_h_ns,
-                self.gauge_max_ns
+                self.budget_max_ns
             );
         }
         if self.aging_period_ns == 0 {
@@ -245,7 +263,10 @@ impl Config {
         rodata.mlfq_q1_slice_ns = self.q1_slice_ns;
         rodata.mlfq_q2_slice_ns = self.q2_slice_ns;
         rodata.mlfq_q3_slice_ns = self.q3_slice_ns;
-        rodata.mlfq_gauge_max_ns = self.gauge_max_ns;
+        rodata.mlfq_budget_max_ns = self.budget_max_ns;
+        rodata.mlfq_alpha = self.alpha;
+        rodata.mlfq_ema_half_life_ns = self.ema_half_life_ns;
+        rodata.mlfq_long_sleep_ns = self.long_sleep_ns;
         rodata.mlfq_t_l_ns = self.t_l_ns;
         rodata.mlfq_t_h_ns = self.t_h_ns;
         rodata.mlfq_aging_period_ns = self.aging_period_ns;
@@ -265,7 +286,7 @@ impl Config {
     pub fn describe(&self) -> String {
         format!(
             "slices: Q1={}us Q2={}us Q3={}us, T_L={}us, T_H={}us, \
-             gauge_max={}us, cbs_period_mult=2, aging_period={}s, \
+             budget_max={}us, ema_half_life={}us, aging_period={}s, \
              short_sleep={}us, ss_rate_limit={}us, hysteresis_sleep={}us, \
              sameq_min_run={}us, preempt_slice={}us, \
              rtdl_drain_interval={}us, quotas: Q1={} Q2={} max_batch={}",
@@ -274,7 +295,8 @@ impl Config {
             self.q3_slice_ns / NSEC_PER_USEC,
             self.t_l_ns / NSEC_PER_USEC,
             self.t_h_ns / NSEC_PER_USEC,
-            self.gauge_max_ns / NSEC_PER_USEC,
+            self.budget_max_ns / NSEC_PER_USEC,
+            self.ema_half_life_ns / NSEC_PER_USEC,
             self.aging_period_ns / NSEC_PER_SEC,
             self.short_sleep_ns / NSEC_PER_USEC,
             self.short_sleep_rate_limit_ns / NSEC_PER_USEC,
@@ -305,7 +327,10 @@ pub struct ConfigBuilder {
     q1_slice_ns: Option<u64>,
     q2_slice_ns: Option<u64>,
     q3_slice_ns: Option<u64>,
-    gauge_max_ns: Option<u64>,
+    budget_max_ns: Option<u64>,
+    alpha: Option<u64>,
+    ema_half_life_ns: Option<u64>,
+    long_sleep_ns: Option<u64>,
     t_l_ns: Option<u64>,
     t_h_ns: Option<u64>,
     aging_period_ns: Option<u64>,
@@ -342,8 +367,23 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn gauge_max_ns(mut self, v: u64) -> Self {
-        self.gauge_max_ns = Some(v);
+    pub fn budget_max_ns(mut self, v: u64) -> Self {
+        self.budget_max_ns = Some(v);
+        self
+    }
+
+    pub fn alpha(mut self, v: u64) -> Self {
+        self.alpha = Some(v);
+        self
+    }
+
+    pub fn ema_half_life_ns(mut self, v: u64) -> Self {
+        self.ema_half_life_ns = Some(v);
+        self
+    }
+
+    pub fn long_sleep_ns(mut self, v: u64) -> Self {
+        self.long_sleep_ns = Some(v);
         self
     }
 
@@ -414,7 +454,10 @@ impl ConfigBuilder {
             q1_slice_ns: self.q1_slice_ns.unwrap_or(defaults.q1_slice_ns),
             q2_slice_ns: self.q2_slice_ns.unwrap_or(defaults.q2_slice_ns),
             q3_slice_ns: self.q3_slice_ns.unwrap_or(defaults.q3_slice_ns),
-            gauge_max_ns: self.gauge_max_ns.unwrap_or(defaults.gauge_max_ns),
+            budget_max_ns: self.budget_max_ns.unwrap_or(defaults.budget_max_ns),
+            alpha: self.alpha.unwrap_or(defaults.alpha),
+            ema_half_life_ns: self.ema_half_life_ns.unwrap_or(defaults.ema_half_life_ns),
+            long_sleep_ns: self.long_sleep_ns.unwrap_or(defaults.long_sleep_ns),
             t_l_ns: self.t_l_ns.unwrap_or(defaults.t_l_ns),
             t_h_ns: self.t_h_ns.unwrap_or(defaults.t_h_ns),
             aging_period_ns: self.aging_period_ns.unwrap_or(defaults.aging_period_ns),
@@ -450,8 +493,8 @@ mod tests {
     #[test]
     fn defaults_match_intf_h() {
         use crate::bpf_intf::{
-            mlfq_consts_MLFQ_AGING_PERIOD_NS, mlfq_consts_MLFQ_DISPATCH_MAX_BATCH,
-            mlfq_consts_MLFQ_GAUGE_MAX_NS, mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS,
+            mlfq_consts_MLFQ_AGING_PERIOD_NS, mlfq_consts_MLFQ_BUDGET_MAX_NS,
+            mlfq_consts_MLFQ_DISPATCH_MAX_BATCH, mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS,
             mlfq_consts_MLFQ_PREEMPT_SLICE_NS, mlfq_consts_MLFQ_Q1_QUOTA,
             mlfq_consts_MLFQ_Q1_SLICE_NS, mlfq_consts_MLFQ_Q2_QUOTA, mlfq_consts_MLFQ_Q2_SLICE_NS,
             mlfq_consts_MLFQ_Q3_SLICE_NS, mlfq_consts_MLFQ_RTDL_DRAIN_INTERVAL_NS,
@@ -465,7 +508,7 @@ mod tests {
         assert_eq!(cfg.q1_slice_ns, mlfq_consts_MLFQ_Q1_SLICE_NS as u64);
         assert_eq!(cfg.q2_slice_ns, mlfq_consts_MLFQ_Q2_SLICE_NS as u64);
         assert_eq!(cfg.q3_slice_ns, mlfq_consts_MLFQ_Q3_SLICE_NS as u64);
-        assert_eq!(cfg.gauge_max_ns, mlfq_consts_MLFQ_GAUGE_MAX_NS as u64);
+        assert_eq!(cfg.budget_max_ns, mlfq_consts_MLFQ_BUDGET_MAX_NS as u64);
         assert_eq!(cfg.t_l_ns, mlfq_consts_MLFQ_T_L_NS as u64);
         assert_eq!(cfg.t_h_ns, mlfq_consts_MLFQ_T_H_NS as u64);
         assert_eq!(cfg.aging_period_ns, mlfq_consts_MLFQ_AGING_PERIOD_NS as u64);
@@ -546,8 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_t_h_at_or_above_gauge_max() {
-        // GAUGE_MAX_NS = 2^23 = 8_388_608 ns
+    fn rejects_t_h_at_or_above_budget_max() {
+        // BUDGET_MAX_NS = 2^23 = 8_388_608 ns
         assert!(ConfigBuilder::default().t_h_ns(8_388_608).build().is_err());
         assert!(ConfigBuilder::default().t_h_ns(9_000_000).build().is_err());
     }
@@ -590,12 +633,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gauge_max_at_or_below_t_h() {
-        // gauge_max must be strictly above T_H.
-        let cfg = ConfigBuilder::default().gauge_max_ns(2_000_000).build();
-        assert!(cfg.is_err()); // gauge_max == T_H
-        let cfg = ConfigBuilder::default().gauge_max_ns(1_000_000).build();
-        assert!(cfg.is_err()); // gauge_max < T_H
+    fn rejects_budget_max_at_or_below_t_h() {
+        // budget_max must be strictly above T_H.
+        let cfg = ConfigBuilder::default().budget_max_ns(2_000_000).build();
+        assert!(cfg.is_err()); // budget_max == T_H
+        let cfg = ConfigBuilder::default().budget_max_ns(1_000_000).build();
+        assert!(cfg.is_err()); // budget_max < T_H
                                // The default band pair is valid.
         assert!(ConfigBuilder::default().build().is_ok());
     }
@@ -605,8 +648,8 @@ mod tests {
         let cfg = Config::default();
         let s = cfg.describe();
         // Slices are powers of two: Q1=2^20=1048576ns=1048us, Q2=2^21=2048us, Q3=2^22=4194us
-        assert!(s.contains("T_L=250us, T_H=4000us"));
-        assert!(s.contains("cbs_period_mult=2"));
+        assert!(s.contains("T_L=250us, T_H=2000us"));
+        assert!(s.contains("ema_half_life=24000us"));
         assert!(s.contains("aging_period=1s"));
         assert!(s.contains("rtdl_drain_interval=1000us"));
         assert!(s.contains("quotas: Q1=4 Q2=8 max_batch=32"));
