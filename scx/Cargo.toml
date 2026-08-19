@@ -1,6 +1,6 @@
 [package]
 name = "scx_mlfq"
-version = "1.3.5"
+version = "1.3.6"
 authors = ["Galih Tama <galpt@v.recipes>"]
 edition = "2021"
 description = "A multilevel feedback queue sched_ext scheduler with per-queue EEVDF virtual time. https://github.com/sched-ext/scx/tree/main"

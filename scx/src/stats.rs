@@ -8,10 +8,10 @@
 //! Stats server, `#[derive(Stats)]` metrics and monitor loop.
 //!
 //! `Metrics` corresponds to the BPF-side `struct mlfq_stats`: the type is
-//! defined in `src/bpf/intf.h` and the `volatile` instance lives in
-//! `src/bpf/main.bpf.c`, plus a userspace uptime gauge. Field names match
-//! the BPF struct 1:1. The `top` stats op reports deltas over the poll
-//! interval.
+//! defined in `src/bpf/intf.h` and lives in a per-CPU map in
+//! `src/bpf/main.bpf.c` (the front-end sums the per-CPU slots), plus a
+//! userspace uptime gauge. Field names match the BPF struct 1:1. The
+//! `top` stats op reports deltas over the poll interval.
 
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
@@ -56,14 +56,6 @@ pub struct Metrics {
     pub cpuperf_boosts: u64,
     #[stat(desc = "Dispatch moves from remote queue DSQs")]
     pub steals: u64,
-    /*
-     * The dispatch steal is split by cache domain (see the two-tier
-     * steal scan). The same-LLC tier moves work inside a domain, the
-     * cross-LLC tier moves it between domains. steals == steals_same_llc +
-     * steals_cross_llc whenever the LLC data is populated (mlfq_nr_llcs
-     * > 0). A machine with LLC awareness disabled leaves the split
-     * counters at 0 and all moves count as `steals`.
-     */
     #[stat(desc = "Dispatch moves from remote queue DSQs within the same LLC")]
     pub steals_same_llc: u64,
     #[stat(desc = "Dispatch moves from remote queue DSQs across LLC domains")]
@@ -86,17 +78,7 @@ pub struct Metrics {
     pub enq_pinned_busy: u64,
     #[stat(desc = "Pinned enqueues to the global DSQ")]
     pub enq_pinned_global: u64,
-    #[stat(desc = "MLFQ tree inference walks run")]
-    pub tree_inference: u64,
-    #[stat(desc = "Classifications served by the EMA fallback while untrained")]
-    pub tree_fallback: u64,
-    #[stat(desc = "Tree queue mappings that disagree with the base EMA mapping")]
-    pub tree_disagree: u64,
-    #[stat(desc = "Training samples emitted to the daemon")]
-    pub tree_samples_emitted: u64,
-    #[stat(desc = "Training samples dropped (ring buffer full)")]
-    pub tree_samples_dropped: u64,
-    #[stat(desc = "Realtime/DL/stop takeovers of SCX CPUs observed by the sched_switch hook")]
+    #[stat(desc = "Realtime/DL/stop takeovers of SCX CPUs observed via ops.cpu_release()")]
     pub rt_takeovers: u64,
     #[stat(desc = "DSQ evacuation passes that ran on realtime takeovers")]
     pub rt_evacuations: u64,
@@ -104,60 +86,22 @@ pub struct Metrics {
     pub rt_redirects: u64,
     #[stat(desc = "SCX_ENQ_REENQ re-enqueues counted at enqueue")]
     pub rt_reenqs: u64,
+    #[stat(desc = "FCBS bonus grants consumed from queue bonuses")]
+    pub fcbs_grants: u64,
+    #[stat(desc = "FCBS slack deposits from early-completing tasks")]
+    pub fcbs_slack_events: u64,
     #[stat(
         desc = "Per-op callback latency histogram, 4 ops x 8 buckets in microseconds (stopping, dispatch, enqueue, cpu_release)"
     )]
     pub op_lat: Vec<u64>,
-    #[stat(desc = "Training samples dropped by the per-pid window cap")]
-    pub tree_samples_cap_dropped: u64,
-    #[stat(desc = "Committed tree model generation, 0 while untrained")]
-    pub tree_model_generation: u64,
-    #[stat(desc = "Training samples behind the committed tree model")]
-    pub tree_model_samples: u64,
-    #[stat(desc = "Nodes of the committed tree model")]
-    pub tree_model_nodes: u64,
-    #[stat(
-        desc = "Committed tree MAE in microseconds on the held-out slice of its training window"
-    )]
-    pub tree_mae_tree_us: u64,
-    #[stat(desc = "Exact EMA-baseline MAE in microseconds on the same held-out slice")]
-    pub tree_mae_ema_us: u64,
-    /* Pearson correlation of the committed model's burst predictions
-     * with the labels on its held-out slice, scaled by 1000. Web UI
-     * only, so it carries no stat description. */
-    pub tree_corr_milli: i64,
-    /*
-     * System wakeup gauges and the effective adaptation state. The
-     * gauges and the effective values are instantaneous pass-throughs
-     * (the top op reports them as-is, like uptime_ns). The two counters
-     * are interval deltas like the placement counters.
-     */
-    #[stat(desc = "System wakeup-latency gauge (1s half-life EMA), microseconds")]
-    pub sys_lat_ema_us: u64,
-    #[stat(desc = "System wakeup-rate gauge (1s half-life EMA), fixed point; >> 8 = wakeups/s")]
-    pub sys_rate_ema: u64,
-    #[stat(desc = "Effective EMA Q1/Q2 band edge, microseconds")]
-    pub t_l_eff_us: u64,
-    #[stat(desc = "Effective EMA Q2/Q3 band edge, microseconds")]
-    pub t_h_eff_us: u64,
-    #[stat(desc = "Effective tree Q1/Q2 band edge, microseconds")]
-    pub t_int_eff_us: u64,
-    #[stat(desc = "Effective tree Q2/Q3 band edge, microseconds")]
-    pub t_bnd_eff_us: u64,
-    #[stat(desc = "Effective same-queue preemption residency guard, microseconds")]
-    pub guard_eff_us: u64,
-    #[stat(desc = "Adaptation shift, fixed point (FP_ONE = 1.0)")]
-    pub adapt_shift: i64,
     #[stat(desc = "Wakeup arrivals (interval delta)")]
     pub wakeup_total: u64,
-    #[stat(desc = "Adaptation steps run (interval delta)")]
-    pub adapt_steps: u64,
 }
 
 /// One entry of the web UI's per-CPU card grid.
 ///
 /// The static fields (`freq_khz`, `llc_id`, `smt`) are seeded once at
-/// attach from the host topology (`topology::web_cpu_static`); the
+/// attach from the host topology (`topology::web_cpu_static`). The
 /// dynamic fields (`running_queue`, `running_pid`, `rt_occupied`) are
 /// refreshed from the BPF per-CPU maps on every web-metrics poll. The
 /// carriers do not take part in the stats server's `delta()` accounting.
@@ -187,7 +131,7 @@ pub struct PerCpuMetrics {
 /// Snapshot served by the web UI's `/api/stats` endpoint.
 ///
 /// The run loop pushes one of these every iteration (both the stats
-/// request and the idle-timeout branches); the webui thread keeps the
+/// request and the idle-timeout branches). The webui thread keeps the
 /// newest snapshot behind a mutex for the HTTP handlers. All fields are
 /// instantaneous gauges, not interval deltas: the gauges bypass the
 /// stats server's `delta()` entirely.
@@ -197,7 +141,7 @@ pub struct WebMetrics {
     pub stats: Metrics,
     /// One entry per online CPU.
     pub per_cpu: Vec<PerCpuMetrics>,
-    /// Tracked runnable tasks per queue; index 0 unused, 1..3 = Q1..Q3.
+    /// Tracked runnable tasks per queue. Index 0 unused, 1..3 = Q1..Q3.
     pub queue_runnable: Vec<u64>,
     /// Tracked runnable tasks per LLC domain.
     pub llc_runnable: Vec<u64>,
@@ -238,7 +182,8 @@ impl Metrics {
             "[{}] run={} runtime_ns={} uptime_ns={} \
              placements: Q1={} Q2={} Q3={} \
              promotions={} demotions={} aging_boosts={} short_sleep_boosts={} \
-             preemption_kicks={} cpuperf_boosts={}",
+             preemption_kicks={} cpuperf_boosts={} wakeups={} \
+             fcbs_grants={} fcbs_slack={}",
             crate::SCHEDULER_NAME,
             self.on_cpu,
             self.total_runtime,
@@ -252,23 +197,9 @@ impl Metrics {
             self.short_sleep_boosts,
             self.preemption_kicks,
             self.cpuperf_boosts,
-        )?;
-        writeln!(
-            w,
-            "[{}] tree: gen={} nodes={} samples={} mae_tree={}us mae_ema={}us \
-             inf={} fallback={} disagree={} emitted={} dropped={} cap_dropped={}",
-            crate::SCHEDULER_NAME,
-            self.tree_model_generation,
-            self.tree_model_nodes,
-            self.tree_model_samples,
-            self.tree_mae_tree_us,
-            self.tree_mae_ema_us,
-            self.tree_inference,
-            self.tree_fallback,
-            self.tree_disagree,
-            self.tree_samples_emitted,
-            self.tree_samples_dropped,
-            self.tree_samples_cap_dropped,
+            self.wakeup_total,
+            self.fcbs_grants,
+            self.fcbs_slack_events,
         )?;
         writeln!(
             w,
@@ -284,27 +215,11 @@ impl Metrics {
             fmt_op_lat(self.op_lat.get(16..24).unwrap_or(&[])),
             fmt_op_lat(self.op_lat.get(24..32).unwrap_or(&[])),
         )?;
-        writeln!(
-            w,
-            "[{}] adapt: lat_ema={}us rate_ema={}w/s shift={}% T_L_eff={}us T_H_eff={}us T_INT_eff={}us T_BND_eff={}us guard_eff={}us wakeups={} steps={}",
-            crate::SCHEDULER_NAME,
-            self.sys_lat_ema_us,
-            self.sys_rate_ema >> crate::bpf_intf::mlfq_consts_FP_SHIFT,
-            self.adapt_shift * 100 / crate::bpf_intf::mlfq_consts_FP_ONE as i64,
-            self.t_l_eff_us,
-            self.t_h_eff_us,
-            self.t_int_eff_us,
-            self.t_bnd_eff_us,
-            self.guard_eff_us,
-            self.wakeup_total,
-            self.adapt_steps,
-        )?;
         Ok(())
     }
 
     /// Interval delta. Counters are wrapping deltas over the poll interval.
-    /// Gauges (`on_cpu`, `uptime_ns`, the tree model metadata) pass through
-    /// as instantaneous values.
+    /// Gauges (`on_cpu`, `uptime_ns`) pass through as instantaneous values.
     pub fn delta(&self, rhs: &Self) -> Self {
         Self {
             on_cpu: self.on_cpu,
@@ -331,47 +246,19 @@ impl Metrics {
             enq_pinned_idle: self.enq_pinned_idle.wrapping_sub(rhs.enq_pinned_idle),
             enq_pinned_busy: self.enq_pinned_busy.wrapping_sub(rhs.enq_pinned_busy),
             enq_pinned_global: self.enq_pinned_global.wrapping_sub(rhs.enq_pinned_global),
-            tree_inference: self.tree_inference.wrapping_sub(rhs.tree_inference),
-            tree_fallback: self.tree_fallback.wrapping_sub(rhs.tree_fallback),
-            tree_disagree: self.tree_disagree.wrapping_sub(rhs.tree_disagree),
-            tree_samples_emitted: self
-                .tree_samples_emitted
-                .wrapping_sub(rhs.tree_samples_emitted),
-            tree_samples_dropped: self
-                .tree_samples_dropped
-                .wrapping_sub(rhs.tree_samples_dropped),
             rt_takeovers: self.rt_takeovers.wrapping_sub(rhs.rt_takeovers),
             rt_evacuations: self.rt_evacuations.wrapping_sub(rhs.rt_evacuations),
             rt_redirects: self.rt_redirects.wrapping_sub(rhs.rt_redirects),
             rt_reenqs: self.rt_reenqs.wrapping_sub(rhs.rt_reenqs),
-            /* The histogram is a per-interval delta like the counters. */
+            fcbs_grants: self.fcbs_grants.wrapping_sub(rhs.fcbs_grants),
+            fcbs_slack_events: self.fcbs_slack_events.wrapping_sub(rhs.fcbs_slack_events),
             op_lat: self
                 .op_lat
                 .iter()
                 .zip(rhs.op_lat.iter())
                 .map(|(lhs, rhs)| lhs.wrapping_sub(*rhs))
                 .collect(),
-            tree_samples_cap_dropped: self
-                .tree_samples_cap_dropped
-                .wrapping_sub(rhs.tree_samples_cap_dropped),
-            /* Model metadata is a gauge: the currently committed model. */
-            tree_model_generation: self.tree_model_generation,
-            tree_model_samples: self.tree_model_samples,
-            tree_model_nodes: self.tree_model_nodes,
-            tree_mae_tree_us: self.tree_mae_tree_us,
-            tree_mae_ema_us: self.tree_mae_ema_us,
-            tree_corr_milli: self.tree_corr_milli,
-            /* Gauges pass through; the adaptation counters are deltas. */
-            sys_lat_ema_us: self.sys_lat_ema_us,
-            sys_rate_ema: self.sys_rate_ema,
-            t_l_eff_us: self.t_l_eff_us,
-            t_h_eff_us: self.t_h_eff_us,
-            t_int_eff_us: self.t_int_eff_us,
-            t_bnd_eff_us: self.t_bnd_eff_us,
-            guard_eff_us: self.guard_eff_us,
-            adapt_shift: self.adapt_shift,
             wakeup_total: self.wakeup_total.wrapping_sub(rhs.wakeup_total),
-            adapt_steps: self.adapt_steps.wrapping_sub(rhs.adapt_steps),
         }
     }
 }

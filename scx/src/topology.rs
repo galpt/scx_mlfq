@@ -46,19 +46,19 @@ use crate::bpf_intf::mlfq_consts_MLFQ_MAX_LLCS;
 use crate::bpf_intf::mlfq_consts_MLFQ_MAX_LLC_CPUS;
 use crate::bpf_intf::mlfq_llc_cpu_list;
 
-/// Compile-time CPU bound; must match `MLFQ_MAX_CPUS` in `src/bpf/intf.h`.
+/// Compile-time CPU bound. Must match `MLFQ_MAX_CPUS` in `src/bpf/intf.h`.
 const MAX_CPUS: usize = mlfq_consts_MLFQ_MAX_CPUS as usize;
 
-/// Compile-time LLC bound; must match `MLFQ_MAX_LLCS` in `src/bpf/intf.h`.
+/// Compile-time LLC bound. Must match `MLFQ_MAX_LLCS` in `src/bpf/intf.h`.
 const MAX_LLCS: usize = mlfq_consts_MLFQ_MAX_LLCS as usize;
 
-/// Compile-time per-LLC CPU-list bound; must match `MLFQ_MAX_LLC_CPUS`
+/// Compile-time per-LLC CPU-list bound. Must match `MLFQ_MAX_LLC_CPUS`
 /// in `src/bpf/intf.h`.
 const MAX_LLC_CPUS: usize = mlfq_consts_MLFQ_MAX_LLC_CPUS as usize;
 
 /// Whether SMT is active on the host, read from the kernel's
 /// `/sys/devices/system/cpu/smt/active` interface. The knob is absent on
-/// systems without SMT support; a missing or unreadable knob yields
+/// systems without SMT support. A missing or unreadable knob yields
 /// `None`, so the caller can omit the SMT annotation from the startup
 /// banner rather than guessing.
 pub fn smt_enabled() -> Option<bool> {
@@ -70,10 +70,10 @@ pub fn smt_enabled() -> Option<bool> {
 /// logic is unit-testable without touching the host topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapacityPlan {
-    /// True when every CPU is treated as primary: uniform-capacity system,
-    /// or the primary set could not be determined.
+    /// True when every CPU is treated as primary. This is the uniform-capacity
+    /// system, or the primary set could not be determined.
     pub primary_all: bool,
-    /// CPUs to add to the primary mask (sorted, deduplicated); empty when
+    /// CPUs to add to the primary mask (sorted, deduplicated). Empty when
     /// `primary_all` is true.
     pub primary_cpus: Vec<u32>,
 }
@@ -81,7 +81,7 @@ pub struct CapacityPlan {
 /// Decide the primary set from the discovered big cores.
 ///
 /// A primary list covering every online CPU means there is no capacity
-/// asymmetry to exploit; an empty list means discovery produced no usable
+/// asymmetry to exploit. An empty list means discovery produced no usable
 /// data. Both fall back to the uniform-capacity behavior.
 pub fn plan_primary_mask(primary_cpus: &[u32], nr_online: usize) -> CapacityPlan {
     if primary_cpus.is_empty() || primary_cpus.len() >= nr_online {
@@ -106,12 +106,12 @@ pub fn plan_primary_mask(primary_cpus: &[u32], nr_online: usize) -> CapacityPlan
 pub struct LlcPlan {
     /// Number of LLC domains (0 disables the LLC step entirely).
     pub nr_llcs: u32,
-    /// Per-LLC: 1 if the domain contains at least one primary (big) core.
+    /// Per-LLC. 1 if the domain contains at least one primary (big) core.
     pub has_primary: [u8; MAX_LLCS],
-    /// Per-LLC: the CPUs of that domain.
+    /// Per-LLC. The CPUs of that domain.
     pub llc_cpus: Vec<Vec<u32>>,
     /// Per-CPU LLC domain id (MLFQ_MAX_LLCS, the sentinel, when the CPU
-    /// is unknown or out of range; only known online CPUs get a real
+    /// is unknown or out of range. Only known online CPUs get a real
     /// domain id).
     pub cpu_llc: [u32; MAX_CPUS],
 }
@@ -174,7 +174,7 @@ pub fn plan_llcs(cpu_to_llc: &[(u32, u32)], primary_cpus: &[u32], max_llcs: usiz
 pub struct SiblingPlan {
     /// True when any online CPU has a sibling sharing its physical core.
     pub smt_on: bool,
-    /// Per-CPU: the lowest-id other CPU sharing the core, or the CPU
+    /// Per-CPU. The lowest-id other CPU sharing the core, or the CPU
     /// itself when the core is unpaired or the CPU is unknown.
     pub cpu_sibling: [u32; MAX_CPUS],
 }
@@ -220,7 +220,7 @@ pub fn plan_sibling_table(cpu_to_core: &[(u32, u32)]) -> SiblingPlan {
 
 /// Parse a kernel cache size string ("32M", "16384K", plain bytes) into
 /// bytes. The kernel exposes cache sizes in the human-readable form
-/// with a K/M/G suffix; a parse failure yields `None`.
+/// with a K/M/G suffix. A parse failure yields `None`.
 fn parse_cache_size(size: &str) -> Option<u64> {
     let s = size.trim();
     let (num, mult) = if let Some(v) = s.strip_suffix('K') {
@@ -241,9 +241,9 @@ fn parse_cache_size(size: &str) -> Option<u64> {
 /// directories each describe one cache level with `level`/`type`/`size`
 /// (and, on machines that expose it, `id`) files. The LLC level is the
 /// index whose `id` matches the CPU's kernel `topology/llc_id` (both
-/// describe the same level); on machines whose index entries carry no
+/// describe the same level). On machines whose index entries carry no
 /// `id` file, the deepest (largest `level`) index is used. A per-entry
-/// read failure skips that entry; a failure of the whole discovery
+/// read failure skips that entry. A failure of the whole discovery
 /// yields `None` and the caller falls back to 0 for the domain.
 fn llc_size_bytes(cache_path: &Path) -> Option<u64> {
     let cpu_path = cache_path.parent()?;
@@ -292,7 +292,7 @@ fn llc_size_bytes(cache_path: &Path) -> Option<u64> {
 /// than two domains, or two or more domains tied for the largest size
 /// (including the all-zeros case of a fully failed discovery), there is
 /// no capacity win to exploit and the feature stays off (`None`).
-/// `sizes` is indexed by LLC domain id; only the first `nr_llcs`
+/// `sizes` is indexed by LLC domain id. Only the first `nr_llcs`
 /// entries are considered.
 pub fn pick_largest_llc(sizes: &[u64], nr_llcs: u32) -> Option<u32> {
     if (nr_llcs as usize) < 2 {
@@ -373,7 +373,7 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
         llcs.has_primary.fill(1);
     }
 
-    // SMT sibling preference table: the lowest-id sibling per core.
+    // SMT sibling preference table. The lowest-id sibling per core.
     let sibling = plan_sibling_table(
         &topo
             .all_cpus
@@ -382,9 +382,9 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
             .collect::<Vec<_>>(),
     );
 
-    // Largest-LLC bias: per-domain cache sizes from a representative
+    // Largest-LLC bias. Per-domain cache sizes from a representative
     // CPU of each domain, then the strictly-largest winner. Every read is
-    // best-effort; a failure leaves that domain's size at 0 and a full
+    // best-effort. A failure leaves that domain's size at 0 and a full
     // failure ties the zeros into the sentinel (feature off).
     let mut llc_sizes = vec![0u64; llcs.nr_llcs as usize];
     for (llc, size) in llc_sizes.iter_mut().enumerate() {
@@ -471,11 +471,11 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
         .collect();
     let llcs = plan_llcs(&cpu_to_llc, &primaries, MAX_LLCS);
 
-    // The SMT badge marks the non-primary thread of a core: the lowest
+    // The SMT badge marks the non-primary thread of a core. The lowest
     // id in the core is the primary, the same anchor convention the
     // sibling table uses for the wakeup-preference path, and every
     // other thread of the core is its virtual sibling. The badge is
-    // display-only; the scheduling path reads the sibling table, not
+    // display-only. The scheduling path reads the sibling table, not
     // this flag.
     let cpu_to_core: Vec<(u32, u32)> = topo
         .all_cpus
@@ -494,7 +494,7 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
         .iter()
         .map(|(id, cpu)| {
             // The placement path's MLFQ_MAX_LLCS sentinel (an unmapped
-            // or unknown CPU) is mapped to 0 for display: the UI shows
+            // or unknown CPU) is mapped to 0 for display. The UI shows
             // the LLC id as-is, and "no LLC" is the field's documented
             // convention, not a sentinel value from the placement side.
             let llc_id = llcs.cpu_llc.get(*id).copied().unwrap_or(0);
@@ -523,7 +523,7 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
 
 /// Read a CPU's current operating frequency from sysfs, in kHz. The
 /// `scaling_cur_freq` file reflects the live frequency of the CPU,
-/// whatever the governor is doing; a missing or unreadable file (no
+/// whatever the governor is doing. A missing or unreadable file (no
 /// cpufreq driver) yields 0.
 pub fn current_freq_khz(cpu: u32) -> u64 {
     std::fs::read_to_string(format!(
@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn full_primary_list_is_uniform() {
-        // Every online CPU is primary: no asymmetry to exploit.
+        // Every online CPU is primary. No asymmetry to exploit.
         let plan = plan_primary_mask(&[0, 1, 2, 3, 4, 5, 6, 7], 8);
         assert!(plan.primary_all);
     }
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn llc_plan_disables_when_exceeding_cap() {
-        // 33 domains exceed the 32-domain bound: disable LLC awareness.
+        // 33 domains exceed the 32-domain bound. LLC awareness is disabled.
         let map: Vec<(u32, u32)> = (0..33).map(|i| (i, i)).collect();
         let plan = plan_llcs(&map, &[], MAX_LLCS);
         assert_eq!(plan.nr_llcs, 0);
@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     fn smt_pair_table() {
-        // Two SMT pairs over four CPUs / two cores: each CPU points at
+        // Two SMT pairs over four CPUs / two cores. Each CPU points at
         // the other member of its core.
         let plan = plan_sibling_table(&[(0, 0), (1, 0), (2, 1), (3, 1)]);
         assert!(plan.smt_on);
@@ -860,7 +860,7 @@ mod tests {
         assert!(plan.smt_on);
         assert_eq!(plan.cpu_sibling[0], 1);
         assert_eq!(plan.cpu_sibling[1], 0);
-        // The unpaired core's CPU has no sibling: itself.
+        // The unpaired core's CPU has no sibling. It points at itself.
         assert_eq!(plan.cpu_sibling[2], 2);
     }
 
@@ -899,13 +899,13 @@ mod tests {
 
     #[test]
     fn largest_llc_all_zero_sizes_tie_to_disabled() {
-        // Fully failed discovery: every size reads 0 and the zeros tie.
+        // Fully failed discovery. Every size reads 0 and the zeros tie.
         assert_eq!(pick_largest_llc(&[0, 0, 0], 3), None);
     }
 
     #[test]
     fn largest_llc_unreadable_domain_reads_zero() {
-        // One domain's size read failed (0): the other is strictly
+        // One domain's size read failed (0). The other is strictly
         // largest and wins.
         assert_eq!(pick_largest_llc(&[16, 0], 2), Some(0));
     }
@@ -921,8 +921,8 @@ mod tests {
 
     #[test]
     fn llc_size_bytes_picks_the_llc_index_by_id() {
-        // Fake sysfs: index0 is the L2 (id 4), index1 the LLC (id 7);
-        // the CPU's topology llc_id selects the LLC entry.
+        // Fake sysfs layout. Index0 is the L2 (id 4), index1 the LLC (id 7).
+        // The CPU's topology llc_id selects the LLC entry.
         let dir = std::env::temp_dir().join(format!("scx_mlfq_cache_id_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("cpu0/cache/index0")).unwrap();
         std::fs::create_dir_all(dir.join("cpu0/cache/index1")).unwrap();
@@ -942,7 +942,7 @@ mod tests {
 
     #[test]
     fn llc_size_bytes_falls_back_to_deepest_level_without_id() {
-        // No id files and no topology llc_id: the deepest index wins.
+        // No id files and no topology llc_id. The deepest index wins.
         let dir = std::env::temp_dir().join(format!("scx_mlfq_cache_noid_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("cpu0/cache/index0")).unwrap();
         std::fs::create_dir_all(dir.join("cpu0/cache/index1")).unwrap();

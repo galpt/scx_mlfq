@@ -2,9 +2,9 @@
   SPDX-License-Identifier: GPL-2.0
   Copyright (c) 2026 Galih Tama <galpt@v.recipes>
 
-  scx_mlfq web UI: a live view of the scheduler's per-CPU state and
+  scx_mlfq web UI, a live view of the scheduler's per-CPU state and
   system-wide counters, served by src/webui.rs over loopback port 50005
-  (or the /tmp/scx_mlfq.sock unix-socket fallback). Offline-first: no
+  (or the /tmp/scx_mlfq.sock unix-socket fallback). Offline-first, with no
   external fonts or libraries.
 -->
 <!doctype html>
@@ -121,7 +121,7 @@
     <header class="card" style="margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:12px;">
       <div style="min-width:0;overflow:hidden">
         <h1 style="font-size:1.25rem;font-weight:700">scx_mlfq stats</h1>
-        <p style="font-size:0.8125rem;color:var(--text-secondary);margin-top:2px">multilevel feedback queues, virtual time, placement, stealing and realtime pressure</p>
+        <p style="font-size:0.8125rem;color:var(--text-secondary);margin-top:2px">fixed-window burst gauge, 3-queue EEVDF, FCBS budget reclaim</p>
       </div>
       <div id="status-badge" style="font-size:0.75rem;padding:3px 10px;border-radius:999px;border:1px solid var(--success);color:var(--success);font-family:var(--font-mono);white-space:nowrap">
         ● running
@@ -166,16 +166,9 @@
         <div><span style="color:var(--text-muted)">RT evacuations:</span> <span class="stat-value" id="rt-evacuations">0</span></div>
         <div><span style="color:var(--text-muted)">RT redirects:</span> <span class="stat-value" id="rt-redirects">0</span></div>
         <div><span style="color:var(--text-muted)">RT reenqs:</span> <span class="stat-value" id="rt-reenqs">0</span></div>
-        <div><span style="color:var(--text-muted)">Tree gen:</span> <span class="stat-value" id="tree-gen">0</span></div>
-        <div><span style="color:var(--text-muted)">Tree nodes:</span> <span class="stat-value" id="tree-nodes">0</span></div>
-        <div><span style="color:var(--text-muted)">Tree MAE:</span> <span class="stat-value" id="tree-mae">0</span></div>
-        <div><span style="color:var(--text-muted)">Tree corr:</span> <span class="stat-value" id="tree-corr">0</span></div>
-        <div><span style="color:var(--text-muted)">Wakeup lat:</span> <span class="stat-value" id="wakeup-lat">0</span><span style="color:var(--text-muted)"> us</span></div>
-        <div><span style="color:var(--text-muted)">Wakeup rate:</span> <span class="stat-value" id="wakeup-rate">0</span><span style="color:var(--text-muted)"> /s</span></div>
-        <div><span style="color:var(--text-muted)">T_L / T_H eff:</span> <span class="stat-value" id="t-l-eff">0</span><span style="color:var(--text-muted)"> / </span><span class="stat-value" id="t-h-eff">0</span><span style="color:var(--text-muted)"> us</span></div>
-        <div><span style="color:var(--text-muted)">T_INT / T_BND eff:</span> <span class="stat-value" id="t-int-eff">0</span><span style="color:var(--text-muted)"> / </span><span class="stat-value" id="t-bnd-eff">0</span><span style="color:var(--text-muted)"> us</span></div>
-        <div><span style="color:var(--text-muted)">Guard eff:</span> <span class="stat-value" id="guard-eff">0</span><span style="color:var(--text-muted)"> us</span></div>
-        <div><span style="color:var(--text-muted)">Adapt shift:</span> <span class="stat-value" id="adapt-shift">0</span><span style="color:var(--text-muted)"> %</span></div>
+        <div><span style="color:var(--text-muted)">FCBS grants:</span> <span class="stat-value" id="fcbs-grants">0</span></div>
+        <div><span style="color:var(--text-muted)">FCBS slack:</span> <span class="stat-value" id="fcbs-slack">0</span></div>
+        <div><span style="color:var(--text-muted)">Wakeup total:</span> <span class="stat-value" id="wakeup-total">0</span></div>
         <div style="grid-column:1/-1">
           <span style="color:var(--text-muted)">LLC loads:</span>
           <span id="llc-runnable" style="display:inline-flex;flex-wrap:wrap;gap:4px;margin-left:4px"></span>
@@ -196,14 +189,6 @@
   <script>
     const el = (id) => document.getElementById(id);
 
-    // Fixed-point layout of the BPF gauges (FP_SHIFT in intf.h).
-    const FP_SHIFT = 8;
-    const FP_ONE = 1 << FP_SHIFT;
-    // A published-model correlation above this threshold counts as the
-    // model tracking the workload. The scheduler publishes only models
-    // that beat the EMA baseline on the held-out slice, so the
-    // threshold separates a meaningful fit from a weak one.
-    const SUMMARY_GOOD_CORR = 0.3;
     // Latency bucket edges in microseconds, mirroring the MLFQ_OP_LAT_*
     // constants in src/bpf/intf.h. Eight buckets from these seven edges.
     const OP_LAT_EDGES_US = [2, 5, 10, 20, 50, 100, 250];
@@ -230,6 +215,10 @@
       if (hr < 24) return hr.toFixed(1) + ' hr';
       var day = hr / 24;
       return day.toFixed(1) + ' days';
+    }
+
+    function fmtNs(us) {
+      return fmt(Math.round(us));
     }
 
     // One op's eight latency buckets as "low-high=count" pairs, mirroring
@@ -274,37 +263,51 @@
       }).join('');
     }
 
-    // Summary prose, built from the live stats with the scheduler's
-    // published rules: the committed model is the one that beat the EMA
-    // baseline on its held-out slice, and its Pearson correlation with
-    // the measured bursts is the fit number. The wakeup-rate gauge
-    // reads zero only in the first second after attach, before the
-    // first adaptation fold, so the sentence follows the data. A model
-    // that has not been published yet gets the still-learning wording
-    // instead.
+    // Summary prose built from the live stats. The scheduler classifies
+    // with a fixed-window burst gauge and CBS per-queue servers. The
+    // gauge crosses its CPU-bound threshold within one scheduling period.
     function buildSummary(s) {
-      var lat = Math.round(s.sys_lat_ema_us || 0);
-      var rate = (s.sys_rate_ema || 0) >> FP_SHIFT;
-      var maeTree = Math.round(s.tree_mae_tree_us || 0);
-      var maeEma = Math.round(s.tree_mae_ema_us || 0);
-      var corr = (s.tree_corr_milli || 0) / 1000;
-      var trained = (s.tree_model_generation || 0) > 0;
+      var promos = s.promotions || 0;
+      var demotes = s.demotions || 0;
+      var ages = s.aging_boosts || 0;
+      var boosts = s.short_sleep_boosts || 0;
+      var grants = s.fcbs_grants || 0;
+      var wakes = s.wakeup_total || 0;
+      var steals = s.steals || 0;
+      var onCpu = s.on_cpu || 0;
+
+      var demoteRate = wakes > 0 ? demotes / wakes : 0;
+      var promoRate = wakes > 0 ? (promos + ages + boosts) / wakes : 0;
+
       var tldr, explanation;
-      if (!trained) {
-        tldr = 'MLFQ is working as expected and is still learning your workload.';
-        explanation = 'The classification model has not been published yet, so it is still collecting samples from your task behavior. ' +
-          'As you can see from the wakeup-latency gauge, it shows ' + lat + ' us. ' +
-          'Based on the internal rules of this scheduler, a model is published only when it beats the EMA baseline on its held-out slice, and this shows that MLFQ is adapting correctly to your workload.';
+      if (wakes === 0) {
+        tldr = 'scx_mlfq is running but has not observed any wakeups yet.';
+        explanation = 'The scheduler is idle. Wakeup activity will appear once tasks start running.';
+      } else if (demoteRate < 0.01 && promoRate > 0) {
+        tldr = 'scx_mlfq is working as expected. The workload is predominantly interactive.';
+        explanation = 'The burst gauge shows that most tasks are sleeping frequently enough to stay in Q1. ' +
+          'Wakeup promotions and the short-sleep boost are keeping latency low. ' +
+          fmt(promos + ages + boosts) + ' tasks were promoted to higher queues.';
+      } else if (demoteRate > 0.05) {
+        tldr = 'scx_mlfq is working as expected and adapting to the workload.';
+        explanation = 'The burst gauge is actively classifying tasks. ' +
+          fmt(demotes) + ' sustained consumers were demoted to lower queues, while ' +
+          fmt(promos + ages + boosts) + ' interactive tasks were promoted. ' +
+          'This is the expected behavior for a mixed interactive and batch workload.';
       } else {
-        tldr = corr > SUMMARY_GOOD_CORR
-          ? 'MLFQ is working as expected and is adapting correctly to your workload.'
-          : 'MLFQ is working as expected and is still adapting to your workload.';
-        explanation = 'As you can see from the wakeup-latency gauge, it shows ' + lat + ' us. ' +
-          (rate > 0
-            ? 'The wakeup-rate gauge shows ' + fmt(rate) + ' per second, '
-            : 'The wakeup-rate gauge is still warming up, ') +
-          'and the classification model reports a mean absolute error of ' + maeTree + ' us, against ' + maeEma + ' us for the EMA gauge. ' +
-          'Based on the internal rules of this scheduler, the final result is a model correlation of ' + corr.toFixed(2) + ', and this shows that MLFQ is correctly adapting to your workload.';
+        tldr = 'scx_mlfq is working as expected.';
+        explanation = 'The burst gauge is classifying tasks across all three queues. ' +
+          'Promotions, demotions, and aging are all operating normally.';
+      }
+
+      if (steals > 0) {
+        explanation += ' Idle CPUs are stealing owed tasks across ' + fmt(steals) + ' steal events.';
+      }
+      if (grants > 0) {
+        explanation += ' ' + fmt(grants) + ' budget grants were reclaimed from early-completing tasks.';
+      }
+      if (onCpu > 0) {
+        explanation += ' ' + fmt(onCpu) + ' tasks are currently on CPU.';
       }
       return { tldr: tldr, explanation: explanation };
     }
@@ -338,27 +341,9 @@
       el('rt-evacuations').textContent = fmt(s.rt_evacuations || 0);
       el('rt-redirects').textContent = fmt(s.rt_redirects || 0);
       el('rt-reenqs').textContent = fmt(s.rt_reenqs || 0);
-      el('tree-gen').textContent = fmt(s.tree_model_generation || 0);
-      el('tree-nodes').textContent = fmt(s.tree_model_nodes || 0);
-      el('tree-mae').textContent = fmt(s.tree_mae_tree_us || 0) + ' us';
-      el('tree-corr').textContent = ((s.tree_corr_milli || 0) / 1000).toFixed(2);
-
-      var summary = buildSummary(s);
-      el('summary-tldr').textContent = summary.tldr;
-      el('summary-explanation').textContent = summary.explanation;
-
-      // Adaptation gauges. The wakeup-rate gauge is fixed point
-      // (FP_SHIFT 8), the shift is fixed point too and shown as a percent
-      // of the base band width.
-      el('wakeup-lat').textContent = fmt(s.sys_lat_ema_us || 0);
-      el('wakeup-rate').textContent = fmt((s.sys_rate_ema || 0) >> FP_SHIFT);
-      el('t-l-eff').textContent = fmt(s.t_l_eff_us || 0);
-      el('t-h-eff').textContent = fmt(s.t_h_eff_us || 0);
-      el('t-int-eff').textContent = fmt(s.t_int_eff_us || 0);
-      el('t-bnd-eff').textContent = fmt(s.t_bnd_eff_us || 0);
-      el('guard-eff').textContent = fmt(s.guard_eff_us || 0);
-      var shiftPct = ((s.adapt_shift || 0) * 100 / FP_ONE);
-      el('adapt-shift').textContent = shiftPct.toFixed(1);
+      el('wakeup-total').textContent = fmt(s.wakeup_total || 0);
+      el('fcbs-grants').textContent = fmt(s.fcbs_grants || 0);
+      el('fcbs-slack').textContent = fmt(s.fcbs_slack_events || 0);
 
       // Per-LLC runnable occupancy. One chip per domain with tracked
       // runnable tasks, in domain order. All-zero shows a single muted
@@ -382,6 +367,10 @@
       el('op-lat').textContent = opStr;
 
       renderCoreCards(data);
+
+      var summary = buildSummary(s);
+      el('summary-tldr').textContent = summary.tldr;
+      el('summary-explanation').textContent = summary.explanation;
     }
 
     function pollStats() {

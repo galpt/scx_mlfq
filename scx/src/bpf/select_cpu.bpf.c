@@ -59,12 +59,14 @@ static __always_inline bool mlfq_is_primary(const struct mlfq_bitmap *bm,
  * restricted to primary cores (@primary_bm is the hoisted primary bitmap,
  * NULL when every CPU is primary).
  *
- * One map lookup, then a compile-time-bounded scan: word-major over
- * MLFQ_BITMAP_WORDS words, bit-minor over 64 bits per word. For each set
- * candidate the scan tests task affinity, idleness (clearing the idle
- * mark) and, when requested, primary membership, returning the first
- * match in ascending CPU order, with no capacity ordering. An unpopulated
- * entry or an empty scan returns -ENOENT.
+ * One map lookup, then a compile-time-bounded scan. Word-major over
+ * MLFQ_BITMAP_WORDS words, bit-minor over 64 bits per word. An empty
+ * word is skipped whole, so a sparse bitmap costs one load per empty
+ * word instead of 64 bit tests. For each set candidate the scan tests
+ * task affinity, idleness (clearing the idle mark) and, when requested,
+ * primary membership, returning the first match in ascending CPU order,
+ * with no capacity ordering. An unpopulated entry or an empty scan
+ * returns -ENOENT.
  */
 static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 						    const struct task_struct *p,
@@ -79,12 +81,16 @@ static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 		return -ENOENT;
 
 	bpf_for(word, 0, MLFQ_BITMAP_WORDS) {
+		u64 w = bm->words[word];
+
+		if (!w)
+			continue;
 		bpf_for(bit, 0, 64) {
 			u32 cand = word * 64 + bit;
 
 			if (cand >= MLFQ_MAX_CPUS)
 				break;
-			if (!mlfq_bitmap_test_cpu(bm, cand))
+			if (!(w & (1ULL << bit)))
 				continue;
 			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
 				continue;
@@ -101,7 +107,7 @@ static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 }
 
 /*
- * Global primary-core scan: pick an idle primary CPU, or -ENOENT. The
+ * Global primary-core scan. Pick an idle primary CPU, or -ENOENT. The
  * primary bitmap holds only primary cores, so the require_primary
  * restriction is unnecessary here.
  */
@@ -120,14 +126,18 @@ mlfq_pick_idle_primary(const struct task_struct *p,
  * @now: Current time (scx_bpf_now()).
  *
  * The queue recorded in the task context reflects the previous run,
- * while the short-sleep boost runs in ops.enqueue(), after the CPU
- * selection. The CPU selection must treat a wakeup that is about to be
- * promoted as interactive already, so the primary-core preference
- * applies to it from the start. SCHED_IDLE tasks are excluded, the
- * classification pins them to Q3. The MLFQ tree is not walked here.
- * Its classification also runs in ops.enqueue(), after the CPU
- * selection, so the boost mirror above is the only pre-classification
- * interactivity signal.
+ * while the short-sleep boost and gauge decay run in ops.enqueue(),
+ * after the CPU selection. The CPU selection must treat a wakeup that
+ * is about to be promoted as interactive already, so the primary-core
+ * preference applies to it from the start. SCHED_IDLE tasks are
+ * excluded, the classification pins them to Q3.
+ *
+ * The interactive signal fires when any of three conditions holds:
+ * the task is already in Q1, the short-sleep boost will promote it
+ * to Q1, or the decayed burst gauge maps to the interactive band
+ * (gauge <= T_L). The gauge mirror uses the shared pure helper
+ * mlfq_gauge_decayed() so the CPU selection and the enqueue
+ * classification agree on the same decayed gauge value.
  *
  * Return: true if the wakeup is or will become interactive.
  */
@@ -136,15 +146,26 @@ mlfq_interactive_on_wakeup(const struct task_struct *p,
 			   const struct task_ctx *tctx, u64 now)
 {
 	u64 sleep_ns = 0;
+	u64 q_i, p_i;
 
 	if (tctx->last_sleep_at && mlfq_time_before(tctx->last_sleep_at, now))
 		sleep_ns = now - tctx->last_sleep_at;
 
+	if (tctx->queue == 1)
+		q_i = mlfq_q1_slice_ns;
+	else if (tctx->queue == 2)
+		q_i = mlfq_q2_slice_ns;
+	else
+		q_i = mlfq_q3_slice_ns;
+	p_i = q_i * MLFQ_CBS_PERIOD_MULT;
+
 	return tctx->queue == 1 ||
 	       (p->policy != MLFQ_SCHED_IDLE &&
-		mlfq_ss_boost_pending(tctx, sleep_ns, mlfq_task_io_wait(p),
+		(mlfq_ss_boost_pending(tctx, sleep_ns, mlfq_task_io_wait(p),
 				      now, mlfq_short_sleep_ns,
-				      mlfq_short_sleep_rate_limit_ns));
+				      mlfq_short_sleep_rate_limit_ns) ||
+		 mlfq_gauge_decayed(tctx, sleep_ns, q_i, p_i) <=
+		 mlfq_t_l_ns));
 }
 
 s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -166,7 +187,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	/*
 	 * The task allowed on prev_cpu (cpuset) may have changed since
-	 * the last run; fix that up.
+	 * the last run, fix that up.
 	 */
 	if (!bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
 		first_cpu = bpf_cpumask_first(p->cpus_ptr);
@@ -183,7 +204,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	}
 
 	/*
-	 * Hoist the primary-core bitmap lookup: it is immutable after load,
+	 * Hoist the primary-core bitmap lookup. It is immutable after load,
 	 * so one lookup serves the whole scan (see mlfq_pick_idle_in_bitmap).
 	 */
 	primary_bm = mlfq_get_primary_bitmap();
@@ -408,7 +429,7 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 				cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 		}
 	} else {
-		/* Q2/Q3: any idle CPU. */
+		/* Q2/Q3 take any idle CPU. */
 		cpu_id = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	}
 

@@ -8,22 +8,16 @@
  * one of them becomes runnable on a CPU running an SCX task, the kernel
  * switches the CPU to the higher-priority class and only hands it back
  * when the higher-priority queue empties. This module tracks which CPUs
- * a realtime task is running on through a sched_switch hook, drains the
- * DSQs of a CPU that is taken over so its tasks are not stranded, and
- * (in the placement modules) redirects wakeups away from occupied
- * cores. The occupancy flag is the scheduler's view of a CPU the SCX
- * classes cannot run on. It is updated on every real context switch,
- * so it always reflects the class of the last task that ran.
+ * a realtime task is running on through ops.cpu_release() and
+ * ops.cpu_acquire(), drains the DSQs of a CPU that is taken over so its
+ * tasks are not stranded, and (in the placement modules) redirects
+ * wakeups away from occupied cores. The occupancy flag is the
+ * scheduler's view of a CPU the SCX classes cannot run on. It is set
+ * when the kernel hands the CPU to a higher-priority class
+ * (ops.cpu_release) and cleared when sched_ext regains it
+ * (ops.cpu_acquire), so it always reflects whether a realtime task
+ * currently holds the CPU.
  */
-
-/*
- * The kernel's RT priority cutoff (kernel/sched/sched.h) is this.
- * Tasks with prio < MAX_RT_PRIO are the realtime classes, DL at prio -1,
- * RT at 0..99 and the stop task at 0, while fair, ext and idle tasks
- * sit at prio >= 100. The vmlinux.h type header does not expose the
- * macro, so it is stated here as the constant it is.
- */
-#define MAX_RT_PRIO 100
 
 /*
  * Look up the per-CPU realtime-occupancy state.
@@ -70,12 +64,16 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
 	u32 word, bit;
 
 	bpf_for(word, 0, MLFQ_BITMAP_WORDS) {
+		u64 w = bm->words[word];
+
+		if (!w)
+			continue;
 		bpf_for(bit, 0, 64) {
 			u32 cand = word * 64 + bit;
 
 			if (cand >= MLFQ_MAX_CPUS)
 				break;
-			if (!mlfq_bitmap_test_cpu(bm, cand))
+			if (!(w & (1ULL << bit)))
 				continue;
 			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
 				continue;
@@ -156,6 +154,7 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 {
 	struct mlfq_rtdl_state *rt;
 	bool evacuated = false;
+	u32 qid;
 
 	rt = mlfq_lookup_rtdl_state(cpu);
 	if (!rt)
@@ -175,22 +174,32 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 		return;
 
 	/*
-	 * Nonempty gate: when every DSQ this CPU owns is empty there is
+	 * Nonempty gate. When every DSQ this CPU owns is empty there is
 	 * nothing to evacuate, so the pass is skipped without consuming
-	 * the rate-limit window.
+	 * the rate-limit window.  The queue DSQ scan is looped over
+	 * MLFQ_NR_QUEUES so adding or removing queues needs no manual
+	 * gate update.
 	 */
-	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu)))
-		return;
+	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu)) {
+		bool any_queued = false;
+
+		bpf_for(qid, 1, MLFQ_NR_QUEUES + 1) {
+			if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cpu))) {
+				any_queued = true;
+				break;
+			}
+		}
+		if (!any_queued)
+			return;
+	}
 
 	/*
 	 * The evacuation is version-gated. The local DSQ is reenqueued
 	 * from anywhere only where the call-from-anywhere kfunc exists
 	 * (v6.19+), and the queue DSQs only through the generic
-	 * reenqueue (v7.1+), with three explicit constant-id calls.
-	 * The reenqueue itself re-anchors the tasks in the queue DSQs.
+	 * reenqueue (v7.1+), looped over MLFQ_NR_QUEUES so the drain
+	 * stays queue-count-agnostic. The reenqueue itself re-anchors the
+	 * tasks in the queue DSQs.
 	 * The enqueue redirect then relocates them off the occupied CPU,
 	 * so the drain plus the redirect is what actually evacuates. On
 	 * 6.18 the drain is a no-op by kernel limitation. The local DSQ
@@ -209,9 +218,9 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 		evacuated = true;
 	}
 	if (__COMPAT_has_generic_reenq()) {
-		scx_bpf_dsq_reenq(mlfq_dsq_id(1, cpu), 0);
-		scx_bpf_dsq_reenq(mlfq_dsq_id(2, cpu), 0);
-		scx_bpf_dsq_reenq(mlfq_dsq_id(3, cpu), 0);
+		bpf_for(qid, 1, MLFQ_NR_QUEUES + 1) {
+			scx_bpf_dsq_reenq(mlfq_dsq_id(qid, cpu), 0);
+		}
 		evacuated = true;
 	}
 
@@ -223,49 +232,78 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 */
 	if (evacuated) {
 		rt->last_drain_at = now;
-		__sync_fetch_and_add(&mlfq_stats.rt_evacuations, 1);
+		mlfq_stat_add(rt_evacuations, 1);
 	}
 }
 
 /*
- * The sched_switch hook. The kernel fires this tracepoint on every real
- * context switch. The program reads next->prio to learn the class of
- * the task the CPU is about to run. A realtime next marks the CPU
- * occupied and attempts the takeover drain. Any other next clears the
- * mark. Because the hook fires on every real switch, the flag always
- * reflects the class of the last task that ran on the CPU, which is
- * exactly the invariant the placement redirect needs. The program is
- * loaded on every kernel. The flag logic alone drives placement even
- * where the evacuation cannot run, and the evacuation branches inside
- * are ksym-gated so they self-prune on kernels without the reenqueue
- * kfuncs. The body is straight-line with at most a few bounded map
- * operations per switch. There are no loops.
+ * ops.cpu_release(). The kernel invokes this callback once per takeover
+ * when a higher-priority class (stop, DL or RT) preempts sched_ext on
+ * @cpu, with args->reason naming the class. The callback marks the CPU
+ * occupied and attempts the takeover drain. ops.cpu_acquire() clears the
+ * mark when sched_ext regains the CPU. The kernel gates the callback on
+ * SCX_OPS_HAS_CPU_PREEMPT, which it sets itself because this callback is
+ * registered, and fires it at most once per takeover (rq->scx.cpu_released),
+ * so the occupancy flag always reflects whether a realtime task currently
+ * holds the CPU, which is exactly the invariant the placement redirect
+ * needs. The callback is registered on every kernel. The flag logic alone
+ * drives placement even where the evacuation cannot run, and the
+ * evacuation branches inside are ksym-gated so they self-prune on kernels
+ * without the reenqueue kfuncs. The body is straight-line with at most a
+ * few bounded map operations per takeover. There are no loops.
  */
-SEC("?tp_btf/sched_switch")
-int BPF_PROG(mlfq_sched_switch, bool preempt,
-	     struct task_struct *prev, struct task_struct *next,
-	     unsigned int prev_state)
+void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
-	s32 cpu = bpf_get_smp_processor_id();
+	u64 op_lat_start = mlfq_op_lat_begin(MLFQ_OP_LAT_CPU_RELEASE);
 	struct mlfq_rtdl_state *rt;
 	u64 now;
 
-	if (unlikely(next->prio < MAX_RT_PRIO)) {
-		rt = mlfq_lookup_rtdl_state(cpu);
-		if (!rt)
-			return 0;
+	rt = mlfq_lookup_rtdl_state(cpu);
+	if (!rt) {
+		mlfq_op_lat_charge(MLFQ_OP_LAT_CPU_RELEASE, op_lat_start);
+		return;
+	}
+
+	/*
+	 * A real preemption (stop, DL or RT) marks the CPU occupied and
+	 * attempts the takeover drain. The reason is SCX_CPU_PREEMPT_UNKNOWN
+	 * only for a release the kernel cannot attribute to a class, which
+	 * is not a takeover, so the flag stays untouched there.
+	 */
+	if (args->reason != SCX_CPU_PREEMPT_UNKNOWN) {
 		if (!(rt->flags & MLFQ_RTDL_OCCUPIED)) {
 			rt->flags |= MLFQ_RTDL_OCCUPIED;
-			__sync_fetch_and_add(&mlfq_stats.rt_takeovers, 1);
+			mlfq_stat_add(rt_takeovers, 1);
 		}
 		now = scx_bpf_now();
 		mlfq_rtdl_drain(cpu, now);
-	} else {
-		rt = mlfq_lookup_rtdl_state(cpu);
-		if (!rt)
-			return 0;
-		if (rt->flags & MLFQ_RTDL_OCCUPIED)
-			rt->flags &= ~MLFQ_RTDL_OCCUPIED;
 	}
-	return 0;
+
+	/*
+	 * On kernels without the call-from-anywhere reenqueue (6.18), the
+	 * drain cannot evacuate the local DSQ, so the v1 reenqueue, which is
+	 * only callable from this callback, does it here. On newer kernels
+	 * the drain already handled it.
+	 */
+	if (!__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
+		scx_bpf_reenqueue_local();
+
+	mlfq_op_lat_charge(MLFQ_OP_LAT_CPU_RELEASE, op_lat_start);
+}
+
+/*
+ * ops.cpu_acquire(). The kernel invokes this callback once when sched_ext
+ * regains control of a CPU it had released to a higher-priority class
+ * (balance_one(), gated on rq->scx.cpu_released). Clearing the occupancy
+ * mark here is what lets placement use the CPU again.
+ */
+void BPF_STRUCT_OPS(mlfq_cpu_acquire, s32 cpu, struct scx_cpu_acquire_args *args)
+{
+	struct mlfq_rtdl_state *rt;
+
+	rt = mlfq_lookup_rtdl_state(cpu);
+	if (!rt)
+		return;
+	if (rt->flags & MLFQ_RTDL_OCCUPIED)
+		rt->flags &= ~MLFQ_RTDL_OCCUPIED;
 }
