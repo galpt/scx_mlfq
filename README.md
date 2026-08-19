@@ -9,7 +9,7 @@ holds CPU-bound tasks with 4 ms slices. Each queue is a vtime-ordered
 dispatch queue, where the virtual deadline of a task is the insertion key,
 so the kernel dispatch queue rbtree provides
 earliest-virtual-deadline-first selection. Task classification uses a
-per-task burst gauge: the gauge climbs by run time and decays at wakeup by
+per-task burst gauge. The gauge climbs by run time and decays at wakeup by
 a fixed-window step, so a task that has run more than it slept accumulates
 gauge and crosses the CPU-bound threshold, while a task that sleeps enough
 zeroes it. Queue moves happen only at period boundaries. Wakeup promotes,
@@ -23,13 +23,12 @@ sits below the fair class, so this scheduler handles non-RT tasks only.
 
 ## Repository layout
 
-```
-scx/    scheduler sources, a drop-in for scheds/experimental/scx_mlfq/
-        in a checkout of sched-ext/scx (see below)
-tools/  CachyOS beta-testing scripts (install / uninstall, GUI integration
-        via a patched scx_loader and libscxctl-ui; see tools/README.md)
-LICENSE GPL-2.0
-```
+The `scx/` directory holds the scheduler sources and is a drop-in for
+`scheds/experimental/scx_mlfq/` in a checkout of sched-ext/scx. The
+`tools/` directory holds the CachyOS beta-testing scripts for install and
+uninstall, plus the GUI integration through a patched `scx_loader` and
+`libscxctl-ui`, and is documented in `tools/README.md`. The repository
+root carries the GPL-2.0 license text.
 
 ## Creating the upstream branch
 
@@ -41,7 +40,8 @@ one-line workspace edit. From a checkout of your scx fork, run
 git checkout -b scx_mlfq
 cp -r <this-repo>/scx scheds/experimental/scx_mlfq
 # the scheduler package carries the repo LICENSE symlink, like every
-# other scheduler; the standalone repo keeps the full text at the root LICENSE
+# other scheduler. The standalone repo keeps the full text at the root
+# LICENSE.
 rm scheds/experimental/scx_mlfq/LICENSE
 ln -s ../../../LICENSE scheds/experimental/scx_mlfq/LICENSE
 # add "scheds/experimental/scx_mlfq" to [workspace].members in Cargo.toml
@@ -70,7 +70,7 @@ sudo bash tools/install_scx_mlfq.sh --beta-only # scheduler binary only
 sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of everything
 ```
 
-The install script builds the scheduler from this repository: it clones
+The install script builds the scheduler from this repository. It clones
 the standalone repo, copies the `scx/` sources into a sched-ext workspace
 (cloned from `galpt/scx`, branch `scx_mlfq`, or `--source-dir` for a local
 workspace), installs `/usr/bin/scx_mlfq`, and records everything in a
