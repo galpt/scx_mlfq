@@ -219,6 +219,12 @@
     // Latency bucket edges in microseconds, mirroring the MLFQ_OP_LAT_*
     // constants in src/bpf/intf.h. Eight buckets from these seven edges.
     const OP_LAT_EDGES_US = [2, 5, 10, 20, 50, 100, 250];
+    // GPU trace mask bits mirrored from src/bpf/intf.h:1057 (MLFQ_GPU_TRACE_*).
+    // Keep in sync with the Rust use at src/main.rs:411; the UI decodes
+    // gpuMask with these names so a future bit reassignment stays consistent.
+    const GPU_TRACE_AMDGPU_CS = 1 << 0;
+    const GPU_TRACE_AMDGPU_CS_IOCTL = 1 << 1;
+    const GPU_TRACE_GPU_SCHED = 1 << 2;
 
     function clamp(v) { return v < 0 ? 0 : v; }
 
@@ -374,8 +380,8 @@
 
       // GPU card: amdgpu yes/no, gpu_sched yes/no, and current gpu_submit 0..4 for running queue. When both are no, show not supported, not 0.
       var gpuMask = data.gpu_trace_mask || 0;
-      var amdgpuYes = (gpuMask & 1) || (gpuMask & 2);
-      var gpuSchedYes = (gpuMask & 4) !== 0;
+      var amdgpuYes = (gpuMask & GPU_TRACE_AMDGPU_CS) || (gpuMask & GPU_TRACE_AMDGPU_CS_IOCTL);
+      var gpuSchedYes = (gpuMask & GPU_TRACE_GPU_SCHED) !== 0;
       el('gpu-amdgpu').textContent = amdgpuYes ? 'yes' : 'no';
       el('gpu-sched').textContent = gpuSchedYes ? 'yes' : 'no';
       el('gpu-total').textContent = fmt(data.gpu_submit_total || 0);
