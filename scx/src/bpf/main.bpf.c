@@ -178,10 +178,10 @@ volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
  * Training-sample ring buffer. The stopping path emits one completed
  * sample per rate-limit window (mlfq_tree_ctrl.sample_last_at); the
  * userspace daemon drains it every 100 ms for the regression-tree
- * training. 1 MB holds about 13.8k samples of 76 bytes, roughly 6.9 s
- * of emission at the global rate limit, which absorbs a multi-second
- * daemon stall; drop-on-full is the natural backpressure when the
- * daemon cannot keep up, and the emission rate limits keep the
+ * training. 1 MB holds about 12.4k samples of 84 bytes (1.3.11 ABI),
+ * roughly 6.2 s of emission at the global rate limit, which absorbs a
+ * multi-second daemon stall; drop-on-full is the natural backpressure
+ * when the daemon cannot keep up, and the emission rate limits keep the
  * steady-state rate at one sample per MLFQ_TREE_SAMPLE_RATE_LIMIT_NS
  * globally and one per MLFQ_TREE_PER_TASK_LIMIT_NS per task.
  */

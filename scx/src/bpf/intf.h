@@ -657,9 +657,10 @@ _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
  * enqueue-to-run measurement block, plus the 80-byte MLFQ tree sample
  * block (the 64-byte feature vector plus pending_queue and
  * pending_valid padded to 64-bit) plus 24-byte sleep cadence EMA
- * block (mean 8, var 8, ratio 4 + pad 4) plus 4-byte gpu_submit.
- * Total 220 bytes for the 1.3.11 ABI (64-byte feats + cadence +
- * gpu_submit at 216). The 64-byte vector keeps sq_ema at 40,
+ * block (mean 8, var 8, ratio 4 + pad 4) plus 4-byte gpu_submit
+ * plus 4-byte tail pad. Total 232 bytes aligned for the 1.3.11 ABI
+ * (228 without tail pad, 224 before gpu_submit, gpu_submit at 224).
+ * The 64-byte vector keeps sq_ema at 40,
  * sleep_var_ratio at 48 and gpu_submit at 56 quantised 0..4.
  *
  * Why clamp: placement lag clamped to [0, limit] for bounded-lag;
@@ -770,11 +771,11 @@ struct task_ctx {
 	u32 pending_queue;		/* queue at the capture */
 	u64 pending_valid;
 	u32 gpu_submit;			/* gpu submissions, quantised 0..4, decay on idle */
-	u32 pad3;			/* pad to 8-byte alignment, keeps 220 bytes */
+	u32 pad3;			/* tail pad to 8-byte alignment, keeps 232 bytes aligned */
 };
 
 _Static_assert(sizeof(struct task_ctx) == 232,
-	       "task_ctx must be 232 bytes for 1.3.11 ABI (64-byte feats + cadence + gpu_submit, unpacked)");
+	       "task_ctx must be 232 bytes for 1.3.11 ABI (64-byte feats + cadence + gpu_submit, 8-byte aligned; 224 before gpu, 228 without tail pad)");
 _Static_assert(__builtin_offsetof(struct task_ctx, pending_feats) == 144,
 	       "pending_feats at 144");
 _Static_assert(__builtin_offsetof(struct task_ctx, pending_queue) == 208,

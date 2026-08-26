@@ -440,7 +440,7 @@ impl<'a> Scheduler<'a> {
          * bounded channel the run loop drains. try_send drops the sample
          * when the channel is full, which the ring-buffer backpressure
          * absorbs first. TreeSample is a repr(C) POD mirroring the
-         * 76-byte BPF record, so the parse is a plain byte
+         * 84-byte BPF record (1.3.11 ABI), so the parse is a plain byte
          * reinterpretation. The record's version tag is checked before
          * the record is admitted, so a record from a foreign producer or
          * a mismatched build is dropped instead of misread.
@@ -451,7 +451,7 @@ impl<'a> Scheduler<'a> {
             if data.len() < size_of::<TreeSample>() {
                 return 0;
             }
-            // SAFETY: TreeSample is a repr(C) mirror of the 76-byte
+            // SAFETY: TreeSample is a repr(C) mirror of the 84-byte
             // mlfq_tree_sample the stopping path submits; reading the
             // record as the struct is a plain byte reinterpretation of
             // integer fields.
