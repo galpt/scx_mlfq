@@ -40,7 +40,13 @@ static __always_inline void mlfq_sleep_ema_update(struct task_ctx *tctx,
 	if (sleep_ns > 64ULL * NSEC_PER_MSEC)
 		sleep_ns = 64ULL * NSEC_PER_MSEC;
 
-	/* Decay on long idle >120ms (MLFQ_LONG_SLEEP_NS). */
+	/* Decay on long idle >120ms (MLFQ_LONG_SLEEP_NS), wrapping-safe
+	 * via mlfq_ema_decay(). The gpu_submit quant (0..4) decays here
+	 * as well, one step per long idle, so a task that stops
+	 * submitting ages out of Q1 after ~480 ms without work. The
+	 * 10 ms dedup window (last_gpu_submit_at) is not decayed; it
+	 * is a per-submission latch gated by time_before().
+	 */
 	if (sleep_ns > MLFQ_LONG_SLEEP_NS) {
 		tctx->sleep_mean_ema = mlfq_ema_decay(tctx->sleep_mean_ema,
 						      sleep_ns,
@@ -104,6 +110,7 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 	tctx->pad2 = 0;
 	tctx->gpu_submit = 0;
 	tctx->pad3 = 0;
+	tctx->last_gpu_submit_at = 0;
 	/*
 	 * The runnable-ownership record starts unowned. A fresh task is
 	 * not counted in the per-LLC/per-queue gauges until its first

@@ -659,13 +659,18 @@ _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
  * block (the 64-byte feature vector plus pending_queue and
  * pending_valid padded to 64-bit) plus 24-byte sleep cadence EMA
  * block (mean 8, var 8, ratio 4 + pad 4) plus 4-byte gpu_submit
- * plus 4-byte tail pad. Total 232 bytes aligned for the 1.3.11 ABI
- * (228 without tail pad, 224 before gpu_submit, gpu_submit at 224).
- * The 64-byte vector keeps sq_ema at 40,
+ * plus 4-byte pad plus 8-byte gpu_submit dedup timestamp.
+ * Total 240 bytes aligned for the 1.3.11 ABI
+ * (232 before gpu_submit timestamp, 224 before gpu_submit, gpu_submit at 224,
+ * last_gpu_submit_at at 232). The 64-byte vector keeps sq_ema at 40,
  * sleep_var_ratio at 48 and gpu_submit at 56 quantised 0..4.
  *
  * Why clamp: placement lag clamped to [0, limit] for bounded-lag;
  * service EMAs clamped to MAX to bound thresholds and f64 sums.
+ * gpu_submit dedup window is MLFQ_TREE_PER_TASK_LIMIT_NS (10 ms),
+ * the same per-task rate limit as the training-sample gate, so a
+ * single logical GPU submission that fires 2-3 tracepoints
+ * (amdgpu_cs, amdgpu_cs_ioctl, gpu_sched) is counted once.
  */
 
 /**
@@ -774,11 +779,12 @@ struct task_ctx {
 	u32 pending_queue;		/* queue at the capture */
 	u64 pending_valid;
 	u32 gpu_submit;			/* gpu submissions, quantised 0..4, decay on idle */
-	u32 pad3;			/* tail pad to 8-byte alignment, keeps 232 bytes aligned */
+	u32 pad3;			/* pad to 8-byte alignment for the timestamp */
+	u64 last_gpu_submit_at;		/* scx_bpf_now() of the last gpu_submit bump, per-task dedup window (10 ms) */
 };
 
-_Static_assert(sizeof(struct task_ctx) == 232,
-	       "task_ctx must be 232 bytes for 1.3.11 ABI (64-byte feats + cadence + gpu_submit, 8-byte aligned; 224 before gpu, 228 without tail pad)");
+_Static_assert(sizeof(struct task_ctx) == 240,
+	       "task_ctx must be 240 bytes for 1.3.11 ABI (64-byte feats + cadence + gpu_submit + dedup timestamp, 8-byte aligned; 224 before gpu, 232 last_gpu_submit_at)");
 _Static_assert(__builtin_offsetof(struct task_ctx, pending_feats) == 144,
 	       "pending_feats at 144");
 _Static_assert(__builtin_offsetof(struct task_ctx, pending_queue) == 208,
@@ -787,6 +793,8 @@ _Static_assert(__builtin_offsetof(struct task_ctx, pending_valid) == 216,
 	       "pending_valid at 216");
 _Static_assert(__builtin_offsetof(struct task_ctx, gpu_submit) == 224,
 	       "gpu_submit must sit at offset 224");
+_Static_assert(__builtin_offsetof(struct task_ctx, last_gpu_submit_at) == 232,
+	       "last_gpu_submit_at must sit at offset 232");
 _Static_assert(__builtin_offsetof(struct task_ctx, sleep_mean_ema) == 120,
 	       "sleep_mean_ema at 120");
 _Static_assert(__builtin_offsetof(struct task_ctx, sleep_var_ratio) == 136,
@@ -1049,10 +1057,14 @@ extern const volatile bool mlfq_adapt_enabled;
 
 /*
  * GPU submit tracepoint state. mlfq_gpu_submit_total counts every
- * quantised gpu_submit bump (the per-task 0..4 counter's increments) and
- * mlfq_gpu_trace_mask records which tracepoints attached at load: bit0
- * amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched. Both are gauges, not
- * interval deltas, and are read by the web metrics.
+ * deduped quantised gpu_submit bump (the per-task 0..4 counter's
+ * increments, one per MLFQ_TREE_PER_TASK_LIMIT_NS window, so a burst
+ * of amdgpu_cs/amdgpu_cs_ioctl/gpu_sched for one job is a single
+ * bump) and mlfq_gpu_trace_mask records which tracepoints attached
+ * at load: bit0 amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched. Both
+ * are gauges, not interval deltas, and are read by the web metrics.
+ * The dedup window mirrors the sample per-task limiter, so the total
+ * is not raw trace hits.
  */
 #define MLFQ_GPU_TRACE_AMDGPU_CS	(1U << 0)
 #define MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL	(1U << 1)

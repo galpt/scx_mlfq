@@ -297,8 +297,8 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * io_wait == 0 there) and is left unchanged.
 	 *
 	 * One branch, no loop. Preserves per-queue EEVDF bounded lag and
-	 * the 64/84/232 V4 NR9 ABI; verifier stays within 1M insn /
-	 * 512B stack.
+	 * the 64/84/240 V4 NR9 ABI (task_ctx 240 with dedup timestamp);
+	 * verifier stays within 1M insn / 512B stack.
 	 */
 	if (!io_wait && tctx->gpu_submit == 0 &&
 	    tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns &&

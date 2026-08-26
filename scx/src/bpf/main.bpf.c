@@ -133,10 +133,12 @@ volatile u32 mlfq_llc_idle[MLFQ_MAX_LLCS];
 volatile struct mlfq_stats mlfq_stats;
 
 /*
- * GPU submit gauges. mlfq_gpu_submit_total counts every quantised
- * gpu_submit bump, mlfq_gpu_trace_mask records which tracepoints
- * attached (bit0 amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched).
- * Both are gauges exposed via the web metrics.
+ * GPU submit gauges. mlfq_gpu_submit_total counts every deduped
+ * quantised gpu_submit bump (one per 10 ms window), mlfq_gpu_trace_mask
+ * records which tracepoints attached (bit0 amdgpu_cs, bit1
+ * amdgpu_cs_ioctl, bit2 gpu_sched) latched on every hit for the web
+ * metrics. The total is deduped, not raw hits, so a single job that
+ * fires 2-3 tracepoints in burst counts once.
  */
 volatile u64 mlfq_gpu_submit_total;
 volatile u32 mlfq_gpu_trace_mask;
@@ -614,11 +616,18 @@ static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
  * amdgpu_cs and amdgpu_cs_ioctl cover AMD, and gpu_scheduler
  * drm_sched_job_queue covers any driver that uses gpu_sched,
  * including nouveau for your RTX 3050, so both vendors are handled.
- * Each increment quantises gpu_submit 0..4 (min(+1,4)) and sets
- * MLFQ_TF_DRM_WAKE for the select_cpu broadening. The flag is
- * cleared after the WAKE_SYNC insert. Per-queue bounded-lag is
- * preserved, verifier 1M/512B, no new loop, and the handlers are
- * knob free and enabled by default when the tracepoints exist.
+ * Each logical GPU submission can fire 2-3 tracepoints in burst
+ * (amdgpu_cs, amdgpu_cs_ioctl, gpu_sched) within microseconds; the
+ * per-task dedup window (MLFQ_TREE_PER_TASK_LIMIT_NS, 10 ms) ensures
+ * one quantised bump per window, so a single job does not saturate
+ * gpu_submit 0..4. The window mirrors the per-task training-sample
+ * limiter (fair.c-style time_before check), keeping
+ * mlfq_gpu_submit_total as deduped bumps, not raw hits, and the
+ * MLFQ_TF_DRM_WAKE flag as a deduped wake hint. The trace mask is
+ * latched on every hit (even deduped) so the web metrics show which
+ * tracepoints are present. Per-queue bounded-lag is preserved,
+ * verifier 1M/512B, no new loop, and the handlers are knob free and
+ * enabled by default when the tracepoints exist.
  * The SEC is "tracepoint/..." without "?" and without tp_btf, so
  * the attach uses the raw tracepoint and does not require BTF for
  * module tracepoints. The programs remain optional via userspace
@@ -629,16 +638,36 @@ static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p,
 						  u32 trace_bit)
 {
 	struct task_ctx *tctx = mlfq_lookup_task_ctx(p);
+	u64 now;
 
 	if (!tctx)
 		return;
+	/* Latch the trace mask on every hit, even deduped, so the
+	 * gauge reflects which tracepoints are present on the machine.
+	 * The dedup window gates only the quantised bump and the total.
+	 */
+	__sync_fetch_and_or(&mlfq_gpu_trace_mask, trace_bit);
+	now = scx_bpf_now();
+	/* Deduplicate burst of tracepoints for one logical submission.
+	 * A single job can fire amdgpu_cs + amdgpu_cs_ioctl +
+	 * drm_sched_job_queue together; without the window one job
+	 * would bump gpu_submit by 2-3 and saturate 0..4 immediately,
+	 * biasing the tree feature. Gate on the per-task 10 ms window
+	 * (MLFQ_TREE_PER_TASK_LIMIT_NS), the same cadence as the
+	 * per-task sample limiter, so at most one bump per window.
+	 * Wrapping-safe via mlfq_time_before(), like fair.c.
+	 */
+	if (tctx->last_gpu_submit_at &&
+	    !mlfq_time_before(tctx->last_gpu_submit_at +
+			      MLFQ_TREE_PER_TASK_LIMIT_NS, now))
+		return;
+	tctx->last_gpu_submit_at = now;
 	if (tctx->gpu_submit < 4)
 		tctx->gpu_submit++;
 	else
 		tctx->gpu_submit = 4;
 	tctx->flags |= MLFQ_TF_DRM_WAKE;
 	__sync_fetch_and_add(&mlfq_gpu_submit_total, 1);
-	__sync_fetch_and_or(&mlfq_gpu_trace_mask, trace_bit);
 }
 
 SEC("tracepoint/amdgpu/amdgpu_cs")

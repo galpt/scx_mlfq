@@ -673,8 +673,8 @@ static void test_mlfq_tree_layout(void)
 	TEST_OK(sizeof(struct mlfq_tree_store) ==
 		MLFQ_TREE_MAX_NODES * sizeof(struct mlfq_tree_node),
 		"tree store is one 2048-node buffer (the map value type)");
-	TEST_OK(sizeof(struct task_ctx) == 232,
-		"task_ctx grows to 232 bytes with the enqueue-to-run measurement block, the grown 64-byte feature vector and the 24-byte cadence block plus gpu_submit");
+	TEST_OK(sizeof(struct task_ctx) == 240,
+		"task_ctx grows to 240 bytes with the enqueue-to-run measurement block, the grown 64-byte feature vector and the 24-byte cadence block plus gpu_submit and dedup timestamp");
 	TEST_OK(offsetof(struct task_ctx, enq_at) == 80 &&
 		offsetof(struct task_ctx, last_wake_lat_ns) == 88 &&
 		offsetof(struct task_ctx, last_q_wait_ns) == 92 &&
@@ -689,6 +689,8 @@ static void test_mlfq_tree_layout(void)
 		"task_ctx cadence block sits at 120/136 before the tree-sample block");
 	TEST_OK(offsetof(struct task_ctx, gpu_submit) == 224,
 		"task_ctx gpu_submit sits at 224 after the tree-sample block");
+	TEST_OK(offsetof(struct task_ctx, last_gpu_submit_at) == 232,
+		"task_ctx last_gpu_submit_at sits at 232 after gpu_submit");
 	TEST_OK(sizeof(struct mlfq_tree_ctrl) == 64 &&
 		offsetof(struct mlfq_tree_ctrl, meta) == 0 &&
 		offsetof(struct mlfq_tree_ctrl, sample_last_at) == 8,
