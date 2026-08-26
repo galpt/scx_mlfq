@@ -342,10 +342,38 @@ impl<'a> Scheduler<'a> {
                 true,
             );
         }
-        /* ?tracepoint autoload gating for amdgpu: the SEC("?tracepoint/...")
-         * makes the amdgpu_cs and amdgpu_cs_ioctl programs optional, so
-         * kernels without the amdgpu tracepoints load fine. No hard fail.
+        /*
+         * GPU tracepoints: raw tracepoints without BTF, optional.
+         * SEC("tracepoint/...") without "?" and without tp_btf uses the
+         * raw tracepoint and does not require BTF for module tracepoints.
+         * Keep them optional by disabling autoload when tracefs is absent,
+         * so load never hard-fails. The three handlers are amdgpu_cs,
+         * amdgpu_cs_ioctl and gpu_scheduler/drm_sched_job_queue, covering
+         * AMD and nouveau (gpu_sched).
          */
+        {
+            let has = |p1: &str, p2: &str| {
+                std::path::Path::new(p1).exists() || std::path::Path::new(p2).exists()
+            };
+            if !has(
+                "/sys/kernel/debug/tracing/events/amdgpu/amdgpu_cs",
+                "/sys/kernel/tracing/events/amdgpu/amdgpu_cs",
+            ) {
+                skel.progs.mlfq_amdgpu_cs.set_autoload(false);
+            }
+            if !has(
+                "/sys/kernel/debug/tracing/events/amdgpu/amdgpu_cs_ioctl",
+                "/sys/kernel/tracing/events/amdgpu/amdgpu_cs_ioctl",
+            ) {
+                skel.progs.mlfq_amdgpu_cs_ioctl.set_autoload(false);
+            }
+            if !has(
+                "/sys/kernel/debug/tracing/events/gpu_scheduler/drm_sched_job_queue",
+                "/sys/kernel/tracing/events/gpu_scheduler/drm_sched_job_queue",
+            ) {
+                skel.progs.mlfq_gpu_sched_queue.set_autoload(false);
+            }
+        }
 
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 
@@ -372,27 +400,20 @@ impl<'a> Scheduler<'a> {
             );
         }
 
-        // GPU tracepoint availability: probe tracefs for the optional
-        // amdgpu and gpu_sched tracepoints and seed the BPF mask so the
-        // web UI shows "yes" even before the first GPU submit. The BPF
-        // handlers also OR the bits on every bump, so the mask stays
-        // correct if the probe races a first event.
+        // GPU tracepoint availability: seed the BPF mask from actual
+        // attach success (autoload after load), not just tracefs existence,
+        // so the web UI reflects whether the handlers are really attached.
+        // The BPF handlers also OR the bits on every gpu_submit bump, so
+        // the mask stays correct even if the probe races a first event.
         {
             let mut mask: u32 = 0;
-            let has = |path: &str| std::path::Path::new(path).exists();
-            if has("/sys/kernel/debug/tracing/events/amdgpu/amdgpu_cs")
-                || has("/sys/kernel/tracing/events/amdgpu/amdgpu_cs")
-            {
+            if skel.progs.mlfq_amdgpu_cs.autoload() {
                 mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS as u32;
             }
-            if has("/sys/kernel/debug/tracing/events/amdgpu/amdgpu_cs_ioctl")
-                || has("/sys/kernel/tracing/events/amdgpu/amdgpu_cs_ioctl")
-            {
+            if skel.progs.mlfq_amdgpu_cs_ioctl.autoload() {
                 mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL as u32;
             }
-            if has("/sys/kernel/debug/tracing/events/gpu_scheduler/drm_sched_job_queue")
-                || has("/sys/kernel/tracing/events/gpu_scheduler/drm_sched_job_queue")
-            {
+            if skel.progs.mlfq_gpu_sched_queue.autoload() {
                 mask |= crate::bpf_intf::MLFQ_GPU_TRACE_GPU_SCHED as u32;
             }
             if mask != 0 {

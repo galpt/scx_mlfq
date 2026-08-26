@@ -276,6 +276,22 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 			__sync_fetch_and_add(&mlfq_stats.promotions, 1);
 		}
 	}
+
+	/*
+	 * Q3 seed: throughput tasks that never submit GPU work
+	 * (gpu_submit==0) would otherwise never produce Q3 labels if
+	 * the tree learns a gpu_submit>0 split and pushes the Q3
+	 * threshold up. Force one Q3 placement when the previous burst
+	 * and the sleep both indicate Q3 (prev_burst > T_H and
+	 * sleep > MLFQ_SHORT_SLEEP_NS), even when the tree predicts
+	 * Q1, so the emitted sample seeds the next window with Q3
+	 * labels. One branch, no new loop, preserves per-queue EEVDF
+	 * bounded-lag and the 64/84/232 V4 NR9 ABI.
+	 */
+	if (tctx->gpu_submit == 0 &&
+	    tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns &&
+	    sleep_ns > mlfq_short_sleep_ns && tctx->queue != 3)
+		tctx->queue = 3;
 }
 
 /*

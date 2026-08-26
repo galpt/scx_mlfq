@@ -610,7 +610,7 @@ static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
 #include "dispatch.bpf.c"
 
 /*
- * gpu_submit tracepoints: optional, about 200 insn, no loop.
+ * gpu_submit tracepoints: raw tracepoints, about 200 insn, no loop.
  * amdgpu_cs and amdgpu_cs_ioctl cover AMD, and gpu_scheduler
  * drm_sched_job_queue covers any driver that uses gpu_sched,
  * including nouveau for your RTX 3050, so both vendors are handled.
@@ -619,6 +619,11 @@ static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
  * cleared after the WAKE_SYNC insert. Per-queue bounded-lag is
  * preserved, verifier 1M/512B, no new loop, and the handlers are
  * knob free and enabled by default when the tracepoints exist.
+ * The SEC is "tracepoint/..." without "?" and without tp_btf, so
+ * the attach uses the raw tracepoint and does not require BTF for
+ * module tracepoints. The programs remain optional via userspace
+ * autoload gating (bpf_program__set_autoload to false when the
+ * tracepoint is absent), so load never hard-fails.
  */
 static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p,
 						  u32 trace_bit)
@@ -636,7 +641,7 @@ static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p,
 	__sync_fetch_and_or(&mlfq_gpu_trace_mask, trace_bit);
 }
 
-SEC("?tracepoint/amdgpu/amdgpu_cs")
+SEC("tracepoint/amdgpu/amdgpu_cs")
 int mlfq_amdgpu_cs(void *ctx)
 {
 	struct task_struct *p = (struct task_struct *)bpf_get_current_task_btf();
@@ -647,7 +652,7 @@ int mlfq_amdgpu_cs(void *ctx)
 	return 0;
 }
 
-SEC("?tracepoint/amdgpu/amdgpu_cs_ioctl")
+SEC("tracepoint/amdgpu/amdgpu_cs_ioctl")
 int mlfq_amdgpu_cs_ioctl(void *ctx)
 {
 	struct task_struct *p = (struct task_struct *)bpf_get_current_task_btf();
@@ -658,7 +663,7 @@ int mlfq_amdgpu_cs_ioctl(void *ctx)
 	return 0;
 }
 
-SEC("?tracepoint/gpu_scheduler/drm_sched_job_queue")
+SEC("tracepoint/gpu_scheduler/drm_sched_job_queue")
 int mlfq_gpu_sched_queue(void *ctx)
 {
 	struct task_struct *p = (struct task_struct *)bpf_get_current_task_btf();
