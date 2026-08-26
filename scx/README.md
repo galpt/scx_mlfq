@@ -5,7 +5,7 @@ scx_mlfq is a user-defined scheduler for Linux, written in Rust with a BPF core,
 
 ## Overview
 
-Tasks are classified into three per-CPU queues, Q1 for interactive tasks, Q2 for unclassified tasks and Q3 for CPU-bound tasks, with 1/2/4 ms slices served in virtual-deadline order within a bounded dispatch batch. Classification is driven by a regression tree that predicts the next CPU burst from recent task behavior, trained in user space on the machine's own samples and republished every minute, with the EMA gauge as the fallback until the first model is published.
+Tasks are classified into three per-CPU queues, Q1 for interactive tasks, Q2 for unclassified tasks and Q3 for CPU-bound tasks, with 1/2/4 ms slices served in virtual-deadline order within a bounded dispatch batch. Classification is driven by a regression tree that predicts the next CPU burst from recent task behavior, trained in user space on the machine's own samples and republished every minute, with the EMA gauge as the fallback until the first model is published. A task that recently submitted GPU work is also treated as interactive, so a renderer that sleeps on a fence is not demoted to Q3.
 
 The scheduler also implements wakeup boosts, run-out demotion, aging, a guaranteed Q3 share of every dispatch batch, cache-aware stealing and the placement sequence, and the details live in the code comments of the named files. The classification and boost rules are in `src/bpf/classify.bpf.c` and `src/bpf/enqueue.bpf.c`, the steal tiers in `src/bpf/dispatch.bpf.c`, the placement steps in `src/bpf/select_cpu.bpf.c`. Every placement clamps a task's lag to within one lag bound of its queue's virtual clock. This per-queue bounded-lag guarantee is documented in `src/bpf/intf.h`.
 
@@ -45,5 +45,6 @@ To measure the wakeup latency the scheduler delivers with cyclictest, pin the me
 - The largest-LLC bias trades clock speed for cache capacity, is Q1-only and non-exclusive, and is off on single-LLC and equal-size machines.
 - The topology is snapshotted at attach, so a CPU hotplug needs a restart.
 - RT and DL tasks are handled by the kernel's own classes before sched_ext.
+- GPU submitter awareness is optional and self pruning. The amdgpu and gpu_scheduler tracepoints are used when they exist, otherwise the feature stays at zero.
 - Requires Linux 7.1 or newer. The queue-DSQ re-enqueue and the `SCX_ENQ_IMMED` wakeup fast-path require 7.1; older kernels are not supported.
 

@@ -3,9 +3,10 @@
 A Multilevel Feedback Queue scheduler for sched_ext, with per-queue
 EEVDF-style virtual-time scheduling.
 
-scx_mlfq manages non-RT tasks in three queues. Q1 holds interactive tasks
-with 1 ms slices, Q2 holds tasks the scheduler cannot classify yet with 2 ms
-slices, and Q3 holds CPU-bound tasks with 4 ms slices. Each queue is a
+scx_mlfq manages non-RT tasks in three queues. Q1 holds interactive tasks,
+including tasks that recently submitted GPU work, with 1 ms slices, Q2 holds
+tasks the scheduler cannot classify yet with 2 ms slices, and Q3 holds
+CPU-bound tasks with 4 ms slices. Each queue is a
 vtime-ordered dispatch queue, where the virtual deadline of a task is the
 insertion key, so the kernel dispatch queue rbtree provides
 earliest-virtual-deadline-first selection. Task classification uses a
