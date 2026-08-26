@@ -639,18 +639,18 @@ static void tree_node(struct mlfq_tree_store *store, u32 idx, u8 feature,
 
 static void test_mlfq_tree_layout(void)
 {
-	TEST_OK(sizeof(struct mlfq_tree_feats) == 56,
-		"tree feats is 56 bytes");
+	TEST_OK(sizeof(struct mlfq_tree_feats) == 64,
+		"tree feats is 64 bytes");
 	TEST_OK(sizeof(struct mlfq_tree_node) == 24,
 		"tree node is 24 bytes");
-	TEST_OK(sizeof(struct mlfq_tree_sample) == 76,
-		"tree sample is 76 bytes");
+	TEST_OK(sizeof(struct mlfq_tree_sample) == 84,
+		"tree sample is 84 bytes");
 	TEST_OK(offsetof(struct mlfq_tree_sample, pid) == 0 &&
 		offsetof(struct mlfq_tree_sample, queue) == 4 &&
 		offsetof(struct mlfq_tree_sample, feats) == 8 &&
-		offsetof(struct mlfq_tree_sample, label_ns) == 64 &&
-		offsetof(struct mlfq_tree_sample, version) == 72,
-		"tree sample offsets match the shared ABI, version at 72");
+		offsetof(struct mlfq_tree_sample, label_ns) == 72 &&
+		offsetof(struct mlfq_tree_sample, version) == 80,
+		"tree sample offsets match the shared ABI, version at 80");
 	TEST_OK(offsetof(struct mlfq_tree_feats, prev_burst_ns) == 0 &&
 		offsetof(struct mlfq_tree_feats, sleep_ns) == 8 &&
 		offsetof(struct mlfq_tree_feats, ema) == 16 &&
@@ -660,8 +660,10 @@ static void test_mlfq_tree_layout(void)
 		offsetof(struct mlfq_tree_feats, queue_wait_us) == 36 &&
 		offsetof(struct mlfq_tree_feats, sq_ema) == 40 &&
 		offsetof(struct mlfq_tree_feats, sleep_var_ratio) == 48 &&
-		offsetof(struct mlfq_tree_feats, pad) == 52,
-		"tree feats offsets match the shared ABI, service fields appended");
+		offsetof(struct mlfq_tree_feats, pad) == 52 &&
+		offsetof(struct mlfq_tree_feats, gpu_submit) == 56 &&
+		offsetof(struct mlfq_tree_feats, pad2) == 60,
+		"tree feats offsets match the shared ABI, service fields appended with gpu_submit at 56");
 	TEST_OK(offsetof(struct mlfq_tree_node, threshold) == 0 &&
 		offsetof(struct mlfq_tree_node, left) == 8 &&
 		offsetof(struct mlfq_tree_node, right) == 12 &&
@@ -671,20 +673,22 @@ static void test_mlfq_tree_layout(void)
 	TEST_OK(sizeof(struct mlfq_tree_store) ==
 		MLFQ_TREE_MAX_NODES * sizeof(struct mlfq_tree_node),
 		"tree store is one 2048-node buffer (the map value type)");
-	TEST_OK(sizeof(struct task_ctx) == 216,
-		"task_ctx grows to 216 bytes with the enqueue-to-run measurement block, the grown feature vector and the 24-byte cadence block");
+	TEST_OK(sizeof(struct task_ctx) == 232,
+		"task_ctx grows to 232 bytes with the enqueue-to-run measurement block, the grown 64-byte feature vector and the 24-byte cadence block plus gpu_submit");
 	TEST_OK(offsetof(struct task_ctx, enq_at) == 80 &&
 		offsetof(struct task_ctx, last_wake_lat_ns) == 88 &&
 		offsetof(struct task_ctx, last_q_wait_ns) == 92 &&
 		offsetof(struct task_ctx, sq_ema) == 96,
 		"task_ctx measurement block sits at 80/88/92/96 after the pad bytes");
 	TEST_OK(offsetof(struct task_ctx, pending_feats) == 144 &&
-		offsetof(struct task_ctx, pending_queue) == 200 &&
-		offsetof(struct task_ctx, pending_valid) == 208,
-		"task_ctx tree-sample block follows the measurement and cadence blocks");
+		offsetof(struct task_ctx, pending_queue) == 208 &&
+		offsetof(struct task_ctx, pending_valid) == 216,
+		"task_ctx tree-sample block follows the measurement and cadence blocks with 64-byte feats");
 	TEST_OK(offsetof(struct task_ctx, sleep_mean_ema) == 120 &&
 		offsetof(struct task_ctx, sleep_var_ratio) == 136,
 		"task_ctx cadence block sits at 120/136 before the tree-sample block");
+	TEST_OK(offsetof(struct task_ctx, gpu_submit) == 224,
+		"task_ctx gpu_submit sits at 224 after the tree-sample block");
 	TEST_OK(sizeof(struct mlfq_tree_ctrl) == 64 &&
 		offsetof(struct mlfq_tree_ctrl, meta) == 0 &&
 		offsetof(struct mlfq_tree_ctrl, sample_last_at) == 8,
@@ -700,10 +704,10 @@ static void test_mlfq_tree_layout(void)
 		"per-task sample limit is 10ms");
 	TEST_OK(MLFQ_TREE_LABEL_MAX_NS == MLFQ_TREE_T_BOUND_NS * 64,
 		"label clamp is 64x the Q2/Q3 split bound (192ms)");
-	TEST_OK(MLFQ_TREE_SAMPLE_VERSION == 3,
-		"tree sample version tag is 3");
-	TEST_OK(MLFQ_TREE_NR_FEATURES == 8,
-		"tree NR_FEATURES is 8");
+	TEST_OK(MLFQ_TREE_SAMPLE_VERSION == 4,
+		"tree sample version tag is 4");
+	TEST_OK(MLFQ_TREE_NR_FEATURES == 9,
+		"tree NR_FEATURES is 9");
 }
 
 static void test_tree_meta_layout(void)
@@ -790,17 +794,17 @@ static void test_tree_predict_walk(void)
 
 	/*
 	 * Feature id 0x87 masks to 7, the sq_ema slot (valid for
-	 * NR_FEATURES 8). Under MLFQ_CHECK it is in bounds, and the
-	 * walk routes on feat[7] (sq_ema). The zeroed slot test is now
-	 * the sleep_var_ratio carry-along at id 8, which masks to 0 and
-	 * stays in bounds.
+	 * NR_FEATURES 9). Under MLFQ_CHECK it is in bounds, and the
+	 * walk routes on feat[7] (sq_ema). The carry-along at id 9
+	 * masks to 9 and is out of bounds, rejected by the authoritative
+	 * < NR check.
 	 */
 	tree_store_reset(&store);
 	tree_node(&store, 0, 0x87, 0, 1, 2);
 	tree_node(&store, 1, 0, 0, 50000, 0);
 	tree_node(&store, 2, 0, 0, 3000000, 0);
 	TEST_OK(mlfq_tree_walk(&store, &f) == 50000,
-		"feature 0x87 masks to 7 sq_ema, valid for NR_FEATURES 8");
+		"feature 0x87 masks to 7 sq_ema, valid for NR_FEATURES 9");
 
 	/*
 	 * Masked index: a child index of 0xFFFFFFFF must land on node
@@ -942,14 +946,14 @@ static void test_mlfq_check_tree_predicates(void)
 		"node indices 0 and 2047 are in bounds");
 	TEST_OK(!mlfq_check_tree_node_index(MLFQ_TREE_MAX_NODES),
 		"node index 2048 is out of bounds");
-	TEST_OK(mlfq_check_tree_feature(0) && mlfq_check_tree_feature(7),
-		"feature ids 0 and 7 are in bounds (NR_FEATURES 8)");
+	TEST_OK(mlfq_check_tree_feature(0) && mlfq_check_tree_feature(8),
+		"feature ids 0 and 8 are in bounds (NR_FEATURES 9)");
 	TEST_OK(mlfq_check_tree_feature(5) && mlfq_check_tree_feature(7),
-		"feature ids 5 and 7 are now in bounds for 7.1 ABI");
+		"feature ids 5 and 7 are now in bounds for 1.3.11 ABI");
 	TEST_OK(!mlfq_check_tree_feature(0x80) &&
-		!mlfq_check_tree_feature(0x87) &&
-		!mlfq_check_tree_feature(8),
-		"raw feature ids >=8 (incl. 0x80/0x87 before mask) are out of bounds; BPF walk masks feat[8] &0x7, carry-along 8 zeroed, plain <NR_FEATURES is authoritative (not masked tautology)");
+		!mlfq_check_tree_feature(0x90) &&
+		!mlfq_check_tree_feature(9),
+		"raw feature ids >=9 (incl. 0x80/0x90 before mask) are out of bounds; BPF walk masks feat[9] &0xF, carry-along 9 zeroed, plain <NR_FEATURES is authoritative (not masked tautology)");
 }
 
 /* Runnable accounting contract. */

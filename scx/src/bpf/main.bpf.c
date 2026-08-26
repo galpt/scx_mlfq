@@ -63,14 +63,17 @@ struct {
  * Per-CPU Q1 occupancy for SMT isolation, keyed by cpu id.
  *
  * One byte per CPU padded to 8 bytes for map value alignment.
- * The map is per-CPU ARRAY, not BSS, so occupancy updates are
- * plain per-CPU slots without __sync_* on a shared cache line.
- * Place maps with proper SEC(".maps") and keep the cache-line
- * isolation from mlfq_stats: the occupancy slots live in the
- * array map, never on the BSS stats line.
+ * The map is per-CPU ARRAY primary, with ARRAY fallback if the
+ * verifier rejects the per-CPU variant (the fallback keeps the 8B
+ * value and per-CPU lookup semantics via bpf_map_lookup_elem on
+ * the current CPU). Occupancy updates are plain per-CPU stores
+ * without __sync_* on a shared cache line. Place maps with proper
+ * SEC(".maps") and keep the cache-line isolation from mlfq_stats:
+ * the occupancy slots live in the array map, never on the BSS stats
+ * line. The rodata tables (mlfq_cpu_sibling, etc.) remain.
  */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, MLFQ_MAX_CPUS);
 	__type(key, u32);
 	__type(value, struct mlfq_q1_occupancy);
@@ -597,6 +600,48 @@ static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
 #include "select_cpu.bpf.c"
 #include "enqueue.bpf.c"
 #include "dispatch.bpf.c"
+
+/*
+ * amdgpu gpu_submit tracepoints: optional, about 200 insn, no loop.
+ * Each cs increments the task's gpu_submit quantised 0..4 (min(+1,4))
+ * and sets MLFQ_TF_DRM_WAKE for the select_cpu broadening. The flag
+ * is cleared after the WAKE_SYNC insert. Per-queue bounded-lag is
+ * preserved, verifier 1M/512B, no new loop.
+ */
+static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p)
+{
+	struct task_ctx *tctx = mlfq_lookup_task_ctx(p);
+
+	if (!tctx)
+		return;
+	if (tctx->gpu_submit < 4)
+		tctx->gpu_submit++;
+	else
+		tctx->gpu_submit = 4;
+	tctx->flags |= MLFQ_TF_DRM_WAKE;
+}
+
+SEC("?tracepoint/amdgpu/amdgpu_cs")
+int mlfq_amdgpu_cs(void *ctx)
+{
+	struct task_struct *p = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!p)
+		return 0;
+	mlfq_gpu_submit_inc(p);
+	return 0;
+}
+
+SEC("?tracepoint/amdgpu/amdgpu_cs_ioctl")
+int mlfq_amdgpu_cs_ioctl(void *ctx)
+{
+	struct task_struct *p = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!p)
+		return 0;
+	mlfq_gpu_submit_inc(p);
+	return 0;
+}
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 {

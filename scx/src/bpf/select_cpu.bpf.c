@@ -192,20 +192,22 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu;
 
 	/* SCX_WAKE_SYNC fast-path: synchronous waker handoff for Q1/Q2.
-	 * Strategy: when wake_flags carries SCX_WAKE_SYNC and the wakee
-	 * is Q1/Q2, keep cache hot by staying on waker's CPU. Affinity
-	 * is checked, RT hard gate (mlfq_cpu_occupied) is never relaxed
-	 * and strands Q1/Q2 behind an RT-occupied LOCAL until rtdl drain;
-	 * RT-occupied waker CPU falls through to regular placement.
-	 * SMT sibling veto is intentionally bypassed for this handoff
-	 * (cache-hot policy, zero-knob). Null cur (bpf_get_current_task_btf
-	 * failed) also falls through. The insert uses SCX_DSQ_LOCAL +
-	 * SCX_ENQ_IMMED (never SCX_ENQ_HEAD) as the zero-knob policy and
-	 * the queue's own slice (Q1 1ms, Q2 2ms) to match enqueue's
-	 * per-queue slice, not SCX_SLICE_DFL (20ms), so the dispatch
-	 * slice accounting stays consistent.
+	 * Strategy: when wake_flags carries SCX_WAKE_SYNC or the task
+	 * carries MLFQ_TF_DRM_WAKE and the wakee is Q1/Q2, keep cache hot
+	 * by staying on waker's CPU. Affinity is checked, RT hard gate
+	 * (mlfq_cpu_occupied) is never relaxed and strands Q1/Q2 behind
+	 * an RT-occupied LOCAL until rtdl drain; RT-occupied waker CPU
+	 * falls through to regular placement. SMT sibling veto is
+	 * intentionally bypassed for this handoff (cache-hot policy,
+	 * zero-knob). Null cur (bpf_get_current_task_btf failed) also
+	 * falls through. The insert uses SCX_DSQ_LOCAL + SCX_ENQ_IMMED
+	 * (never SCX_ENQ_HEAD) as the zero-knob policy and the queue's
+	 * own slice (Q1 1ms, Q2 2ms) to match enqueue's per-queue slice,
+	 * not SCX_SLICE_DFL (20ms), so the dispatch slice accounting stays
+	 * consistent. MLFQ_TF_DRM_WAKE is cleared after the insert, no
+	 * new branch depth, no new loop.
 	 */
-	if ((wake_flags & SCX_WAKE_SYNC) && tctx->queue <= 2) {
+	if (((wake_flags & SCX_WAKE_SYNC) || (tctx->flags & MLFQ_TF_DRM_WAKE)) && tctx->queue <= 2) {
 		struct task_struct *cur = bpf_get_current_task_btf();
 
 		if (cur) {
@@ -219,9 +221,11 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
 						   SCX_ENQ_IMMED);
+				tctx->flags &= ~MLFQ_TF_DRM_WAKE;
 				return cur_cpu;
 			}
 		}
+		tctx->flags &= ~MLFQ_TF_DRM_WAKE;
 	}
 
 	/* Clear any fast-path state from a previous select_cpu(). */

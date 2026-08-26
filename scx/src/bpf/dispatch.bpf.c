@@ -189,12 +189,14 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			tier_a_nr = MLFQ_LLC_SCAN_MAX;
 	}
 
+	/* Hoist off and mlfq_dsq_id reuse: off computed once per queue, dsq ids reused via locals. 3072 tail cut documented: MLFQ_ALPHA 3072 is the EMA tail cut. No new bpf_for. */
+	u32 off = cpu_state ? cpu_state->steal_scan_off % (u32)nr_cpus : 0;
+
 	bpf_for(slot, 0, quota) {
 		struct task_struct *best = NULL;
 		u64 best_dsq = 0;
 		s32 best_cpu = cpu;
 		u32 cand, i;
-		u32 off = cpu_state ? cpu_state->steal_scan_off % (u32)nr_cpus : 0;
 		bool tier_a_ran = false;
 
 		/*
@@ -246,6 +248,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			tier_a_ran = true;
 			bpf_for(i, 0, MLFQ_LLC_SCAN_MAX) {
 				struct task_struct *t;
+				u64 cand_dsq;
 				u32 idx = (off + i) % MLFQ_LLC_SCAN_MAX;
 
 				if (idx >= nr)
@@ -253,16 +256,18 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 				cand = llc_cpus[idx];
 				if (cand == (u32)cpu)
 					continue;
-				if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
+				cand_dsq = mlfq_dsq_id(qid, cand);
+				/* Tighten nr_queued gate before peek, hoist dsq id. */
+				if (!scx_bpf_dsq_nr_queued(cand_dsq))
 					continue;
-				t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
+				t = __COMPAT_scx_bpf_dsq_peek(cand_dsq);
 				if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
 					continue;
 				if (!best ||
 				    mlfq_time_before(t->scx.dsq_vtime,
 						     best->scx.dsq_vtime)) {
 					best = t;
-					best_dsq = mlfq_dsq_id(qid, cand);
+					best_dsq = cand_dsq;
 					best_cpu = (s32)cand;
 				}
 			}
@@ -311,24 +316,28 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 					continue;
 				/*
 				 * Gate on nr_queued first: a cheap lockless
-				 * read that skips the peek for empty DSQs.
+				 * read that skips the peek for empty DSQs. Hoist dsq id.
 				 */
-				if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
-					continue;
-				t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
-				if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-					continue;
-				/*
-				 * Prefer the earlier deadline, the same
-				 * time_before64() order the kernel's priq
-				 * uses (scx_dsq_priq_less()).
-				 */
-				if (!best ||
-				    mlfq_time_before(t->scx.dsq_vtime,
-						     best->scx.dsq_vtime)) {
-					best = t;
-					best_dsq = mlfq_dsq_id(qid, cand);
-					best_cpu = (s32)cand;
+				{
+					u64 cand_dsq = mlfq_dsq_id(qid, cand);
+
+					if (!scx_bpf_dsq_nr_queued(cand_dsq))
+						continue;
+					t = __COMPAT_scx_bpf_dsq_peek(cand_dsq);
+					if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+						continue;
+					/*
+					 * Prefer the earlier deadline, the same
+					 * time_before64() order the kernel's priq
+					 * uses (scx_dsq_priq_less()).
+					 */
+					if (!best ||
+					    mlfq_time_before(t->scx.dsq_vtime,
+							     best->scx.dsq_vtime)) {
+						best = t;
+						best_dsq = cand_dsq;
+						best_cpu = (s32)cand;
+					}
 				}
 			}
 		}

@@ -314,18 +314,18 @@ enum mlfq_consts {
 	 * intf.h) fails loudly at the parse instead of misreading the
 	 * fields.
 	 */
-	MLFQ_TREE_SAMPLE_VERSION	= 3,
+	MLFQ_TREE_SAMPLE_VERSION	= 4,
 
 	/*
 	 * Number of features the CART splitter may use. The fitter caps
 	 * split feature ids to [0, MLFQ_TREE_NR_FEATURES), so a value
 	 * here is the contract with mlfq_tree.rs and the walk's feat[]
-	 * indexing. The 7.1-only ABI carries eight split features
+	 * indexing. The 1.3.11 ABI carries nine split features
 	 * (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
-	 * queue_wait, sq_ema) and the var-ratio remains as an additional
-	 * carry-along feature for future splits.
+	 * queue_wait, sq_ema, gpu_submit) with sleep_var_ratio remain
+	 * carry-along quantised via FP_SHIFT (0..4 steps).
 	 */
-	MLFQ_TREE_NR_FEATURES		= 8,
+	MLFQ_TREE_NR_FEATURES		= 9,
 
 	/*
 	 * Adaptation control law. The adaptation is a proportional-only
@@ -431,6 +431,13 @@ enum mlfq_task_flags {
 	 * is never attributed a wakeup latency it did not have.
 	 */
 	MLFQ_TF_ENQ_WAKEUP		= 1U << 1,
+	/*
+	 * The enqueue was a DRM gpu_submit wakeup (amdgpu_cs). Set by
+	 * the amdgpu tracepoints, observed by select_cpu to broaden
+	 * WAKE_SYNC, cleared after the insert. The flag is advisory
+	 * and is not persisted across the measurement.
+	 */
+	MLFQ_TF_DRM_WAKE			= 1U << 2,
 };
 
 /*
@@ -467,20 +474,21 @@ enum mlfq_task_flags {
  * 7.1 ABI adds sleep_var_ratio, the fixed-point (FP_SHIFT=8) variation
  * ratio of sleep intervals, to capture frame-cadence regularity; it
  * stays carry-along until the fitter promotes it. sq_ema remains at
- * offset 40, sleep_var_ratio at 48, pad preserves 8-byte tail
- * alignment. The resulting 56-byte record keeps every u64 at an
- * 8-byte offset and the packed sample at 76 bytes.
+ * offset 40, sleep_var_ratio at 48. The 1.3.11 ABI adds gpu_submit,
+ * the quantised (FP_SHIFT 0..4) gpu submission count, at offset 56
+ * with pad2 for 64-byte alignment. The resulting 64-byte record keeps
+ * every u64 at an 8-byte offset and the packed sample at 84 bytes.
  *
  * Why clamp: wake_lat/queue_wait are bounded via _MAX constants and
  * label clamp, so the fitter's f64 sums stay overflow-free; the var
  * ratio is FP_ONE-scaled and clamped to [0, FP_ONE*2] to bound
- * threshold midpoints.
+ * threshold midpoints; gpu_submit is clamped to [0,4] quant steps.
  *
  * Strategy helper: classification selects the queue via the tree
  * walk (Strategy) observing this feature state (Observer) without a
  * vtable; helpers are static inline.
  *
- * 56 bytes, packed fields naturally aligned.
+ * 64 bytes, packed fields naturally aligned.
  */
 struct mlfq_tree_feats {
 	u64 prev_burst_ns;		/* last completed run segment */
@@ -492,7 +500,9 @@ struct mlfq_tree_feats {
 	u32 queue_wait_us;		/* last enqueue-to-run wait, us */
 	u64 sq_ema;			/* service-quality EMA, ns */
 	u32 sleep_var_ratio;		/* sleep variation ratio, FP_SHIFT fixed point */
-	u32 pad;			/* explicit pad for 56-byte alignment */
+	u32 pad;			/* explicit pad for 64-byte alignment */
+	u32 gpu_submit;			/* gpu submissions quantised 0..4, FP_SHIFT steps */
+	u32 pad2;			/* explicit pad for 64-byte alignment */
 };
 
 /*
@@ -572,22 +582,22 @@ extern volatile struct mlfq_tree_ctrl mlfq_tree_ctrl;
  * struct mlfq_tree_sample - One training sample for the daemon.
  *
  * Theorem: the ring-buffer record is the atomic training unit.
- * Invariant: 76 bytes packed aligned(4), field order is the shared ABI.
+ * Invariant: 84 bytes packed aligned(4), field order is the shared ABI.
  *
- * Derivation: pid/queue (8 bytes) + feats 56 bytes + label 8 bytes +
- * version 4 bytes = 76. The feats vector is the 56-byte form (sq_ema
- * at 40, sleep_var_ratio at 48). label_ns is clamped to
+ * Derivation: pid/queue (8 bytes) + feats 64 bytes + label 8 bytes +
+ * version 4 bytes = 84. The feats vector is the 64-byte form (sq_ema
+ * at 40, sleep_var_ratio at 48, gpu_submit at 56). label_ns is clamped to
  * MLFQ_TREE_LABEL_MAX_NS, so the fitter's f64 sums never sum near-u64
  * values.
  *
- * Why clamp: version is MLFQ_TREE_SAMPLE_VERSION (3 for 7.1 ABI);
+ * Why clamp: version is MLFQ_TREE_SAMPLE_VERSION (4 for 1.3.11 ABI);
  * mismatch drops the record instead of misreading fields.
  *
  * Observer helper: stopping path observes task state to emit this
  * record; daemon observes the ring buffer (Observer) without shared
  * state.
  *
- * 76 bytes packed aligned(4); every field keeps its natural offset.
+ * 84 bytes packed aligned(4); every field keeps its natural offset.
  */
 struct mlfq_tree_sample {
 	u32 pid;
@@ -598,33 +608,34 @@ struct mlfq_tree_sample {
 } __attribute__((packed, aligned(4)));
 
 /* ABI layout pins: compiled on every build, native and BPF. */
-_Static_assert(sizeof(struct mlfq_tree_feats) == 56,
-	       "mlfq_tree_feats must be 56 bytes (sq_ema at 40, var_ratio at 48)");
-_Static_assert(sizeof(struct mlfq_tree_sample) == 76,
-	       "mlfq_tree_sample must be 76 bytes (packed, aligned(4))");
+_Static_assert(sizeof(struct mlfq_tree_feats) == 64,
+	       "mlfq_tree_feats must be 64 bytes (sq_ema at 40, var_ratio at 48, gpu_submit at 56)");
+_Static_assert(sizeof(struct mlfq_tree_sample) == 84,
+	       "mlfq_tree_sample must be 84 bytes (packed, aligned(4))");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, sq_ema) == 40,
 	       "sq_ema must sit at offset 40");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, sleep_var_ratio) == 48,
 	       "sleep_var_ratio must sit at offset 48");
-_Static_assert(__builtin_offsetof(struct mlfq_tree_sample, label_ns) == 64,
-	       "label_ns must sit at offset 64 (pid 0, queue 4, feats 8+56)");
-_Static_assert(__builtin_offsetof(struct mlfq_tree_sample, version) == 72,
-	       "version must sit at offset 72");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_feats, gpu_submit) == 56,
+	       "gpu_submit must sit at offset 56");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_sample, label_ns) == 72,
+	       "label_ns must sit at offset 72 (pid 0, queue 4, feats 8+64)");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_sample, version) == 80,
+	       "version must sit at offset 80");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, prev_burst_ns) == 0,
 	       "prev_burst_ns at 0");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, wake_lat_us) == 32,
 	       "wake_lat_us at 32");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, queue_wait_us) == 36,
 	       "queue_wait_us at 36");
-/* Masking asymmetry: BPF walk feat[8] uses &0x7 (keeps 0..7, id 8
- * carry-along masks to 0 and routes left); Rust feat_value matches
- * with match 0..8 (id 8 carry-along) and  _=>0 fallback. The plain
- * < NR_FEATURES check is authoritative (not &0x7<8 which is tautological).
- * NR_FEATURES 8, so feat[8] holds eight split features and id 8
- * sleep_var_ratio stays carry-along zero until promoted.
+/* Masking asymmetry: BPF walk feat[9] uses &0xF (keeps 0..15, covers 0..8,
+ * id 9+ masks and routes left); Rust feat_value matches with match 0..9
+ * and _=>0 fallback. The plain < NR_FEATURES check is authoritative
+ * (not &0xF<9 which is tautological). NR_FEATURES 9, so feat[9] holds
+ * nine split features and gpu_submit at 8 is quantised 0..4.
  */
-_Static_assert(MLFQ_TREE_NR_FEATURES == 8,
-	       "NR_FEATURES must be 8 for 7.1 ABI (feat[8] 0..7 split, 8 carry-along)");
+_Static_assert(MLFQ_TREE_NR_FEATURES == 9,
+	       "NR_FEATURES must be 9 for 1.3.11 ABI (feat[9] 0..8 split, gpu_submit quant 0..4)");
 
 /*
  * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
@@ -643,12 +654,13 @@ _Static_assert(MLFQ_TREE_NR_FEATURES == 8,
  * bounded-lag clamp, vlag >=0.
  *
  * Derivation: 96-byte classification/vtime block, 24-byte
- * enqueue-to-run measurement block, plus the 72-byte MLFQ tree sample
- * block (the 56-byte feature vector plus pending_queue and
+ * enqueue-to-run measurement block, plus the 80-byte MLFQ tree sample
+ * block (the 64-byte feature vector plus pending_queue and
  * pending_valid padded to 64-bit) plus 24-byte sleep cadence EMA
- * block (mean 8, var 8, ratio 4 + pad 4). Total 216 bytes for the
- * 7.1 ABI (56-byte feats + cadence). The 56-byte vector keeps sq_ema
- * at 40 and sleep_var_ratio at 48.
+ * block (mean 8, var 8, ratio 4 + pad 4) plus 4-byte gpu_submit.
+ * Total 220 bytes for the 1.3.11 ABI (64-byte feats + cadence +
+ * gpu_submit at 216). The 64-byte vector keeps sq_ema at 40,
+ * sleep_var_ratio at 48 and gpu_submit at 56 quantised 0..4.
  *
  * Why clamp: placement lag clamped to [0, limit] for bounded-lag;
  * service EMAs clamped to MAX to bound thresholds and f64 sums.
@@ -757,16 +769,20 @@ struct task_ctx {
 	struct mlfq_tree_feats pending_feats;
 	u32 pending_queue;		/* queue at the capture */
 	u64 pending_valid;
+	u32 gpu_submit;			/* gpu submissions, quantised 0..4, decay on idle */
+	u32 pad3;			/* pad to 8-byte alignment, keeps 220 bytes */
 };
 
-_Static_assert(sizeof(struct task_ctx) == 216,
-	       "task_ctx must be 216 bytes for 7.1 ABI (56-byte feats + 24-byte cadence)");
+_Static_assert(sizeof(struct task_ctx) == 232,
+	       "task_ctx must be 232 bytes for 1.3.11 ABI (64-byte feats + cadence + gpu_submit, unpacked)");
 _Static_assert(__builtin_offsetof(struct task_ctx, pending_feats) == 144,
 	       "pending_feats at 144");
-_Static_assert(__builtin_offsetof(struct task_ctx, pending_queue) == 200,
-	       "pending_queue at 200");
-_Static_assert(__builtin_offsetof(struct task_ctx, pending_valid) == 208,
-	       "pending_valid at 208");
+_Static_assert(__builtin_offsetof(struct task_ctx, pending_queue) == 208,
+	       "pending_queue at 208");
+_Static_assert(__builtin_offsetof(struct task_ctx, pending_valid) == 216,
+	       "pending_valid at 216");
+_Static_assert(__builtin_offsetof(struct task_ctx, gpu_submit) == 224,
+	       "gpu_submit must sit at offset 224");
 _Static_assert(__builtin_offsetof(struct task_ctx, sleep_mean_ema) == 120,
 	       "sleep_mean_ema at 120");
 _Static_assert(__builtin_offsetof(struct task_ctx, sleep_var_ratio) == 136,
@@ -1859,18 +1875,18 @@ static __always_inline bool mlfq_check_tree_feature(u8 feature)
 {
 	/*
 	 * Theorem: the split feature must be within the populated ABI.
-	 * Derivation: 7.1 ABI populates eight split features (0..7:
+	 * Derivation: 1.3.11 ABI populates nine split features (0..8:
 	 * prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
-	 * queue_wait, sq_ema). The fitter caps splits to
-	 * [0, MLFQ_TREE_NR_FEATURES), and sleep_var_ratio at id 8 is
+	 * queue_wait, sq_ema, gpu_submit). The fitter caps splits to
+	 * [0, MLFQ_TREE_NR_FEATURES), and sleep_var_ratio at id 9 is
 	 * carry-along for the next ABI (its slot stays zeroed until
-	 * NR_FEATURES promotes it; BPF walk feat[8] keeps &0x7 mask
-	 * for the 8-slot walk, so id 8 masks to 0 and routes left as
+	 * NR_FEATURES promotes it; BPF walk feat[9] keeps &0xF mask
+	 * for the 9-slot walk, so id 9 masks to 1 and routes left as
 	 * the documented carry-along).
-	 * Why clamp: a feature id >= NR_FEATURES (>=8) would address
-	 * outside feat[8] or read the zeroed carry-along guard; the
+	 * Why clamp: a feature id >= NR_FEATURES (>=9) would address
+	 * outside feat[9] or read the zeroed carry-along guard; the
 	 * plain < bound is the authoritative ABI check, not the masked
-	 * form (&0x7 <8) which is tautological.
+	 * form (&0xF <9) which is tautological.
 	 *
 	 * Strategy helper: the walk observes the feature vector
 	 * (Strategy pattern without vtable) via this predicate.
@@ -1900,15 +1916,15 @@ static __always_inline bool mlfq_check_bands(u64 t_l, u64 t_h,
  * @store: The tree buffer (one entry of mlfq_tree_map).
  * @f: The feature vector.
  *
- * Theorem: the walk is a bounded, masked descent over the 8-feature
+ * Theorem: the walk is a bounded, masked descent over the 9-feature
  * tree (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
- * queue_wait, sq_ema). Invariant: depth <= MLFQ_TREE_MAX_DEPTH.
+ * queue_wait, sq_ema, gpu_submit). Invariant: depth <= MLFQ_TREE_MAX_DEPTH.
  *
  * Derivation: every index is masked to the node budget
  * (MLFQ_TREE_MAX_NODES - 1), so a corrupted tree can never address
- * outside the buffer. feat[8] holds the eight split features in order;
- * sleep_var_ratio at feat id 8 is carry-along (the 7.1 ABI keeps it
- * out of the split range, so a tree splitting on 8 is rejected by
+ * outside the buffer. feat[9] holds the nine split features in order;
+ * sleep_var_ratio at feat id 9 is carry-along (the 1.3.11 ABI keeps it
+ * out of the split range, so a tree splitting on 9 is rejected by
  * mlfq_check_tree_feature). An out-of-range feature reads the zeroed
  * slot, and a walk past the tail lands on a zeroed node predicting 0.
  * The walk is the Strategy observed via the feature vector (Observer)
@@ -1924,9 +1940,9 @@ static __always_inline u64
 mlfq_tree_walk(const struct mlfq_tree_store *store,
 	       const struct mlfq_tree_feats *f)
 {
-	u64 feat[8] = { f->prev_burst_ns, f->sleep_ns, f->ema,
+	u64 feat[9] = { f->prev_burst_ns, f->sleep_ns, f->ema,
 			f->io_wait, f->wake_cnt, f->wake_lat_us,
-			f->queue_wait_us, f->sq_ema };
+			f->queue_wait_us, f->sq_ema, f->gpu_submit };
 	u32 idx = 0, nidx;
 	const struct mlfq_tree_node *n;
 	u8 feature;
@@ -1942,12 +1958,12 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 		if (n->right == 0)
 			return n->left;
 
-		/* BPF walk masks to 0..7 for the 8-slot feat[]; id 8
-		 * carry-along (sleep_var_ratio) masks to 0 and routes
-		 * left. Rust keeps feat[16] with id 8 as carry-along and
+		/* BPF walk masks to 0..15 for the 9-slot feat[]; id 9
+		 * carry-along (sleep_var_ratio) masks to 1 and routes
+		 * left. Rust keeps feat[16] with id 9 as carry-along and
 		 *  _=>0 fallback. Mask asymmetry documented above.
 		 */
-		feature = n->feature & 0x7;
+		feature = n->feature & 0xF;
 #if MLFQ_CHECK
 		if (!mlfq_check_tree_feature(feature))
 			return 0;

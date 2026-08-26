@@ -50,6 +50,9 @@ static __always_inline void mlfq_sleep_ema_update(struct task_ctx *tctx,
 						     MLFQ_EMA_HALF_LIFE_NS);
 		if (!tctx->sleep_mean_ema)
 			tctx->sleep_var_ema = 0;
+		/* Decay gpu_submit on long idle, keep quant 0..4. */
+		if (tctx->gpu_submit)
+			tctx->gpu_submit--;
 	} else {
 		old_mean = tctx->sleep_mean_ema;
 		new_mean = (old_mean * 248 + sleep_ns * 8) / 256;
@@ -99,6 +102,8 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 	tctx->sleep_var_ema = 0;
 	tctx->sleep_var_ratio = 0;
 	tctx->pad2 = 0;
+	tctx->gpu_submit = 0;
+	tctx->pad3 = 0;
 	/*
 	 * The runnable-ownership record starts unowned. A fresh task is
 	 * not counted in the per-LLC/per-queue gauges until its first

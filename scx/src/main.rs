@@ -342,6 +342,10 @@ impl<'a> Scheduler<'a> {
                 true,
             );
         }
+        /* ?tracepoint autoload gating for amdgpu: the SEC("?tracepoint/...")
+         * makes the amdgpu_cs and amdgpu_cs_ioctl programs optional, so
+         * kernels without the amdgpu tracepoints load fine. No hard fail.
+         */
 
         let mut skel = scx_ops_load!(skel, mlfq_ops, uei)?;
 
@@ -991,6 +995,15 @@ impl<'a> Scheduler<'a> {
                 .expect("bss_data missing, the BPF object has no .bss section");
             bss.mlfq_tree_ctrl.meta
         };
+        let old_gen = old_meta >> crate::bpf_intf::MLFQ_TREE_META_GENERATION_SHIFT;
+        // Monotonic generation check: new gen must exceed old, fail otherwise.
+        if gen <= old_gen && old_gen != 0 {
+            anyhow::bail!(
+                "monotonic gen violation: new {} <= old {}",
+                gen,
+                old_gen
+            );
+        }
         let old_active = (old_meta >> 1) & 1;
         let new_active = 1 - old_active;
         let key = (new_active as u32).to_ne_bytes();

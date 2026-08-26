@@ -37,9 +37,9 @@ const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NO
 /// Walk depth bound of the shared store entry, from `src/bpf/intf.h`.
 const MLFQ_TREE_MAX_DEPTH: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_DEPTH as usize;
 
-/// Number of populated features; ids 0..7 index the walk's `feat[8]` slots,
-/// sleep_var_ratio at id 8 is carry-along for the next ABI.
-const MLFQ_TREE_NR_FEATURES: usize = 8;
+/// Number of populated features; ids 0..8 index the walk's `feat[9]` slots,
+/// sleep_var_ratio at id 9 is carry-along for the next ABI, gpu_submit at 8 quantised 0..4.
+const MLFQ_TREE_NR_FEATURES: usize = 9;
 
 /// Default minimum relative variance reduction for a split.
 ///
@@ -57,8 +57,8 @@ pub const DEFAULT_MIN_REL_VAR_REDUCTION: f64 = 1e-3;
 /// Field order is part of the shared ABI with the BPF sample struct and
 /// the emitted `mlfq_tree_sample` layout. `prev_burst_ns`, `sleep_ns`,
 /// `ema`, `io_wait`, `wake_cnt`, then the measured service fields
-/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`) and the cadence feature
-/// (`sleep_var_ratio`).
+/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`), the cadence feature
+/// (`sleep_var_ratio`) and the gpu feature (`gpu_submit` quant 0..4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct TreeFeats {
@@ -80,8 +80,12 @@ pub struct TreeFeats {
     pub sq_ema: u64,
     /// Sleep variation ratio, FP_SHIFT fixed point (8).
     pub sleep_var_ratio: u32,
-    /// Pad to 56 bytes, keeps 8-byte tail alignment.
+    /// Pad to 64-byte alignment.
     pub pad: u32,
+    /// GPU submissions quantised 0..4.
+    pub gpu_submit: u32,
+    /// Pad to 64 bytes, keeps 8-byte tail alignment.
+    pub pad2: u32,
 }
 
 /// One training sample, the mirror of `struct mlfq_tree_sample`.
@@ -91,7 +95,7 @@ pub struct TreeFeats {
 /// `MLFQ_TREE_SAMPLE_VERSION` and is checked by the daemon's parse, so
 /// a record from an out-of-tree producer fails the check instead of
 /// being misread. The BPF struct is `packed, aligned(4)` to keep the
-/// record at 76 bytes, so this mirror is packed identically; every
+/// record at 84 bytes, so this mirror is packed identically; every
 /// field sits at its naturally aligned offset, and the daemon reads the
 /// record with `read_unaligned`.
 #[derive(Clone, Copy, Debug)]
@@ -142,11 +146,11 @@ pub struct SerializedTree {
     pub nodes: Vec<TreeNode>,
 }
 
-/// Feature value for a feature id, matching the BPF walk's `feat[8]` slot
-/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..7 are the split
+/// Feature value for a feature id, matching the BPF walk's `feat[9]` slot
+/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..8 are the split
 /// features (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
-/// queue_wait, sq_ema), id 8 the cadence ratio (carry-along, split
-/// when NR_FEATURES promotes it), and the rest zero.
+/// queue_wait, sq_ema, gpu_submit), id 9 the cadence ratio (carry-along,
+/// split when NR_FEATURES promotes it), and the rest zero.
 fn feat_value(f: TreeFeats, id: u8) -> u64 {
     match id {
         0 => f.prev_burst_ns,
@@ -157,7 +161,8 @@ fn feat_value(f: TreeFeats, id: u8) -> u64 {
         5 => f.wake_lat_us as u64,
         6 => f.queue_wait_us as u64,
         7 => f.sq_ema,
-        8 => f.sleep_var_ratio as u64,
+        8 => f.gpu_submit as u64,
+        9 => f.sleep_var_ratio as u64,
         _ => 0,
     }
 }
@@ -441,7 +446,7 @@ pub fn fit(
 /// Every node count must sit in `[1, MLFQ_TREE_MAX_NODES]`. Every node
 /// must be reachable from the root. Every leaf (`right == 0`) is
 /// unconstrained beyond that. Every internal node must split on a feature
-/// id below the five populated slots, both children must be in-bounds,
+/// id below the nine populated slots, both children must be in-bounds,
 /// and both must follow the parent in the BFS order (parents before
 /// children), which the store layout relies on.
 ///
@@ -529,7 +534,7 @@ pub fn serialize_validate(tree: &SerializedTree) -> Result<(), String> {
 ///
 /// The walk descends at most `MLFQ_TREE_MAX_DEPTH` internal nodes, masking
 /// every index with `MLFQ_TREE_MAX_NODES - 1`, splitting on
-/// `feature & 0x7`, and returning `left` for a leaf (`right == 0`). A
+/// `feature & 0xF`, and returning `left` for a leaf (`right == 0`). A
 /// masked index past the live nodes of an unpadded tree reads like a
 /// zeroed store node (a leaf predicting 0). Depth exhausted, the last
 /// reachable node's `left` is returned only when that node is a leaf; an
@@ -551,8 +556,8 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         feats.wake_lat_us as u64,
         feats.queue_wait_us as u64,
         feats.sq_ema,
+        feats.gpu_submit as u64,
         feats.sleep_var_ratio as u64,
-        0,
         0,
         0,
         0,
@@ -571,7 +576,7 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         if node.right == 0 {
             return node.left as u64;
         }
-        let feature = (node.feature & 0x7) as usize;
+        let feature = (node.feature & 0xF) as usize;
         let next = if feat[feature] <= node.threshold {
             node.left as usize
         } else {
@@ -792,8 +797,8 @@ mod tests {
             feats.wake_lat_us as u64,
             feats.queue_wait_us as u64,
             feats.sq_ema,
+            feats.gpu_submit as u64,
             feats.sleep_var_ratio as u64,
-            0,
             0,
             0,
             0,
@@ -811,7 +816,7 @@ mod tests {
             if node.right == 0 {
                 return idx;
             }
-            let feature = (node.feature & 0x7) as usize;
+            let feature = (node.feature & 0xF) as usize;
             let next = if feat[feature] <= node.threshold {
                 node.left as usize
             } else {
@@ -1115,9 +1120,9 @@ mod tests {
         let fit_ok = |min_rel: f64| fit(&samples, 4, 1, 31, min_rel);
         assert!(serialize_validate(&fit_ok(0.0)).is_ok());
 
-        // Internal node splitting on feature 8 (beyond NR_FEATURES 8).
+        // Internal node splitting on feature 9 (beyond NR_FEATURES 9).
         let mut bad = fit_ok(0.0);
-        bad.nodes[0].feature = 8;
+        bad.nodes[0].feature = 9;
         assert!(serialize_validate(&bad).is_err());
 
         // Child index out of range.
@@ -1489,8 +1494,8 @@ mod tests {
         assert_eq!(size_of::<TreeFeats>(), size_of::<mlfq_tree_feats>());
         assert_eq!(size_of::<TreeNode>(), size_of::<mlfq_tree_node>());
         assert_eq!(size_of::<TreeSample>(), size_of::<mlfq_tree_sample>());
-        assert_eq!(size_of::<TreeFeats>(), 56);
-        assert_eq!(size_of::<TreeSample>(), 76);
+        assert_eq!(size_of::<TreeFeats>(), 64);
+        assert_eq!(size_of::<TreeSample>(), 84);
         assert_eq!(size_of::<TreeNode>(), 24);
 
         assert_eq!(
@@ -1526,11 +1531,17 @@ mod tests {
             offset_of!(TreeFeats, sleep_var_ratio),
             offset_of!(mlfq_tree_feats, sleep_var_ratio)
         );
+        assert_eq!(
+            offset_of!(TreeFeats, gpu_submit),
+            offset_of!(mlfq_tree_feats, gpu_submit)
+        );
         assert_eq!(offset_of!(TreeFeats, wake_lat_us), 32);
         assert_eq!(offset_of!(TreeFeats, queue_wait_us), 36);
         assert_eq!(offset_of!(TreeFeats, sq_ema), 40);
         assert_eq!(offset_of!(TreeFeats, sleep_var_ratio), 48);
         assert_eq!(offset_of!(TreeFeats, pad), 52);
+        assert_eq!(offset_of!(TreeFeats, gpu_submit), 56);
+        assert_eq!(offset_of!(TreeFeats, pad2), 60);
 
         assert_eq!(
             offset_of!(TreeNode, threshold),
@@ -1571,8 +1582,8 @@ mod tests {
         );
         assert_eq!(offset_of!(TreeSample, queue), 4);
         assert_eq!(offset_of!(TreeSample, feats), 8);
-        assert_eq!(offset_of!(TreeSample, label_ns), 64);
-        assert_eq!(offset_of!(TreeSample, version), 72);
+        assert_eq!(offset_of!(TreeSample, label_ns), 72);
+        assert_eq!(offset_of!(TreeSample, version), 80);
     }
 
     #[test]
