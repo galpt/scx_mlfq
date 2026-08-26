@@ -278,17 +278,29 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	}
 
 	/*
-	 * Q3 seed: throughput tasks that never submit GPU work
-	 * (gpu_submit==0) would otherwise never produce Q3 labels if
-	 * the tree learns a gpu_submit>0 split and pushes the Q3
-	 * threshold up. Force one Q3 placement when the previous burst
-	 * and the sleep both indicate Q3 (prev_burst > T_H and
-	 * sleep > MLFQ_SHORT_SLEEP_NS), even when the tree predicts
-	 * Q1, so the emitted sample seeds the next window with Q3
-	 * labels. One branch, no new loop, preserves per-queue EEVDF
-	 * bounded-lag and the 64/84/232 V4 NR9 ABI.
+	 * Q3 seed for throughput tasks that never submit GPU work.
+	 * Throughput tasks with gpu_submit == 0 would otherwise never
+	 * emit Q3 labels once the tree learns a gpu_submit > 0 split
+	 * for Q1 and pushes the Q3 threshold up. Seed one Q3 placement
+	 * when the previous burst exceeds T_H and the sleep exceeds
+	 * MLFQ_SHORT_SLEEP_NS, so the sample completed in stopping()
+	 * carries a Q3 label into the next training window.
+	 *
+	 * Invariant: I/O latency is strictly dominant. The seed is
+	 * gated on !io_wait and ordered after the I/O/short-sleep boost
+	 * (mlfq_ss_boost_pending() / mlfq_boost_eligible()), so a task
+	 * waking from I/O stays in Q1 for this episode even when its
+	 * burst and sleep would otherwise match Q3. This avoids a
+	 * one-episode latency inversion for gpu_submit == 0, long-sleep,
+	 * large-burst I/O tasks. See also mlfq_runout_classify() which
+	 * seeds on the run-out path with no sleep guard (sleep == 0,
+	 * io_wait == 0 there) and is left unchanged.
+	 *
+	 * One branch, no loop. Preserves per-queue EEVDF bounded lag and
+	 * the 64/84/232 V4 NR9 ABI; verifier stays within 1M insn /
+	 * 512B stack.
 	 */
-	if (tctx->gpu_submit == 0 &&
+	if (!io_wait && tctx->gpu_submit == 0 &&
 	    tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns &&
 	    sleep_ns > mlfq_short_sleep_ns && tctx->queue != 3)
 		tctx->queue = 3;
@@ -363,11 +375,15 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 	tctx->wake_cnt = 0;
 
 	/*
-	 * Q3 seed for the run-out path, mirroring the wakeup seed.
-	 * Throughput tasks that never submit GPU work and have a large
-	 * previous burst would otherwise never produce Q3 labels if the
-	 * tree learns a gpu_submit split. Force one Q3 placement when
-	 * the burst indicates Q3, so the next window has Q3 labels.
+	 * Q3 seed for the run-out path, mirroring the wakeup seed except
+	 * for the sleep / I/O gate. A throughput task with gpu_submit == 0
+	 * and a large previous burst (> T_H) would otherwise never emit
+	 * Q3 labels once the tree splits on gpu_submit. Force one Q3
+	 * placement so the next window regains Q3 labels. No sleep check
+	 * here: a run-out re-enqueue has sleep == 0 and io_wait == 0 by
+	 * construction (see the capture above), so the I/O-dominance
+	 * invariant and the MLFQ_SHORT_SLEEP_NS guard only apply to the
+	 * wakeup seed in mlfq_wakeup_classify(). One branch, no loop.
 	 */
 	if (tctx->gpu_submit == 0 &&
 	    tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns &&
