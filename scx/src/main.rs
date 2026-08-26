@@ -372,6 +372,36 @@ impl<'a> Scheduler<'a> {
             );
         }
 
+        // GPU tracepoint availability: probe tracefs for the optional
+        // amdgpu and gpu_sched tracepoints and seed the BPF mask so the
+        // web UI shows "yes" even before the first GPU submit. The BPF
+        // handlers also OR the bits on every bump, so the mask stays
+        // correct if the probe races a first event.
+        {
+            let mut mask: u32 = 0;
+            let has = |path: &str| std::path::Path::new(path).exists();
+            if has("/sys/kernel/debug/tracing/events/amdgpu/amdgpu_cs")
+                || has("/sys/kernel/tracing/events/amdgpu/amdgpu_cs")
+            {
+                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS as u32;
+            }
+            if has("/sys/kernel/debug/tracing/events/amdgpu/amdgpu_cs_ioctl")
+                || has("/sys/kernel/tracing/events/amdgpu/amdgpu_cs_ioctl")
+            {
+                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL as u32;
+            }
+            if has("/sys/kernel/debug/tracing/events/gpu_scheduler/drm_sched_job_queue")
+                || has("/sys/kernel/tracing/events/gpu_scheduler/drm_sched_job_queue")
+            {
+                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_GPU_SCHED as u32;
+            }
+            if mask != 0 {
+                if let Some(bss) = skel.maps.bss_data.as_mut() {
+                    bss.mlfq_gpu_trace_mask |= mask;
+                }
+            }
+        }
+
         let struct_ops = scx_ops_attach!(skel, mlfq_ops)?;
 
         /*
@@ -609,6 +639,7 @@ impl<'a> Scheduler<'a> {
             let state = self.read_cpu_state(cpu);
             entry.running_queue = state.running_queue;
             entry.running_pid = state.running_pid;
+            entry.gpu_submit = state.running_gpu_submit;
 
             let rt = self.read_rtdl_state(cpu);
             entry.rt_occupied = rt.flags & crate::bpf_intf::MLFQ_RTDL_OCCUPIED != 0;
@@ -620,6 +651,8 @@ impl<'a> Scheduler<'a> {
             per_cpu,
             queue_runnable: self.read_queue_runnable(),
             llc_runnable: self.read_llc_runnable(),
+            gpu_submit_total: bss_data.mlfq_gpu_submit_total,
+            gpu_trace_mask: bss_data.mlfq_gpu_trace_mask,
         }
     }
 
@@ -647,6 +680,8 @@ impl<'a> Scheduler<'a> {
                 cpu_ema_at: 0,
                 running_deadline: 0,
                 run_start_at: 0,
+                running_gpu_submit: 0,
+                pad2: 0,
             },
         }
     }

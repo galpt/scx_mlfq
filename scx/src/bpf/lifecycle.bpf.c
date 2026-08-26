@@ -177,6 +177,7 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 		cpu->running_pid = p->pid;
 		cpu->running_deadline = tctx->deadline;
 		cpu->run_start_at = now;
+		cpu->running_gpu_submit = tctx->gpu_submit;
 	}
 
 	/*
@@ -432,6 +433,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		cpu->running_pid = 0;
 		cpu->running_deadline = 0;
 		cpu->run_start_at = 0;
+		cpu->running_gpu_submit = 0;
 	}
 
 	/* Diagnostic runnable count. Guard against wrap-around. */

@@ -124,7 +124,7 @@ fn unix_handle_client(
         st.metrics.clone()
     };
 
-    let (body, content_type) = match path {
+        let (body, content_type) = match path {
         "/" => (html.as_bytes().to_vec(), "text/html; charset=utf-8"),
         "/api/stats" => {
             let stats = serde_json::to_value(&metrics.stats).unwrap_or_default();
@@ -134,6 +134,8 @@ fn unix_handle_client(
                 "per_cpu": per_cpu,
                 "queue_runnable": metrics.queue_runnable,
                 "llc_runnable": metrics.llc_runnable,
+                "gpu_submit_total": metrics.gpu_submit_total,
+                "gpu_trace_mask": metrics.gpu_trace_mask,
             });
             let j = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into());
             (j.into_bytes(), "application/json")
@@ -460,6 +462,8 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
                             "per_cpu": per_cpu,
                             "queue_runnable": metrics.queue_runnable,
                             "llc_runnable": metrics.llc_runnable,
+                            "gpu_submit_total": metrics.gpu_submit_total,
+                            "gpu_trace_mask": metrics.gpu_trace_mask,
                         });
                         let json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".into());
                         let resp = Response::from_string(json)

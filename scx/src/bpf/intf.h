@@ -835,7 +835,7 @@ extern const volatile u32 mlfq_idle_tracking;
  *
  * Theorem: each CPU's running queue, deadline and EMA are the
  * observable state the dispatch and selection helpers observe.
- * Invariant: one entry per CPU, 56 bytes, one cache line; array key
+ * Invariant: one entry per CPU, 64 bytes, one cache line; array key
  * is cpu id.
  *
  * Derivation: running_queue/pid/deadline track the current occupant
@@ -849,7 +849,7 @@ extern const volatile u32 mlfq_idle_tracking;
  * level to [0, SCX_CPUPERF_ONE] and bounds virtual-time math; deadline
  * 0 marks unknown and never preempts.
  *
- * 56 bytes, one cache line.
+ * 64 bytes, one cache line.
  */
 struct mlfq_cpu_state {
 	s32 running_queue;		/* queue of the running task, 0 none */
@@ -859,6 +859,8 @@ struct mlfq_cpu_state {
 	u64 cpu_ema_at;			/* scx_bpf_now() of the last update */
 	u64 running_deadline;		/* running task's deadline, 0 unknown */
 	u64 run_start_at;		/* scx_bpf_now() at ops.running() */
+	u32 running_gpu_submit;		/* gpu_submit 0..4 of the running task */
+	u32 pad2;
 };
 
 /* Per-CPU realtime-occupancy flags. */
@@ -1044,6 +1046,20 @@ struct mlfq_adapt_state {
 extern volatile struct mlfq_sys_gauge mlfq_sys_gauge;
 extern volatile struct mlfq_adapt_state mlfq_adapt_state;
 extern const volatile bool mlfq_adapt_enabled;
+
+/*
+ * GPU submit tracepoint state. mlfq_gpu_submit_total counts every
+ * quantised gpu_submit bump (the per-task 0..4 counter's increments) and
+ * mlfq_gpu_trace_mask records which tracepoints attached at load: bit0
+ * amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched. Both are gauges, not
+ * interval deltas, and are read by the web metrics.
+ */
+#define MLFQ_GPU_TRACE_AMDGPU_CS	(1U << 0)
+#define MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL	(1U << 1)
+#define MLFQ_GPU_TRACE_GPU_SCHED	(1U << 2)
+
+extern volatile u64 mlfq_gpu_submit_total;
+extern volatile u32 mlfq_gpu_trace_mask;
 
 /*
  * Plain u64 bitmap of CPU membership (bit N set = CPU N present). The

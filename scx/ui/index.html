@@ -131,6 +131,18 @@
     <!-- Per-CPU cards -->
     <div id="core-cards" class="core-grid"></div>
 
+    <!-- GPU -->
+    <div class="card" style="margin-bottom:16px" id="gpu-card">
+      <p class="section-label">GPU</p>
+      <div class="sys-grid">
+        <div><span style="color:var(--text-muted)">amdgpu:</span> <span class="stat-value" id="gpu-amdgpu">-</span></div>
+        <div><span style="color:var(--text-muted)">gpu_sched:</span> <span class="stat-value" id="gpu-sched">-</span></div>
+        <div><span style="color:var(--text-muted)">gpu_submit total:</span> <span class="stat-value" id="gpu-total">0</span></div>
+        <div><span style="color:var(--text-muted)">running gpu_submit:</span> <span class="stat-value" id="gpu-running">-</span></div>
+      </div>
+      <p style="font-size:0.75rem;color:var(--text-muted);margin-top:8px" id="gpu-note"></p>
+    </div>
+
     <!-- Summary -->
     <div class="card" style="margin-bottom:16px">
       <p class="section-label">Summary</p>
@@ -359,6 +371,34 @@
       el('guard-eff').textContent = fmt(s.guard_eff_us || 0);
       var shiftPct = ((s.adapt_shift || 0) * 100 / FP_ONE);
       el('adapt-shift').textContent = shiftPct.toFixed(1);
+
+      // GPU card: amdgpu yes/no, gpu_sched yes/no, and current gpu_submit 0..4 for running queue. When both are no, show not supported, not 0.
+      var gpuMask = data.gpu_trace_mask || 0;
+      var amdgpuYes = (gpuMask & 1) || (gpuMask & 2);
+      var gpuSchedYes = (gpuMask & 4) !== 0;
+      el('gpu-amdgpu').textContent = amdgpuYes ? 'yes' : 'no';
+      el('gpu-sched').textContent = gpuSchedYes ? 'yes' : 'no';
+      el('gpu-total').textContent = fmt(data.gpu_submit_total || 0);
+      if (!amdgpuYes && !gpuSchedYes) {
+        el('gpu-running').textContent = 'not supported';
+        el('gpu-note').textContent = 'GPU tracepoints not available on this kernel, gpu_submit stays at 0.';
+      } else {
+        var perCpu = data.per_cpu || [];
+        var running = [];
+        for (var i = 0; i < perCpu.length; i++) {
+          if (perCpu[i].running_queue > 0) {
+            var v = perCpu[i].gpu_submit;
+            if (v !== undefined && v !== null) running.push(v);
+          }
+        }
+        if (running.length === 0) {
+          el('gpu-running').textContent = 'idle';
+        } else {
+          // Show distribution of 0..4 values for the running queue, e.g., "2, 2, 1".
+          el('gpu-running').textContent = running.join(', ');
+        }
+        el('gpu-note').textContent = '';
+      }
 
       // Per-LLC runnable occupancy. One chip per domain with tracked
       // runnable tasks, in domain order. All-zero shows a single muted

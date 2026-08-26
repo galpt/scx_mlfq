@@ -191,6 +191,19 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 		pred = mlfq_tree_predict(&tctx->pending_feats);
 	}
 
+	/*
+	 * Q3 clamp: gpu_submit is Q1-only, not Q3-defining. A leaf that
+	 * splits on gpu_submit>0 must not push the Q3 threshold up for
+	 * throughput tasks that never submit GPU work. A prediction that
+	 * would map to Q3 is therefore demoted to Q2 when the task
+	 * recently submitted GPU work, unless the sleep or the previous
+	 * burst also indicates Q3.
+	 */
+	if (pred >= mlfq_adapt_state.t_bnd_eff_ns && tctx->gpu_submit > 0 &&
+	    !(sleep_ns > mlfq_short_sleep_ns ||
+	      tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns))
+		pred = mlfq_adapt_state.t_bnd_eff_ns - 1;
+
 	if (pred) {
 		/*
 		 * The mapping is promotion-only. The tree is authoritative

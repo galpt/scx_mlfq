@@ -182,6 +182,8 @@ pub struct PerCpuMetrics {
     pub running_pid: u32,
     /// True when a realtime-class task currently occupies the CPU.
     pub rt_occupied: bool,
+    /// GPU submit counter of the currently running task, quantised 0..4.
+    pub gpu_submit: u32,
 }
 
 /// Snapshot served by the web UI's `/api/stats` endpoint.
@@ -201,6 +203,10 @@ pub struct WebMetrics {
     pub queue_runnable: Vec<u64>,
     /// Tracked runnable tasks per LLC domain.
     pub llc_runnable: Vec<u64>,
+    /// Total gpu_submit increments observed.
+    pub gpu_submit_total: u64,
+    /// Bitmask of attached GPU tracepoints (bit0 amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched).
+    pub gpu_trace_mask: u32,
 }
 
 /// Bucket edges of the op-latency histogram, matching `enum

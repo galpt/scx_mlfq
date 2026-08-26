@@ -529,6 +529,7 @@ pub fn web_cpu_static() -> Vec<crate::stats::PerCpuMetrics> {
                 running_queue: 0,
                 running_pid: 0,
                 rt_occupied: false,
+                gpu_submit: 0,
             }
         })
         .collect()

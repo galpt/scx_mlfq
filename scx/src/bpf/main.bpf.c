@@ -133,6 +133,15 @@ volatile u32 mlfq_llc_idle[MLFQ_MAX_LLCS];
 volatile struct mlfq_stats mlfq_stats;
 
 /*
+ * GPU submit gauges. mlfq_gpu_submit_total counts every quantised
+ * gpu_submit bump, mlfq_gpu_trace_mask records which tracepoints
+ * attached (bit0 amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched).
+ * Both are gauges exposed via the web metrics.
+ */
+volatile u64 mlfq_gpu_submit_total;
+volatile u32 mlfq_gpu_trace_mask;
+
+/*
  * System wakeup gauges and the effective adaptation state, placed here
  * so the tree-ctrl cache-line isolation below is preserved.
  *
@@ -611,7 +620,8 @@ static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
  * preserved, verifier 1M/512B, no new loop, and the handlers are
  * knob free and enabled by default when the tracepoints exist.
  */
-static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p)
+static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p,
+						  u32 trace_bit)
 {
 	struct task_ctx *tctx = mlfq_lookup_task_ctx(p);
 
@@ -622,6 +632,8 @@ static __always_inline void mlfq_gpu_submit_inc(struct task_struct *p)
 	else
 		tctx->gpu_submit = 4;
 	tctx->flags |= MLFQ_TF_DRM_WAKE;
+	__sync_fetch_and_add(&mlfq_gpu_submit_total, 1);
+	__sync_fetch_and_or(&mlfq_gpu_trace_mask, trace_bit);
 }
 
 SEC("?tracepoint/amdgpu/amdgpu_cs")
@@ -631,7 +643,7 @@ int mlfq_amdgpu_cs(void *ctx)
 
 	if (!p)
 		return 0;
-	mlfq_gpu_submit_inc(p);
+	mlfq_gpu_submit_inc(p, MLFQ_GPU_TRACE_AMDGPU_CS);
 	return 0;
 }
 
@@ -642,7 +654,7 @@ int mlfq_amdgpu_cs_ioctl(void *ctx)
 
 	if (!p)
 		return 0;
-	mlfq_gpu_submit_inc(p);
+	mlfq_gpu_submit_inc(p, MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL);
 	return 0;
 }
 
@@ -653,7 +665,7 @@ int mlfq_gpu_sched_queue(void *ctx)
 
 	if (!p)
 		return 0;
-	mlfq_gpu_submit_inc(p);
+	mlfq_gpu_submit_inc(p, MLFQ_GPU_TRACE_GPU_SCHED);
 	return 0;
 }
 
