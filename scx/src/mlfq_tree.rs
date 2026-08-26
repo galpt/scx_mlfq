@@ -37,8 +37,9 @@ const MLFQ_TREE_MAX_NODES: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_NO
 /// Walk depth bound of the shared store entry, from `src/bpf/intf.h`.
 const MLFQ_TREE_MAX_DEPTH: usize = crate::bpf_intf::mlfq_consts_MLFQ_TREE_MAX_DEPTH as usize;
 
-/// Number of populated features; ids 0..4 index the walk's `feat[8]` slots.
-const MLFQ_TREE_NR_FEATURES: usize = 5;
+/// Number of populated features; ids 0..7 index the walk's `feat[8]` slots,
+/// sleep_var_ratio at id 8 is carry-along for the next ABI.
+const MLFQ_TREE_NR_FEATURES: usize = 8;
 
 /// Default minimum relative variance reduction for a split.
 ///
@@ -56,7 +57,8 @@ pub const DEFAULT_MIN_REL_VAR_REDUCTION: f64 = 1e-3;
 /// Field order is part of the shared ABI with the BPF sample struct and
 /// the emitted `mlfq_tree_sample` layout. `prev_burst_ns`, `sleep_ns`,
 /// `ema`, `io_wait`, `wake_cnt`, then the measured service fields
-/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`).
+/// (`wake_lat_us`, `queue_wait_us`, `sq_ema`) and the cadence feature
+/// (`sleep_var_ratio`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct TreeFeats {
@@ -76,6 +78,10 @@ pub struct TreeFeats {
     pub queue_wait_us: u32,
     /// Per-task service-quality EMA (nsecs), saturating.
     pub sq_ema: u64,
+    /// Sleep variation ratio, FP_SHIFT fixed point (8).
+    pub sleep_var_ratio: u32,
+    /// Pad to 56 bytes, keeps 8-byte tail alignment.
+    pub pad: u32,
 }
 
 /// One training sample, the mirror of `struct mlfq_tree_sample`.
@@ -85,7 +91,7 @@ pub struct TreeFeats {
 /// `MLFQ_TREE_SAMPLE_VERSION` and is checked by the daemon's parse, so
 /// a record from an out-of-tree producer fails the check instead of
 /// being misread. The BPF struct is `packed, aligned(4)` to keep the
-/// record at 68 bytes, so this mirror is packed identically; every
+/// record at 76 bytes, so this mirror is packed identically; every
 /// field sits at its naturally aligned offset, and the daemon reads the
 /// record with `read_unaligned`.
 #[derive(Clone, Copy, Debug)]
@@ -107,7 +113,7 @@ pub struct TreeSample {
 ///
 /// For an internal node (`right != 0`), `threshold` is the split point in
 /// nsecs, `left`/`right` the child indices and `feature` the split feature
-/// id (0..4). For a leaf (`right == 0`), `left` carries the prediction in
+/// id (0..7). For a leaf (`right == 0`), `left` carries the prediction in
 /// nsecs. `pad` is the 7 reserved bytes of the 24-byte node; it is always
 /// zeroed so the published node bytes are deterministic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,7 +125,7 @@ pub struct TreeNode {
     pub left: u32,
     /// Right child index; 0 marks a leaf.
     pub right: u32,
-    /// Split feature id (0..4); 0 on leaves.
+    /// Split feature id (0..7); 0 on leaves.
     pub feature: u8,
     /// Reserved padding, always zeroed.
     pub pad: [u8; 7],
@@ -137,9 +143,10 @@ pub struct SerializedTree {
 }
 
 /// Feature value for a feature id, matching the BPF walk's `feat[8]` slot
-/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..4 are the fit
-/// features, ids 5..6 the measured service fields (populated but inert,
-/// the fitter caps the split range at 5), id 7 the zeroed slot.
+/// layout in `src/bpf/intf.h` (`mlfq_tree_walk`). Ids 0..7 are the split
+/// features (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
+/// queue_wait, sq_ema), id 8 the cadence ratio (carry-along, split
+/// when NR_FEATURES promotes it), and the rest zero.
 fn feat_value(f: TreeFeats, id: u8) -> u64 {
     match id {
         0 => f.prev_burst_ns,
@@ -149,6 +156,8 @@ fn feat_value(f: TreeFeats, id: u8) -> u64 {
         4 => f.wake_cnt as u64,
         5 => f.wake_lat_us as u64,
         6 => f.queue_wait_us as u64,
+        7 => f.sq_ema,
+        8 => f.sleep_var_ratio as u64,
         _ => 0,
     }
 }
@@ -176,7 +185,7 @@ type WeightedSample = (TreeSample, f64);
 /// fit concentrates on the recent regime without dropping the older
 /// data entirely and no weight can underflow. Each weight is one
 /// `powf`, so there is no error accumulation across samples.
-fn sample_weights(n: usize) -> Vec<f64> {
+pub fn sample_weights(n: usize) -> Vec<f64> {
     let half_life = n as f64 / 2.0;
     (0..n)
         .map(|i| 2.0f64.powf(-((n - i) as f64) / half_life))
@@ -533,7 +542,7 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         return 0; /* untrained */
     }
 
-    let feat: [u64; 8] = [
+    let feat: [u64; 16] = [
         feats.prev_burst_ns,
         feats.sleep_ns,
         feats.ema,
@@ -541,6 +550,14 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
         feats.wake_cnt as u64,
         feats.wake_lat_us as u64,
         feats.queue_wait_us as u64,
+        feats.sq_ema,
+        feats.sleep_var_ratio as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         0,
     ];
     let mask = MLFQ_TREE_MAX_NODES - 1;
@@ -579,13 +596,46 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
 
 /// The publish quality gate. The tree replaces the previous model only when
 /// its holdout MAE beats the exact per-sample EMA baseline on the same
-/// holdout slice (strictly better or equal).
+/// holdout slice (strictly better or equal) and, for the first publish,
+/// the Pearson correlation meets the 0.30 floor (Appendix C). The holdout
+/// MAE is weighted by the recency weights of the window, so recent
+/// samples dominate the gate.
 ///
 /// This is the daemon's contract with the README's claim that the tree
 /// is published when it beats the baseline: a regressed model is kept
 /// out and the previous model stays committed.
-pub fn should_publish(mae_tree: f64, mae_ema: f64) -> bool {
-    mae_tree <= mae_ema
+pub fn should_publish(mae_tree: f64, mae_ema: f64, corr: f64, is_first_publish: bool) -> bool {
+    if mae_tree > mae_ema {
+        return false;
+    }
+    if is_first_publish && corr < 0.30 {
+        return false;
+    }
+    true
+}
+
+/// Weighted MAE for the holdout slice (Appendix C). Each holdout sample
+/// carries its recency weight w_i = 2^(-age_i / (n/2)) where n is the
+/// full window length, so the gate emphasizes the recent regime without
+/// dropping the older tail entirely.
+pub fn weighted_holdout_mae(preds: &[u64], actuals: &[u64], weights: &[f64]) -> f64 {
+    assert_eq!(preds.len(), actuals.len());
+    assert_eq!(preds.len(), weights.len());
+    if preds.is_empty() {
+        return 0.0;
+    }
+    let mut sw = 0.0;
+    let mut sw_err = 0.0;
+    for ((p, a), w) in preds.iter().zip(actuals).zip(weights.iter()) {
+        let err = if p >= a { *p - *a } else { *a - *p } as f64;
+        sw += *w;
+        sw_err += *w * err;
+    }
+    if sw == 0.0 {
+        0.0
+    } else {
+        sw_err / sw
+    }
 }
 
 /// Record-layout version tag of the emitted training samples, from
@@ -633,6 +683,7 @@ pub fn tree_meta(generation: u64, nr_nodes: usize, active: u64) -> u64 {
 ///
 /// Lengths must match. The empty case returns 0. The sums accumulate in
 /// u128 so near-u64 values cannot overflow.
+#[allow(dead_code)]
 pub fn mae(preds: &[u64], actuals: &[u64]) -> f64 {
     assert_eq!(
         preds.len(),
@@ -708,14 +759,8 @@ mod tests {
             version: MLFQ_TREE_SAMPLE_VERSION,
             queue: 1,
             feats: TreeFeats {
-                prev_burst_ns: 0,
                 sleep_ns,
-                ema: 0,
-                io_wait: 0,
-                wake_cnt: 0,
-                wake_lat_us: 0,
-                queue_wait_us: 0,
-                sq_ema: 0,
+                ..TreeFeats::default()
             },
             label_ns,
         }
@@ -724,7 +769,7 @@ mod tests {
     /// The mirror of `predict()` that returns the terminal node index, so
     /// tests can reconstruct which training samples share a leaf.
     fn leaf_index(tree: &SerializedTree, feats: &TreeFeats) -> usize {
-        let feat: [u64; 8] = [
+        let feat: [u64; 16] = [
             feats.prev_burst_ns,
             feats.sleep_ns,
             feats.ema,
@@ -732,6 +777,14 @@ mod tests {
             feats.wake_cnt as u64,
             feats.wake_lat_us as u64,
             feats.queue_wait_us as u64,
+            feats.sq_ema,
+            feats.sleep_var_ratio as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
         ];
         let mask = MLFQ_TREE_MAX_NODES - 1;
@@ -1048,9 +1101,9 @@ mod tests {
         let fit_ok = |min_rel: f64| fit(&samples, 4, 1, 31, min_rel);
         assert!(serialize_validate(&fit_ok(0.0)).is_ok());
 
-        // Internal node splitting on feature 5.
+        // Internal node splitting on feature 8 (beyond NR_FEATURES 8).
         let mut bad = fit_ok(0.0);
-        bad.nodes[0].feature = 5;
+        bad.nodes[0].feature = 8;
         assert!(serialize_validate(&bad).is_err());
 
         // Child index out of range.
@@ -1093,11 +1146,21 @@ mod tests {
 
     #[test]
     fn publish_gate_and_tree_meta() {
-        // The gate accepts strictly better or equal and rejects worse.
-        assert!(should_publish(100.0, 100.0));
-        assert!(should_publish(99.0, 100.0));
-        assert!(!should_publish(101.0, 100.0));
-        assert!(should_publish(0.0, 0.0));
+        // The gate accepts strictly better or equal and rejects worse,
+        // and the first publish requires corr >=0.30 (Appendix C).
+        assert!(should_publish(100.0, 100.0, 0.5, false));
+        assert!(should_publish(99.0, 100.0, 0.5, false));
+        assert!(!should_publish(101.0, 100.0, 0.5, false));
+        assert!(should_publish(0.0, 0.0, 0.5, false));
+        assert!(!should_publish(90.0, 100.0, 0.29, true));
+        assert!(should_publish(90.0, 100.0, 0.30, true));
+        assert!(should_publish(90.0, 100.0, 0.0, false));
+        // Weighted holdout: recent samples dominate.
+        let preds = [100, 200];
+        let actuals = [110, 190];
+        let w = [0.25, 1.0];
+        let wm = weighted_holdout_mae(&preds, &actuals, &w);
+        assert!((wm - 10.0).abs() < 1e-9);
 
         // The meta bits are exact: trained bit 0 (always set by a
         // publish), active bit 1, node count in bits 8..31 and the
@@ -1405,8 +1468,8 @@ mod tests {
         assert_eq!(size_of::<TreeFeats>(), size_of::<mlfq_tree_feats>());
         assert_eq!(size_of::<TreeNode>(), size_of::<mlfq_tree_node>());
         assert_eq!(size_of::<TreeSample>(), size_of::<mlfq_tree_sample>());
-        assert_eq!(size_of::<TreeFeats>(), 48);
-        assert_eq!(size_of::<TreeSample>(), 68);
+        assert_eq!(size_of::<TreeFeats>(), 56);
+        assert_eq!(size_of::<TreeSample>(), 76);
         assert_eq!(size_of::<TreeNode>(), 24);
 
         assert_eq!(
@@ -1438,9 +1501,15 @@ mod tests {
             offset_of!(TreeFeats, sq_ema),
             offset_of!(mlfq_tree_feats, sq_ema)
         );
+        assert_eq!(
+            offset_of!(TreeFeats, sleep_var_ratio),
+            offset_of!(mlfq_tree_feats, sleep_var_ratio)
+        );
         assert_eq!(offset_of!(TreeFeats, wake_lat_us), 32);
         assert_eq!(offset_of!(TreeFeats, queue_wait_us), 36);
         assert_eq!(offset_of!(TreeFeats, sq_ema), 40);
+        assert_eq!(offset_of!(TreeFeats, sleep_var_ratio), 48);
+        assert_eq!(offset_of!(TreeFeats, pad), 52);
 
         assert_eq!(
             offset_of!(TreeNode, threshold),
@@ -1481,8 +1550,8 @@ mod tests {
         );
         assert_eq!(offset_of!(TreeSample, queue), 4);
         assert_eq!(offset_of!(TreeSample, feats), 8);
-        assert_eq!(offset_of!(TreeSample, label_ns), 56);
-        assert_eq!(offset_of!(TreeSample, version), 64);
+        assert_eq!(offset_of!(TreeSample, label_ns), 64);
+        assert_eq!(offset_of!(TreeSample, version), 72);
     }
 
     #[test]

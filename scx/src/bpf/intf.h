@@ -314,7 +314,18 @@ enum mlfq_consts {
 	 * intf.h) fails loudly at the parse instead of misreading the
 	 * fields.
 	 */
-	MLFQ_TREE_SAMPLE_VERSION	= 2,
+	MLFQ_TREE_SAMPLE_VERSION	= 3,
+
+	/*
+	 * Number of features the CART splitter may use. The fitter caps
+	 * split feature ids to [0, MLFQ_TREE_NR_FEATURES), so a value
+	 * here is the contract with mlfq_tree.rs and the walk's feat[]
+	 * indexing. The 7.1-only ABI carries eight split features
+	 * (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
+	 * queue_wait, sq_ema) and the var-ratio remains as an additional
+	 * carry-along feature for future splits.
+	 */
+	MLFQ_TREE_NR_FEATURES		= 8,
 
 	/*
 	 * Adaptation control law. The adaptation is a proportional-only
@@ -442,15 +453,34 @@ enum mlfq_task_flags {
  * of the scheduler's ABI.
  */
 
-/*
- * Feature vector of the prediction tree, one value per split feature.
- * 48 bytes. Field order is part of the shared ABI: emitted samples
- * (mlfq_tree_sample) and the Rust-side TreeFeats use the same layout.
- * The last three fields capture the measured enqueue-to-run service of
- * the task's previous episode (the wakeup latency, the queue wait and
- * the per-task service-quality EMA). The fitter currently splits on the
- * first five features only, so the new fields are carried in the samples
- * as inert data.
+/**
+ * struct mlfq_tree_feats - Feature vector of the prediction tree.
+ *
+ * Theorem: the vector is the per-task state the CART predictor may
+ * split on. Invariant: field order and offsets are the shared ABI
+ * with emitted samples (mlfq_tree_sample) and the Rust TreeFeats
+ * mirror; any reordering breaks bindgen and the ring-buffer parse.
+ *
+ * Derivation: prev_burst/sleep/ema/io_wait/wake_cnt are the original
+ * 32-byte prefix. wake_lat/queue_wait/sq_ema measure the previous
+ * episode's enqueue-to-run service, appended without reordering. The
+ * 7.1 ABI adds sleep_var_ratio, the fixed-point (FP_SHIFT=8) variation
+ * ratio of sleep intervals, to capture frame-cadence regularity; it
+ * stays carry-along until the fitter promotes it. sq_ema remains at
+ * offset 40, sleep_var_ratio at 48, pad preserves 8-byte tail
+ * alignment. The resulting 56-byte record keeps every u64 at an
+ * 8-byte offset and the packed sample at 76 bytes.
+ *
+ * Why clamp: wake_lat/queue_wait are bounded via _MAX constants and
+ * label clamp, so the fitter's f64 sums stay overflow-free; the var
+ * ratio is FP_ONE-scaled and clamped to [0, FP_ONE*2] to bound
+ * threshold midpoints.
+ *
+ * Strategy helper: classification selects the queue via the tree
+ * walk (Strategy) observing this feature state (Observer) without a
+ * vtable; helpers are static inline.
+ *
+ * 56 bytes, packed fields naturally aligned.
  */
 struct mlfq_tree_feats {
 	u64 prev_burst_ns;		/* last completed run segment */
@@ -461,6 +491,8 @@ struct mlfq_tree_feats {
 	u32 wake_lat_us;		/* last wakeup-to-run latency, us */
 	u32 queue_wait_us;		/* last enqueue-to-run wait, us */
 	u64 sq_ema;			/* service-quality EMA, ns */
+	u32 sleep_var_ratio;		/* sleep variation ratio, FP_SHIFT fixed point */
+	u32 pad;			/* explicit pad for 56-byte alignment */
 };
 
 /*
@@ -536,22 +568,26 @@ struct mlfq_tree_ctrl {
 
 extern volatile struct mlfq_tree_ctrl mlfq_tree_ctrl;
 
-/*
- * One training sample emitted by the scheduler and consumed by the
- * daemon. pid and queue identify the emitter, feats is the feature
- * vector at classification time, label_ns the run segment that followed
- * and version the record-layout tag (MLFQ_TREE_SAMPLE_VERSION), checked
- * by the daemon's parse so a record from a foreign producer or a stale
- * build fails loudly instead of being misread. 68 bytes. Field order is
- * shared with the Rust front-end.
+/**
+ * struct mlfq_tree_sample - One training sample for the daemon.
  *
- * The struct carries `packed, aligned(4)`. The packed attribute drops
- * the trailing pad the 8-byte-aligned feature vector would otherwise
- * add (72 bytes), and the align(4) keeps the record on a 4-byte
- * boundary for ring-buffer consumers. Every field keeps its naturally
- * aligned offset. The 64-bit fields sit at 8-byte-aligned offsets, and
- * so the packed attribute changes no field placement, only the record
- * size.
+ * Theorem: the ring-buffer record is the atomic training unit.
+ * Invariant: 76 bytes packed aligned(4), field order is the shared ABI.
+ *
+ * Derivation: pid/queue (8 bytes) + feats 56 bytes + label 8 bytes +
+ * version 4 bytes = 76. The feats vector is the 56-byte form (sq_ema
+ * at 40, sleep_var_ratio at 48). label_ns is clamped to
+ * MLFQ_TREE_LABEL_MAX_NS, so the fitter's f64 sums never sum near-u64
+ * values.
+ *
+ * Why clamp: version is MLFQ_TREE_SAMPLE_VERSION (3 for 7.1 ABI);
+ * mismatch drops the record instead of misreading fields.
+ *
+ * Observer helper: stopping path observes task state to emit this
+ * record; daemon observes the ring buffer (Observer) without shared
+ * state.
+ *
+ * 76 bytes packed aligned(4); every field keeps its natural offset.
  */
 struct mlfq_tree_sample {
 	u32 pid;
@@ -560,6 +596,35 @@ struct mlfq_tree_sample {
 	u64 label_ns;
 	u32 version;			/* MLFQ_TREE_SAMPLE_VERSION */
 } __attribute__((packed, aligned(4)));
+
+/* ABI layout pins: compiled on every build, native and BPF. */
+_Static_assert(sizeof(struct mlfq_tree_feats) == 56,
+	       "mlfq_tree_feats must be 56 bytes (sq_ema at 40, var_ratio at 48)");
+_Static_assert(sizeof(struct mlfq_tree_sample) == 76,
+	       "mlfq_tree_sample must be 76 bytes (packed, aligned(4))");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_feats, sq_ema) == 40,
+	       "sq_ema must sit at offset 40");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_feats, sleep_var_ratio) == 48,
+	       "sleep_var_ratio must sit at offset 48");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_sample, label_ns) == 64,
+	       "label_ns must sit at offset 64 (pid 0, queue 4, feats 8+56)");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_sample, version) == 72,
+	       "version must sit at offset 72");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_feats, prev_burst_ns) == 0,
+	       "prev_burst_ns at 0");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_feats, wake_lat_us) == 32,
+	       "wake_lat_us at 32");
+_Static_assert(__builtin_offsetof(struct mlfq_tree_feats, queue_wait_us) == 36,
+	       "queue_wait_us at 36");
+/* Masking asymmetry: BPF walk feat[8] uses &0x7 (keeps 0..7, id 8
+ * carry-along masks to 0 and routes left); Rust feat_value matches
+ * with match 0..8 (id 8 carry-along) and  _=>0 fallback. The plain
+ * < NR_FEATURES check is authoritative (not &0x7<8 which is tautological).
+ * NR_FEATURES 8, so feat[8] holds eight split features and id 8
+ * sleep_var_ratio stays carry-along zero until promoted.
+ */
+_Static_assert(MLFQ_TREE_NR_FEATURES == 8,
+	       "NR_FEATURES must be 8 for 7.1 ABI (feat[8] 0..7 split, 8 carry-along)");
 
 /*
  * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
@@ -570,16 +635,54 @@ struct mlfq_tree_sample {
  */
 #define MLFQ_LLC_UNOWNED 0xFFU
 
-/*
- * Per-task state in BPF task storage. All timestamps are scx_bpf_now()
- * nsecs. vruntime is on the owning queue's virtual-time clock and is
- * re-anchored to the queue's clock at every placement. The struct is
- * 184 bytes. The 96-byte classification/vtime block, the 24-byte
- * enqueue-to-run measurement block, plus the 64-byte MLFQ tree sample
- * block (the 48-byte feature vector -- the vector grew with the
- * service fields, plus pending_queue and pending_valid rounded to a
- * u64).
+/**
+ * struct task_ctx - Per-task state in BPF task storage.
+ *
+ * Theorem: the task is the unit of EEVDF placement and MLFQ
+ * classification. Invariant: vruntime anchored to queue clock via
+ * bounded-lag clamp, vlag >=0.
+ *
+ * Derivation: 96-byte classification/vtime block, 24-byte
+ * enqueue-to-run measurement block, plus the 72-byte MLFQ tree sample
+ * block (the 56-byte feature vector plus pending_queue and
+ * pending_valid padded to 64-bit) plus 24-byte sleep cadence EMA
+ * block (mean 8, var 8, ratio 4 + pad 4). Total 216 bytes for the
+ * 7.1 ABI (56-byte feats + cadence). The 56-byte vector keeps sq_ema
+ * at 40 and sleep_var_ratio at 48.
+ *
+ * Why clamp: placement lag clamped to [0, limit] for bounded-lag;
+ * service EMAs clamped to MAX to bound thresholds and f64 sums.
  */
+
+/**
+ * struct mlfq_q1_occupancy - Per-CPU Q1 occupancy for SMT isolation.
+ *
+ * Theorem: each CPU's Q1 occupancy is the soft SMT veto the selection
+ * observes. Invariant: one byte per CPU, padded to 8 bytes for array
+ * map value alignment and to keep per-CPU slots on separate cache
+ * lines from mlfq_stats (Observer: select_cpu observes occupancy,
+ * Strategy: veto is pluggable via helper).
+ *
+ * Derivation: occupied==1 when the CPU runs a Q1 task (set in
+ * running(), cleared in stopping()), 0 otherwise. The 8-byte value
+ * keeps array map values naturally aligned and avoids false sharing
+ * with the BSS stats line; the map is per-CPU ARRAY, not BSS, so no
+ * __sync_* on a shared line is needed. Performance review: no extra
+ * cache-line pad needed today — per-CPU ARRAY already isolates each
+ * CPU's slot from the BSS stats line; pad further only if perf
+ * measurement shows sibling veto contention (documented, not padded now).
+ *
+ * Why isolation: keeping occupancy per-CPU avoids the word-bit
+ * false sharing of a global q1_mask; sibling lookup is logical via
+ * mlfq_cpu_sibling table, not bit arithmetic.
+ *
+ * 8 bytes.
+ */
+struct mlfq_q1_occupancy {
+	u8 occupied;
+	u8 pad[7];
+};
+
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
 	s64 vlag;			/* clamped lag at placement, >= 0 */
@@ -631,6 +734,18 @@ struct task_ctx {
 	u64 last_sample_at;		/* scx_bpf_now() of the last emitted
 					 * training sample, per-task rate limit */
 	/*
+	 * Sleep cadence EMA block for frame-loop regularity. mean/var are
+	 * N=32 EWMA (α=8/256) over sleep intervals, ratio is var/mean² in
+	 * FP_SHIFT=8 fixed point saturating 0..1024 (4*FP_ONE). The block
+	 * is zeroed by mlfq_reset_task_ctx and updated in stopping(!runnable)
+	 * with clamp and long-idle decay (>120ms) to avoid stale cadence
+	 * carrying over a long idle.
+	 */
+	u64 sleep_mean_ema;		/* EMA of sleep intervals, ns */
+	u64 sleep_var_ema;		/* EMA of sleep variance, ns² */
+	u32 sleep_var_ratio;		/* var/mean² ratio, FP_SHIFT=8, 0..1024 */
+	u32 pad2;
+	/*
 	 * Pending MLFQ tree sample: the feature vector and the queue are
 	 * captured at the classification enqueue, and the sample is
 	 * completed with the run segment (the label) and emitted at the
@@ -643,6 +758,19 @@ struct task_ctx {
 	u32 pending_queue;		/* queue at the capture */
 	u64 pending_valid;
 };
+
+_Static_assert(sizeof(struct task_ctx) == 216,
+	       "task_ctx must be 216 bytes for 7.1 ABI (56-byte feats + 24-byte cadence)");
+_Static_assert(__builtin_offsetof(struct task_ctx, pending_feats) == 144,
+	       "pending_feats at 144");
+_Static_assert(__builtin_offsetof(struct task_ctx, pending_queue) == 200,
+	       "pending_queue at 200");
+_Static_assert(__builtin_offsetof(struct task_ctx, pending_valid) == 208,
+	       "pending_valid at 208");
+_Static_assert(__builtin_offsetof(struct task_ctx, sleep_mean_ema) == 120,
+	       "sleep_mean_ema at 120");
+_Static_assert(__builtin_offsetof(struct task_ctx, sleep_var_ratio) == 136,
+	       "sleep_var_ratio at 136");
 
 /* wake_cpu_state bits */
 #define MLFQ_WAKE_CPU_IDLE	0x01U
@@ -682,8 +810,26 @@ struct queue_ctx {
 extern volatile u32 mlfq_idle_count;
 extern const volatile u32 mlfq_idle_tracking;
 
-/*
- * Per-CPU state, BPF_MAP_TYPE_ARRAY keyed by cpu. 56 bytes, one cacheline.
+/**
+ * struct mlfq_cpu_state - Per-CPU occupancy and scheduling state.
+ *
+ * Theorem: each CPU's running queue, deadline and EMA are the
+ * observable state the dispatch and selection helpers observe.
+ * Invariant: one entry per CPU, 56 bytes, one cache line; array key
+ * is cpu id.
+ *
+ * Derivation: running_queue/pid/deadline track the current occupant
+ * for same-queue preemption (mlfq_sameq_preempt_owed). cpu_ema is the
+ * busy-ns EMA (MLFQ_BUDGET_MAX_NS ceiling, MLFQ_EMA_HALF_LIFE_NS
+ * decay) used for cpuperf level (mlfq_cpuperf_from_ema). steal_scan_off
+ * rotates the Tier-B steal scan (Observer: dispatch observes this
+ * state, Strategy: scan order is a pluggable helper without vtable).
+ *
+ * Why clamp: cpu_ema clamped to [0, BUDGET_MAX] bounds the cpuperf
+ * level to [0, SCX_CPUPERF_ONE] and bounds virtual-time math; deadline
+ * 0 marks unknown and never preempts.
+ *
+ * 56 bytes, one cache line.
  */
 struct mlfq_cpu_state {
 	s32 running_queue;		/* queue of the running task, 0 none */
@@ -698,12 +844,25 @@ struct mlfq_cpu_state {
 /* Per-CPU realtime-occupancy flags. */
 #define MLFQ_RTDL_OCCUPIED			(1U << 0)
 
-/*
- * Per-CPU realtime-occupancy state, keyed by cpu id in the
- * rtdl_state_stor array map. flags reflects the class of the last task
- * that ran on the CPU (see the sched_switch hook in rtdl.bpf.c), which
- * decides whether the CPU is treated as unavailable to the SCX classes.
- * last_drain_at rate-limits the evacuation pass of the takeover path.
+/**
+ * struct mlfq_rtdl_state - Per-CPU realtime occupancy.
+ *
+ * Theorem: the RT occupancy flag is the gate the scheduler observes
+ * before placing work. Invariant: one entry per CPU, flags
+ * MLFQ_RTDL_OCCUPIED when the last sched_switch saw RT/DL.
+ *
+ * Derivation: sched_switch hook (rtdl.bpf.c) observes the switched-in
+ * task class (Observer) and sets flags; enqueue and select_cpu observe
+ * flags to redirect or skip the CPU (Strategy via helper predicates,
+ * static inline, no vtable). last_drain_at rate-limits the evacuation
+ * scan to MLFQ_RTDL_DRAIN_INTERVAL_NS, so a takeover blip cannot
+ * thrash.
+ *
+ * Why clamp: flags is a single bit, checked under the 7.1-only
+ * watchdog (30 s); drain interval clamps the churn to 1/ms per CPU,
+ * bounding the DSQ moves under continuous RT preemption.
+ *
+ * 16 bytes, BPF_MAP_TYPE_ARRAY value.
  */
 struct mlfq_rtdl_state {
 	u32 flags;			/* MLFQ_RTDL_* bits */
@@ -1699,11 +1858,24 @@ static __always_inline bool mlfq_check_tree_node_index(u32 idx)
 static __always_inline bool mlfq_check_tree_feature(u8 feature)
 {
 	/*
-	 * Only ids 0..4 may be split on: the fitter caps the split
-	 * feature range there, so a tree splitting on the populated
-	 * ids 5..6 (or on the zeroed id 7) is out of contract.
+	 * Theorem: the split feature must be within the populated ABI.
+	 * Derivation: 7.1 ABI populates eight split features (0..7:
+	 * prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
+	 * queue_wait, sq_ema). The fitter caps splits to
+	 * [0, MLFQ_TREE_NR_FEATURES), and sleep_var_ratio at id 8 is
+	 * carry-along for the next ABI (its slot stays zeroed until
+	 * NR_FEATURES promotes it; BPF walk feat[8] keeps &0x7 mask
+	 * for the 8-slot walk, so id 8 masks to 0 and routes left as
+	 * the documented carry-along).
+	 * Why clamp: a feature id >= NR_FEATURES (>=8) would address
+	 * outside feat[8] or read the zeroed carry-along guard; the
+	 * plain < bound is the authoritative ABI check, not the masked
+	 * form (&0x7 <8) which is tautological.
+	 *
+	 * Strategy helper: the walk observes the feature vector
+	 * (Strategy pattern without vtable) via this predicate.
 	 */
-	return (feature & 0x7) < 5;
+	return feature < MLFQ_TREE_NR_FEATURES;
 }
 
 static __always_inline bool mlfq_check_bands(u64 t_l, u64 t_h,
@@ -1728,22 +1900,23 @@ static __always_inline bool mlfq_check_bands(u64 t_l, u64 t_h,
  * @store: The tree buffer (one entry of mlfq_tree_map).
  * @f: The feature vector.
  *
- * The descent is a compile-time bound of MLFQ_TREE_MAX_DEPTH steps.
- * Every index is masked to the node budget (MLFQ_TREE_MAX_NODES - 1),
- * so a corrupted tree can never address outside the buffer. An
- * out-of-range feature id reads a zeroed feat[] slot, and a walk past
- * the tree tail lands on a zeroed node, which is a leaf predicting 0.
- * A leaf is a node with right == 0 and carries its prediction in left.
- * A tree deeper than the bound is cut. The walk returns the last
- * reachable node's left, and only when that node is a leaf. A
- * deeper-than-the-bound internal node returns 0 instead of leaking a
- * child index as a prediction.
+ * Theorem: the walk is a bounded, masked descent over the 8-feature
+ * tree (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
+ * queue_wait, sq_ema). Invariant: depth <= MLFQ_TREE_MAX_DEPTH.
  *
- * The feat[] array lays out the seven feature slots in order followed
- * by one zero slot, so a split feature id above 6 reads zero and routes
- * to the left of any non-zero threshold. Only ids 0..4 are split on by
- * any published tree (the fitter and the validator cap the split
- * feature range), so ids 5..6 are populated but inert.
+ * Derivation: every index is masked to the node budget
+ * (MLFQ_TREE_MAX_NODES - 1), so a corrupted tree can never address
+ * outside the buffer. feat[8] holds the eight split features in order;
+ * sleep_var_ratio at feat id 8 is carry-along (the 7.1 ABI keeps it
+ * out of the split range, so a tree splitting on 8 is rejected by
+ * mlfq_check_tree_feature). An out-of-range feature reads the zeroed
+ * slot, and a walk past the tail lands on a zeroed node predicting 0.
+ * The walk is the Strategy observed via the feature vector (Observer)
+ * without a vtable.
+ *
+ * Why clamp: the 30 s watchdog bounds the dispatch stall, and the
+ * 16 ms label clamp bounds the f64 sums; the feat clamp prevents
+ * out-of-bounds reads.
  *
  * Return: The predicted burst in nsecs.
  */
@@ -1753,7 +1926,7 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 {
 	u64 feat[8] = { f->prev_burst_ns, f->sleep_ns, f->ema,
 			f->io_wait, f->wake_cnt, f->wake_lat_us,
-			f->queue_wait_us, 0 };
+			f->queue_wait_us, f->sq_ema };
 	u32 idx = 0, nidx;
 	const struct mlfq_tree_node *n;
 	u8 feature;
@@ -1769,6 +1942,11 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 		if (n->right == 0)
 			return n->left;
 
+		/* BPF walk masks to 0..7 for the 8-slot feat[]; id 8
+		 * carry-along (sleep_var_ratio) masks to 0 and routes
+		 * left. Rust keeps feat[16] with id 8 as carry-along and
+		 *  _=>0 fallback. Mask asymmetry documented above.
+		 */
 		feature = n->feature & 0x7;
 #if MLFQ_CHECK
 		if (!mlfq_check_tree_feature(feature))

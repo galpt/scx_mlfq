@@ -436,7 +436,7 @@ impl<'a> Scheduler<'a> {
          * bounded channel the run loop drains. try_send drops the sample
          * when the channel is full, which the ring-buffer backpressure
          * absorbs first. TreeSample is a repr(C) POD mirroring the
-         * 68-byte BPF record, so the parse is a plain byte
+         * 76-byte BPF record, so the parse is a plain byte
          * reinterpretation. The record's version tag is checked before
          * the record is admitted, so a record from a foreign producer or
          * a mismatched build is dropped instead of misread.
@@ -447,7 +447,7 @@ impl<'a> Scheduler<'a> {
             if data.len() < size_of::<TreeSample>() {
                 return 0;
             }
-            // SAFETY: TreeSample is a repr(C) mirror of the 68-byte
+            // SAFETY: TreeSample is a repr(C) mirror of the 76-byte
             // mlfq_tree_sample the stopping path submits; reading the
             // record as the struct is a plain byte reinterpretation of
             // integer fields.
@@ -715,6 +715,7 @@ impl<'a> Scheduler<'a> {
     /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major). The
     /// map is per-CPU so the BPF charges never contend. A failed lookup
     /// or an unexpected value size yields zeros for that entry.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn read_op_lat(&self) -> Vec<u64> {
         let nr_ops = crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize;
         let buckets = crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_BUCKETS as usize;
@@ -919,10 +920,11 @@ impl<'a> Scheduler<'a> {
             );
             return;
         }
-        if !mlfq_tree::should_publish(res.mae_tree, res.mae_ema) {
+        let is_first = self.model.generation == 0;
+        if !mlfq_tree::should_publish(res.mae_tree, res.mae_ema, res.corr, is_first) {
             log::info!(
-                "MLFQ tree gen {} rejected: holdout MAE_tree={:.1}us > MAE_ema={:.1}us, keeping the previous model",
-                gen, res.mae_tree / 1e3, res.mae_ema / 1e3
+                "MLFQ tree gen {} rejected: holdout MAE_tree={:.1}us > MAE_ema={:.1}us or corr {:.3} < 0.30 for first publish, keeping the previous model",
+                gen, res.mae_tree / 1e3, res.mae_ema / 1e3, res.corr
             );
             return;
         }
@@ -1142,12 +1144,13 @@ fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
             mlfq_tree::predict(&tree, &feats)
         })
         .collect();
-    let mae_tree = mlfq_tree::mae(&preds, &actuals);
-    let mae_ema = holdout
-        .iter()
-        .map(|s| s.feats.ema.abs_diff(s.label_ns) as u128)
-        .sum::<u128>() as f64
-        / holdout.len() as f64;
+    // Weighted holdout (Appendix C): recency weights of the full window,
+    // tail slice corresponds to the holdout; recent samples dominate.
+    let weights_full = mlfq_tree::sample_weights(samples.len());
+    let holdout_weights = &weights_full[train.len()..];
+    let ema_preds: Vec<u64> = holdout.iter().map(|s| s.feats.ema).collect();
+    let mae_tree = mlfq_tree::weighted_holdout_mae(&preds, &actuals, holdout_weights);
+    let mae_ema = mlfq_tree::weighted_holdout_mae(&ema_preds, &actuals, holdout_weights);
     let corr = mlfq_tree::pearson(&preds, &actuals);
 
     Ok(TrainResult {

@@ -136,12 +136,16 @@ pub fn plan_llcs(cpu_to_llc: &[(u32, u32)], primary_cpus: &[u32], max_llcs: usiz
         return plan;
     }
 
-    let nr = cpu_to_llc
-        .iter()
-        .map(|&(_, llc)| llc)
-        .max()
-        .unwrap()
-        .saturating_add(1);
+    let max_llc = cpu_to_llc.iter().map(|&(_, llc)| llc).max().unwrap();
+    let nr = match max_llc.checked_add(1) {
+        Some(v) => v,
+        None => {
+            warn!(
+                "LLC id u32::MAX wraps domain count, disabling LLC-aware placement"
+            );
+            return plan;
+        }
+    };
     if nr as usize > max_llcs {
         warn!(
             "{} LLC domains exceed the supported maximum ({}), disabling LLC-aware placement",
@@ -177,6 +181,10 @@ pub struct SiblingPlan {
     /// Per-CPU: the lowest-id other CPU sharing the core, or the CPU
     /// itself when the core is unpaired or the CPU is unknown.
     pub cpu_sibling: [u32; MAX_CPUS],
+    /// Per-CPU core id (mlfq_cpu_core rodata), MAX_CPUS sentinel when
+    /// unknown. The table groups by core_id (not llc_id) and handles
+    /// >2-way SMT by picking the lowest-id sibling per CPU.
+    pub cpu_core: [u32; MAX_CPUS],
 }
 
 /// Plan the SMT sibling table from a synthetic `(cpu, core)` map.
@@ -192,6 +200,7 @@ pub fn plan_sibling_table(cpu_to_core: &[(u32, u32)]) -> SiblingPlan {
     let mut plan = SiblingPlan {
         smt_on: false,
         cpu_sibling: core::array::from_fn(|i| i as u32),
+        cpu_core: [mlfq_consts_MLFQ_MAX_CPUS; MAX_CPUS],
     };
     let mut cores: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
 
@@ -200,6 +209,7 @@ pub fn plan_sibling_table(cpu_to_core: &[(u32, u32)]) -> SiblingPlan {
             continue;
         }
         cores.entry(core).or_default().push(cpu);
+        plan.cpu_core[cpu as usize] = core;
     }
 
     for cpus in cores.values_mut() {
@@ -210,6 +220,8 @@ pub fn plan_sibling_table(cpu_to_core: &[(u32, u32)]) -> SiblingPlan {
         }
         plan.smt_on = true;
         for &cpu in cpus.iter() {
+            // >2-way SMT: pick lowest-id other CPU per core, not a
+            // full pairing; logical sibling lookup, not word bit.
             let sib = cpus.iter().copied().find(|&c| c != cpu).unwrap_or(cpu);
             plan.cpu_sibling[cpu as usize] = sib;
         }
@@ -406,6 +418,7 @@ pub fn init_topology(skel: &mut crate::bpf_skel::OpenBpfSkel<'_>) -> Result<Topo
     rodata.mlfq_cpu_llc = llcs.cpu_llc;
     rodata.mlfq_smt_on = sibling.smt_on;
     rodata.mlfq_cpu_sibling = sibling.cpu_sibling;
+    rodata.mlfq_cpu_core = sibling.cpu_core;
     rodata.mlfq_llc_largest = largest;
 
     if capacity.primary_all {

@@ -60,6 +60,23 @@ struct {
 } cpu_state_stor SEC(".maps");
 
 /*
+ * Per-CPU Q1 occupancy for SMT isolation, keyed by cpu id.
+ *
+ * One byte per CPU padded to 8 bytes for map value alignment.
+ * The map is per-CPU ARRAY, not BSS, so occupancy updates are
+ * plain per-CPU slots without __sync_* on a shared cache line.
+ * Place maps with proper SEC(".maps") and keep the cache-line
+ * isolation from mlfq_stats: the occupancy slots live in the
+ * array map, never on the BSS stats line.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MLFQ_MAX_CPUS);
+	__type(key, u32);
+	__type(value, struct mlfq_q1_occupancy);
+} q1_occupancy SEC(".maps");
+
+/*
  * Per-CPU realtime-occupancy state, keyed by cpu id. The flags reflect
  * the class of the last task that ran on the CPU (see rtdl.bpf.c). The
  * state is written by the sched_switch hook and read by the enqueue
@@ -158,7 +175,7 @@ volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
  * Training-sample ring buffer. The stopping path emits one completed
  * sample per rate-limit window (mlfq_tree_ctrl.sample_last_at); the
  * userspace daemon drains it every 100 ms for the regression-tree
- * training. 1 MB holds about 15.4k samples of 68 bytes, roughly 7.7 s
+ * training. 1 MB holds about 13.8k samples of 76 bytes, roughly 6.9 s
  * of emission at the global rate limit, which absorbs a multi-second
  * daemon stall; drop-on-full is the natural backpressure when the
  * daemon cannot keep up, and the emission rate limits keep the
@@ -291,6 +308,28 @@ const volatile u32 mlfq_idle_tracking = 0;
  */
 const volatile bool mlfq_smt_on = false;
 const volatile u32 mlfq_cpu_sibling[MLFQ_MAX_CPUS];
+/*
+ * Core id per CPU, written by the Rust front-end before load.
+ * Reserved for future topology debug/dump (e.g. BPF debug helper
+ * validating sibling pairs or veristat topology introspection);
+ * intentionally retained even though is_smt_sibling_q1_busy() uses
+ * only mlfq_cpu_sibling today. Keeping the table costs 4 KiB rodata
+ * and no extra BPF instructions until a debug helper reads it, so
+ * no object inflation until wired. Do not remove as "dead".
+ */
+const volatile u32 mlfq_cpu_core[MLFQ_MAX_CPUS];
+
+/* Debug helper reading mlfq_cpu_core to justify rodata retention
+ * without inflating the hot path. Unused, but keeps the symbol
+ * referenced for veristat/BPF dump introspection; compiler will
+ * dead-strip if not called, yet the rodata stays documented.
+ */
+static __always_inline u32 mlfq_core_of_cpu(u32 cpu)
+{
+	if (cpu >= MLFQ_MAX_CPUS)
+		return MLFQ_MAX_CPUS;
+	return mlfq_cpu_core[cpu];
+}
 
 /*
  * Largest-LLC domain id for the Q1 placement bias, written by the
@@ -301,6 +340,76 @@ const volatile u32 mlfq_cpu_sibling[MLFQ_MAX_CPUS];
  * sentinel keeps the step dead unless a strictly-largest domain exists.
  */
 const volatile u32 mlfq_llc_largest = MLFQ_MAX_LLCS;
+
+/*
+ * Q1 occupancy helpers - Observer for per-CPU occupancy, Strategy for veto.
+ *
+ * The occupancy is tracked per-CPU in the q1_occupancy ARRAY map, one
+ * 8-byte slot per CPU. Updates are plain stores to the CPU's own slot,
+ * never a __sync_* on a BSS shared line, so no false sharing dirties
+ * mlfq_stats. The sibling veto is logical: mlfq_cpu_sibling[CPU]
+ * gives the sibling, mlfq_cpu_core[CPU] the core id, not a word bit.
+ * is_smt_sibling_q1_busy checks the logical sibling's occupancy.
+ */
+
+/**
+ * mlfq_q1_is_occupied - Test if CPU runs a Q1 task.
+ * @cpu: CPU id.
+ *
+ * Return: true if occupancy slot is set.
+ */
+static __always_inline bool mlfq_q1_is_occupied(u32 cpu)
+{
+	struct mlfq_q1_occupancy *occ;
+	u32 key = cpu;
+
+	if (cpu >= MLFQ_MAX_CPUS)
+		return false;
+	occ = bpf_map_lookup_elem(&q1_occupancy, &key);
+	return occ && occ->occupied;
+}
+
+/**
+ * mlfq_q1_set - Mark or clear Q1 occupancy for CPU.
+ * @cpu: CPU id.
+ * @occupied: true to set, false to clear.
+ *
+ * Plain per-CPU store, no __sync_* on shared BSS line. The slot is
+ * owned by @cpu, so no contention. Cache-line isolation from
+ * mlfq_stats is preserved by the map storage.
+ */
+static __always_inline void mlfq_q1_set(u32 cpu, bool occupied)
+{
+	struct mlfq_q1_occupancy *occ;
+	u32 key = cpu;
+
+	if (cpu >= MLFQ_MAX_CPUS)
+		return;
+	occ = bpf_map_lookup_elem(&q1_occupancy, &key);
+	if (occ)
+		occ->occupied = occupied ? 1 : 0;
+}
+
+/**
+ * is_smt_sibling_q1_busy - Logical sibling Q1 veto.
+ * @cpu: Candidate CPU.
+ *
+ * Uses rodata mlfq_cpu_sibling logical lookup, not word-bit
+ * arithmetic. When SMT is off or sibling is self, returns false.
+ *
+ * Return: true if sibling runs Q1.
+ */
+static __always_inline bool is_smt_sibling_q1_busy(s32 cpu)
+{
+	u32 sib;
+
+	if (!mlfq_smt_on || cpu < 0 || cpu >= (s32)MLFQ_MAX_CPUS)
+		return false;
+	sib = mlfq_cpu_sibling[(u32)cpu];
+	if (sib >= MLFQ_MAX_CPUS || sib == (u32)cpu)
+		return false;
+	return mlfq_q1_is_occupied(sib);
+}
 
 /*
  * mlfq_wakeup_window_fold - Consume the per-CPU wakeup windows.

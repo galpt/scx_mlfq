@@ -20,6 +20,66 @@
  * acquisition is observed at ops.running().
  */
 
+/**
+ * mlfq_sleep_ema_update - N=32 EWMA for sleep cadence (α=8/256).
+ * @tctx: Task context.
+ * @sleep_ns: Sleep interval, clamped.
+ *
+ * Updates mean/var EMAs and var/mean² ratio FP_SHIFT 8 saturate
+ * 0..1024. Long idle >120ms decays the EMAs via mlfq_ema_decay.
+ * Observer helper: stopping observes sleep state, Strategy:
+ * ratio computation is pluggable without vtable.
+ */
+static __always_inline void mlfq_sleep_ema_update(struct task_ctx *tctx,
+						  u64 sleep_ns)
+{
+	u64 old_mean, new_mean, var, mean2, ratio, diff, diff2;
+	s64 sdiff;
+
+	/* Clamp sleep_ns to bound f64 and fixed-point products. */
+	if (sleep_ns > 64ULL * NSEC_PER_MSEC)
+		sleep_ns = 64ULL * NSEC_PER_MSEC;
+
+	/* Decay on long idle >120ms (MLFQ_LONG_SLEEP_NS). */
+	if (sleep_ns > MLFQ_LONG_SLEEP_NS) {
+		tctx->sleep_mean_ema = mlfq_ema_decay(tctx->sleep_mean_ema,
+						      sleep_ns,
+						      MLFQ_EMA_HALF_LIFE_NS);
+		tctx->sleep_var_ema = mlfq_ema_decay(tctx->sleep_var_ema,
+						     sleep_ns,
+						     MLFQ_EMA_HALF_LIFE_NS);
+		if (!tctx->sleep_mean_ema)
+			tctx->sleep_var_ema = 0;
+	} else {
+		old_mean = tctx->sleep_mean_ema;
+		new_mean = (old_mean * 248 + sleep_ns * 8) / 256;
+		tctx->sleep_mean_ema = new_mean;
+		/* var EMA: var = var*248/256 + (sleep-old_mean)²*8/256 */
+		sdiff = (s64)sleep_ns - (s64)old_mean;
+		diff = sdiff < 0 ? (u64)(-sdiff) : (u64)sdiff;
+		diff2 = diff * diff;
+		var = tctx->sleep_var_ema;
+		tctx->sleep_var_ema = (var * 248 + diff2 * 8) / 256;
+	}
+
+	/* Ratio var/mean² in FP_SHIFT 8, saturate 0..1024 (4*FP_ONE). */
+	if (tctx->sleep_mean_ema > 0) {
+		mean2 = tctx->sleep_mean_ema * tctx->sleep_mean_ema;
+		if (mean2) {
+			var = tctx->sleep_var_ema;
+			/* var *256 / mean², avoid overflow: var up to ~4e15, *256 ~1e18 fits u64 */
+			ratio = var * FP_ONE / mean2;
+			if (ratio > 1024)
+				ratio = 1024;
+			tctx->sleep_var_ratio = (u32)ratio;
+		} else {
+			tctx->sleep_var_ratio = 0;
+		}
+	} else {
+		tctx->sleep_var_ratio = 0;
+	}
+}
+
 static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 						const struct task_struct *p,
 						u64 now)
@@ -35,6 +95,10 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 		tctx->weight = 1;
 	tctx->flags = MLFQ_TF_FIRST_RUN;
 	tctx->wake_cpu_state = 0;
+	tctx->sleep_mean_ema = 0;
+	tctx->sleep_var_ema = 0;
+	tctx->sleep_var_ratio = 0;
+	tctx->pad2 = 0;
 	/*
 	 * The runnable-ownership record starts unowned. A fresh task is
 	 * not counted in the per-LLC/per-queue gauges until its first
@@ -128,6 +192,9 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 
 	tctx->last_run_at = now;
 	tctx->flags &= ~MLFQ_TF_FIRST_RUN;
+
+	/* Observer: mark Q1 occupancy for SMT isolation (per-CPU map, no __sync). */
+	mlfq_q1_set((u32)cpu_id, tctx->queue == 1);
 
 	/*
 	 * Enqueue-to-run measurement. The enqueue stamp (enq_at) marks
@@ -320,10 +387,32 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	 * classification re-arms the pending block instead of emitting a
 	 * stale feature vector with a mismatched label.
 	 */
+	/* Sleep cadence EMA: update on blocking sleep (!runnable) using
+	 * the sleep that led to this run (pending_feats.sleep_ns). The
+	 * clamp and long-idle decay (>120ms) keep stale cadence from
+	 * pinning a task to Q1 after a long idle.
+	 */
+	if (!runnable) {
+		u64 sleep_ns = 0;
+
+		if (tctx->pending_feats.sleep_ns)
+			sleep_ns = tctx->pending_feats.sleep_ns;
+		else if (tctx->last_sleep_at && mlfq_time_before(tctx->last_sleep_at, now))
+			sleep_ns = now - tctx->last_sleep_at;
+		if (sleep_ns)
+			mlfq_sleep_ema_update(tctx, sleep_ns);
+		/* Decay on long idle even without a captured sleep. */
+		else if (tctx->sleep_mean_ema)
+			mlfq_sleep_ema_update(tctx, MLFQ_LONG_SLEEP_NS + 1);
+	}
+
 	tctx->pending_valid = 0;
 
 	if (!runnable)
 		tctx->last_sleep_at = now;
+
+	/* Clear Q1 occupancy on stopping (task leaves CPU); isolated per-CPU map store. */
+	mlfq_q1_set((u32)bpf_get_smp_processor_id(), false);
 
 	/*
 	 * Keep the running-task record while the task remains runnable
@@ -430,6 +519,24 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
 	if (!tctx)
 		return;
 
+	/*
+	 * Q1 occupancy leak: a task can exit without going through
+	 * ops.stopping() (e.g. exit from !running without a prior
+	 * stop), leaving q1_occupancy[CPU]==1 and a sibling veto
+	 * forever. The same stale-1 survives a CPU offline (the CPU
+	 * never clears its slot). Clear the last CPU's occupancy if
+	 * the exiting task was Q1 and its last CPU still shows
+	 * occupied; the store is per-CPU map, no __sync_* on the BSS
+	 * stats line, and SCX_ENQ_IMMED remains LOCAL-only.
+	 */
+	if (tctx->queue == 1) {
+		s32 cpu = scx_bpf_task_cpu(p);
+
+		if (cpu >= 0 && cpu < (s32)MLFQ_MAX_CPUS &&
+		    mlfq_q1_is_occupied((u32)cpu))
+			mlfq_q1_set((u32)cpu, false);
+	}
+
 	bpf_task_storage_delete(&task_ctx_stor, p);
 }
 
@@ -459,6 +566,16 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
 void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
 	u64 op_lat_start = scx_bpf_now();
+
+	/* Clear stale Q1 occupancy for the offline CPU; sibling veto
+	 * must not survive a CPU offline when the CPU never cleared
+	 * its slot via stopping()/exit_task. Per-CPU map store, no
+	 * __sync_* on a shared line, never SCX_ENQ_HEAD, and bounded
+	 * bpf_for is untouched. Clear before the 7.1+ early return so
+	 * the drain-skip path still heals the veto.
+	 */
+	if (cpu >= 0 && cpu < (s32)MLFQ_MAX_CPUS)
+		mlfq_q1_set((u32)cpu, false);
 
 	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
 		mlfq_op_lat_charge(MLFQ_OP_LAT_CPU_RELEASE, op_lat_start);

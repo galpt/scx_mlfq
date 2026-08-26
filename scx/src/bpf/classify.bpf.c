@@ -181,6 +181,8 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 		tctx->pending_feats.queue_wait_us =
 			tctx->last_q_wait_ns / NSEC_PER_USEC;
 		tctx->pending_feats.sq_ema = tctx->sq_ema;
+		tctx->pending_feats.sleep_var_ratio = tctx->sleep_var_ratio;
+		tctx->pending_feats.pad = 0;
 		tctx->pending_queue = tctx->queue;
 		tctx->pending_valid = 1;
 
@@ -313,6 +315,8 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 		tctx->pending_feats.queue_wait_us =
 			tctx->last_q_wait_ns / NSEC_PER_USEC;
 		tctx->pending_feats.sq_ema = tctx->sq_ema;
+		tctx->pending_feats.sleep_var_ratio = tctx->sleep_var_ratio;
+		tctx->pending_feats.pad = 0;
 		tctx->pending_queue = tctx->queue;
 		tctx->pending_valid = 1;
 
