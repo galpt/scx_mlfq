@@ -29,7 +29,7 @@ The loader's network sandbox is a seccomp filter the scheduler inherits and cann
 
 ## Real-time Core Avoidance
 
-Realtime tasks take a CPU over when they become runnable, since the kernel resolves them to their own classes before sched_ext. The scheduler detects every takeover on the context switch, drains the DSQs of the taken-over CPU, and skips occupied cores in placement. On kernels before 6.19 the drain is a no-op, since the kernel re-enqueues the local DSQ itself. If a scheduling callback stalls for longer than the 30 s watchdog, the scheduler exits and the kernel reverts to CFS. The details live in `src/bpf/rtdl.bpf.c`.
+Realtime tasks take a CPU over when they become runnable, since the kernel resolves them to their own classes before sched_ext. The scheduler detects every takeover on the context switch, drains the DSQs of the taken-over CPU, and skips occupied cores in placement. The drain uses the 7.1 queue-DSQ re-enqueue path. If a scheduling callback stalls for longer than the 30 s watchdog, the scheduler exits and the kernel reverts to CFS. The details live in `src/bpf/rtdl.bpf.c`.
 
 
 ## Measuring Wakeup Latency
@@ -45,5 +45,5 @@ To measure the wakeup latency the scheduler delivers with cyclictest, pin the me
 - The largest-LLC bias trades clock speed for cache capacity, is Q1-only and non-exclusive, and is off on single-LLC and equal-size machines.
 - The topology is snapshotted at attach, so a CPU hotplug needs a restart.
 - RT and DL tasks are handled by the kernel's own classes before sched_ext.
-- Requires Linux 6.18 or newer. The realtime-takeover drain degrades by kernel version. On 6.18 the drain is a no-op and the kernel re-enqueues the local DSQ itself. The scheduler-side local re-enqueue needs 6.19, and the queue-DSQ re-enqueue needs 7.1.
+- Requires Linux 7.1 or newer. The queue-DSQ re-enqueue and the `SCX_ENQ_IMMED` wakeup fast-path require 7.1; older kernels are not supported.
 

@@ -1152,8 +1152,8 @@ fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
             mlfq_tree::predict(&tree, &feats)
         })
         .collect();
-    // Weighted holdout (Appendix C): recency weights of the full window,
-    // tail slice corresponds to the holdout; recent samples dominate.
+    // Weighted holdout: recency weights of the full window, tail slice
+    // corresponds to the holdout; recent samples dominate.
     let weights_full = mlfq_tree::sample_weights(samples.len());
     let holdout_weights = &weights_full[train.len()..];
     let ema_preds: Vec<u64> = holdout.iter().map(|s| s.feats.ema).collect();

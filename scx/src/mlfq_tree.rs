@@ -597,7 +597,7 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
 /// The publish quality gate. The tree replaces the previous model only when
 /// its holdout MAE beats the exact per-sample EMA baseline on the same
 /// holdout slice and the Pearson correlation clears the quality floor
-/// and strictly improves on the currently committed model (Appendix C).
+/// and strictly improves on the currently committed model.
 /// The holdout MAE is weighted by the recency weights of the window, so
 /// recent samples dominate the gate. Correlation is monotonic: once a
 /// model at 0.30 is committed, a later fit at 0.30 or below is held
@@ -628,10 +628,10 @@ pub fn should_publish(
     true
 }
 
-/// Weighted MAE for the holdout slice (Appendix C). Each holdout sample
-/// carries its recency weight w_i = 2^(-age_i / (n/2)) where n is the
-/// full window length, so the gate emphasizes the recent regime without
-/// dropping the older tail entirely.
+/// Weighted MAE for the holdout slice. Each holdout sample carries its
+/// recency weight w_i = 2^(-age_i / (n/2)) where n is the full window
+/// length, so the gate emphasizes the recent regime without dropping
+/// the older tail entirely.
 pub fn weighted_holdout_mae(preds: &[u64], actuals: &[u64], weights: &[f64]) -> f64 {
     assert_eq!(preds.len(), actuals.len());
     assert_eq!(preds.len(), weights.len());
