@@ -198,6 +198,14 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * would map to Q3 is therefore demoted to Q2 when the task
 	 * recently submitted GPU work, unless the sleep or the previous
 	 * burst also indicates Q3.
+	 *
+	 * Paired with the Q3 seed below in mlfq_wakeup_classify() and the
+	 * mirrored seed in mlfq_runout_classify(): the seeds keep Q3
+	 * labels alive for gpu_submit == 0 throughput tasks, while this
+	 * clamp keeps gpu_submit from becoming a Q3-defining feature.
+	 * Together they implement gpu_submit as Q1-only. Keep both; the
+	 * clamp without the seed still starves Q3, and the seed without
+	 * the clamp still pollutes Q3.
 	 */
 	if (pred >= mlfq_adapt_state.t_bnd_eff_ns && tctx->gpu_submit > 0 &&
 	    !(sleep_ns > mlfq_short_sleep_ns ||
@@ -285,6 +293,12 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * when the previous burst exceeds T_H and the sleep exceeds
 	 * MLFQ_SHORT_SLEEP_NS, so the sample completed in stopping()
 	 * carries a Q3 label into the next training window.
+	 *
+	 * Paired with the Q3 clamp above: the clamp demotes Q3
+	 * predictions for gpu_submit > 0 tasks to Q2, while this seed
+	 * preserves Q3 labels for gpu_submit == 0 tasks. Together they
+	 * implement gpu_submit as Q1-only, not Q3-defining. Keep both;
+	 * removing either reintroduces Q3 starvation or Q3 pollution.
 	 *
 	 * Invariant: I/O latency is strictly dominant. The seed is
 	 * gated on !io_wait and ordered after the I/O/short-sleep boost
