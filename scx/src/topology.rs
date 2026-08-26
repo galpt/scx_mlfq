@@ -655,33 +655,32 @@ fn write_bitmap_value(map: &libbpf_rs::Map, value: &mlfq_bitmap, key: u32) -> Re
 
 /// Build the Tier-A CPU list one LLC domain publishes.
 ///
-/// A domain that exceeds `MLFQ_MAX_LLC_CPUS` gets an EMPTY list
-/// (nr == 0): the dispatch path skips Tier A for it and Tier B's full
-/// rotating window covers the domain, instead of Tier A probing a
-/// silently shrunk subset.
+/// Thin wrapper kept for the existing call sites. The actual packing
+/// and oversize handling lives in `build_llc_cpu_list`.
 fn llc_cpu_list_for(cpus: &[u32]) -> mlfq_llc_cpu_list {
+    build_llc_cpu_list(cpus)
+}
+
+/// Pack a CPU list into the `mlfq_llc_cpu_list` map value type.
+///
+/// If the domain has more than `MLFQ_MAX_LLC_CPUS` CPUs the list is
+/// left empty (nr == 0) so the dispatch path skips Tier-A for that
+/// domain and Tier-B's full rotating window covers it instead of
+/// probing a silently truncated subset. CPUs outside `MAX_CPUS` are
+/// skipped, same as the BPF-side guard, and nr counts only the CPUs
+/// actually stored.
+fn build_llc_cpu_list(cpus: &[u32]) -> mlfq_llc_cpu_list {
     if cpus.len() > MAX_LLC_CPUS {
         return mlfq_llc_cpu_list {
             nr: 0,
             cpus: [0; mlfq_consts_MLFQ_MAX_LLC_CPUS as usize],
         };
     }
-    build_llc_cpu_list(cpus)
-}
-
-/// Pack a CPU list into the `mlfq_llc_cpu_list` map value type.
-///
-/// The caller passes only lists that fit `MLFQ_MAX_LLC_CPUS` (an
-/// oversized domain gets an empty list, not a truncated one). The
-/// take() below is defense in depth. Out-of-range CPUs are skipped
-/// (matching the plan and the BPF-side guards), and the count records
-/// only the entries actually stored.
-fn build_llc_cpu_list(cpus: &[u32]) -> mlfq_llc_cpu_list {
     let mut list = mlfq_llc_cpu_list {
         nr: 0,
         cpus: [0; mlfq_consts_MLFQ_MAX_LLC_CPUS as usize],
     };
-    for &cpu in cpus.iter().take(MAX_LLC_CPUS) {
+    for &cpu in cpus {
         if cpu as usize >= MAX_CPUS {
             continue;
         }
