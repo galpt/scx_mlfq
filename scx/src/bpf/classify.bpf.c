@@ -362,6 +362,18 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 
 	tctx->wake_cnt = 0;
 
+	/*
+	 * Q3 seed for the run-out path, mirroring the wakeup seed.
+	 * Throughput tasks that never submit GPU work and have a large
+	 * previous burst would otherwise never produce Q3 labels if the
+	 * tree learns a gpu_submit split. Force one Q3 placement when
+	 * the burst indicates Q3, so the next window has Q3 labels.
+	 */
+	if (tctx->gpu_submit == 0 &&
+	    tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns &&
+	    tctx->queue != 3)
+		tctx->queue = 3;
+
 	if (mlfq_demotion_blocked(p))
 		return;
 	if (mlfq_demote_on_reenq(tctx, mlfq_adapt_state.t_h_eff_ns,
