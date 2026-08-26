@@ -920,11 +920,19 @@ impl<'a> Scheduler<'a> {
             );
             return;
         }
-        let is_first = self.model.generation == 0;
-        if !mlfq_tree::should_publish(res.mae_tree, res.mae_ema, res.corr, is_first) {
+        let published_corr = if self.model.generation == 0 {
+            None
+        } else {
+            Some(self.model.corr)
+        };
+        if !mlfq_tree::should_publish(res.mae_tree, res.mae_ema, res.corr, published_corr) {
             log::info!(
-                "MLFQ tree gen {} rejected: holdout MAE_tree={:.1}us > MAE_ema={:.1}us or corr {:.3} < 0.30 for first publish, keeping the previous model",
-                gen, res.mae_tree / 1e3, res.mae_ema / 1e3, res.corr
+                "MLFQ tree gen {} rejected: holdout MAE_tree={:.1}us > MAE_ema={:.1}us or corr {:.3} below floor 0.30 or not above published {:.3}, keeping the previous model",
+                gen,
+                res.mae_tree / 1e3,
+                res.mae_ema / 1e3,
+                res.corr,
+                published_corr.unwrap_or(0.0)
             );
             return;
         }

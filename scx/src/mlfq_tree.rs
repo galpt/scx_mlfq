@@ -596,20 +596,34 @@ pub fn predict(tree: &SerializedTree, feats: &TreeFeats) -> u64 {
 
 /// The publish quality gate. The tree replaces the previous model only when
 /// its holdout MAE beats the exact per-sample EMA baseline on the same
-/// holdout slice (strictly better or equal) and, for the first publish,
-/// the Pearson correlation meets the 0.30 floor (Appendix C). The holdout
-/// MAE is weighted by the recency weights of the window, so recent
-/// samples dominate the gate.
+/// holdout slice and the Pearson correlation clears the quality floor
+/// and strictly improves on the currently committed model (Appendix C).
+/// The holdout MAE is weighted by the recency weights of the window, so
+/// recent samples dominate the gate. Correlation is monotonic: once a
+/// model at 0.30 is committed, a later fit at 0.30 or below is held
+/// out; 0.52 then 0.72 ratchet toward 1.0 on general workloads.
+/// A higher correlation must also beat the baseline, so a high but
+/// narrow fit on one game cannot regress the tail.
 ///
 /// This is the daemon's contract with the README's claim that the tree
 /// is published when it beats the baseline: a regressed model is kept
 /// out and the previous model stays committed.
-pub fn should_publish(mae_tree: f64, mae_ema: f64, corr: f64, is_first_publish: bool) -> bool {
+pub fn should_publish(
+    mae_tree: f64,
+    mae_ema: f64,
+    corr: f64,
+    published_corr: Option<f64>,
+) -> bool {
     if mae_tree > mae_ema {
         return false;
     }
-    if is_first_publish && corr < 0.30 {
+    if corr < 0.30 {
         return false;
+    }
+    if let Some(pc) = published_corr {
+        if corr <= pc + 1e-9 {
+            return false;
+        }
     }
     true
 }
@@ -1146,15 +1160,22 @@ mod tests {
 
     #[test]
     fn publish_gate_and_tree_meta() {
-        // The gate accepts strictly better or equal and rejects worse,
-        // and the first publish requires corr >=0.30 (Appendix C).
-        assert!(should_publish(100.0, 100.0, 0.5, false));
-        assert!(should_publish(99.0, 100.0, 0.5, false));
-        assert!(!should_publish(101.0, 100.0, 0.5, false));
-        assert!(should_publish(0.0, 0.0, 0.5, false));
-        assert!(!should_publish(90.0, 100.0, 0.29, true));
-        assert!(should_publish(90.0, 100.0, 0.30, true));
-        assert!(should_publish(90.0, 100.0, 0.0, false));
+        // The gate requires MAE_tree <= MAE_ema and corr >=0.30, and once
+        // a model is committed its correlation must be strictly exceeded
+        // (monotonic ratchet toward 1.0). A regressed MAE or a non-
+        // improving correlation keeps the previous model.
+        assert!(should_publish(100.0, 100.0, 0.5, None));
+        assert!(should_publish(99.0, 100.0, 0.5, None));
+        assert!(!should_publish(101.0, 100.0, 0.5, None));
+        assert!(should_publish(0.0, 0.0, 0.5, None));
+        assert!(!should_publish(90.0, 100.0, 0.29, None));
+        assert!(should_publish(90.0, 100.0, 0.30, None));
+        assert!(!should_publish(90.0, 100.0, 0.0, None));
+        assert!(!should_publish(90.0, 100.0, 0.30, Some(0.30)));
+        assert!(should_publish(90.0, 100.0, 0.31, Some(0.30)));
+        assert!(!should_publish(90.0, 100.0, 0.50, Some(0.50)));
+        assert!(should_publish(90.0, 100.0, 0.52, Some(0.50)));
+        assert!(should_publish(90.0, 100.0, 0.72, Some(0.52)));
         // Weighted holdout: recent samples dominate.
         let preds = [100, 200];
         let actuals = [110, 190];
