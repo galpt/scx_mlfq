@@ -209,9 +209,12 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 		evacuated = true;
 	}
 	if (__COMPAT_has_generic_reenq()) {
-		scx_bpf_dsq_reenq(mlfq_dsq_id(1, cpu), 0);
-		scx_bpf_dsq_reenq(mlfq_dsq_id(2, cpu), 0);
-		scx_bpf_dsq_reenq(mlfq_dsq_id(3, cpu), 0);
+		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)))
+			scx_bpf_dsq_reenq(mlfq_dsq_id(1, cpu), 0);
+		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)))
+			scx_bpf_dsq_reenq(mlfq_dsq_id(2, cpu), 0);
+		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu)))
+			scx_bpf_dsq_reenq(mlfq_dsq_id(3, cpu), 0);
 		evacuated = true;
 	}
 

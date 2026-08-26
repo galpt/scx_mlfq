@@ -319,12 +319,10 @@ const volatile u32 mlfq_cpu_sibling[MLFQ_MAX_CPUS];
  */
 const volatile u32 mlfq_cpu_core[MLFQ_MAX_CPUS];
 
-/* Debug helper reading mlfq_cpu_core to justify rodata retention
- * without inflating the hot path. Unused, but keeps the symbol
- * referenced for veristat/BPF dump introspection; compiler will
- * dead-strip if not called, yet the rodata stays documented.
+/* Reserved helper for mlfq_cpu_core; kept for future topology debug.
+ * Marked unused to keep the rodata documented without warning.
  */
-static __always_inline u32 mlfq_core_of_cpu(u32 cpu)
+static __always_inline __attribute__((unused)) u32 mlfq_core_of_cpu(u32 cpu)
 {
 	if (cpu >= MLFQ_MAX_CPUS)
 		return MLFQ_MAX_CPUS;
