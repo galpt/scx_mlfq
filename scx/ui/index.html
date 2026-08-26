@@ -378,7 +378,11 @@
       var shiftPct = ((s.adapt_shift || 0) * 100 / FP_ONE);
       el('adapt-shift').textContent = shiftPct.toFixed(1);
 
-      // GPU card: amdgpu yes/no, gpu_sched yes/no, and current gpu_submit 0..4 for running queue. When both are no, show not supported, not 0.
+      // GPU card: amdgpu yes/no, gpu_sched yes/no, and current
+      // running_gpu_submit 0..4 for the task now on each CPU. The per-CPU
+      // value is the quantised counter of the running task (0..4), the
+      // total is the lifetime count of deduped bumps. When both trace
+      // bits are no, show not supported, not 0.
       var gpuMask = data.gpu_trace_mask || 0;
       var amdgpuYes = (gpuMask & GPU_TRACE_AMDGPU_CS) || (gpuMask & GPU_TRACE_AMDGPU_CS_IOCTL);
       var gpuSchedYes = (gpuMask & GPU_TRACE_GPU_SCHED) !== 0;
@@ -393,7 +397,8 @@
         var running = [];
         for (var i = 0; i < perCpu.length; i++) {
           if (perCpu[i].running_queue > 0) {
-            var v = perCpu[i].gpu_submit;
+            var v = perCpu[i].running_gpu_submit;
+            if (v === undefined || v === null) v = perCpu[i].gpu_submit;
             if (v !== undefined && v !== null) running.push(v);
           }
         }

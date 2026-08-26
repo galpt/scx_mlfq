@@ -660,7 +660,7 @@ impl<'a> Scheduler<'a> {
             let state = self.read_cpu_state(cpu);
             entry.running_queue = state.running_queue;
             entry.running_pid = state.running_pid;
-            entry.gpu_submit = state.running_gpu_submit;
+            entry.running_gpu_submit = state.running_gpu_submit;
 
             let rt = self.read_rtdl_state(cpu);
             entry.rt_occupied = rt.flags & crate::bpf_intf::MLFQ_RTDL_OCCUPIED != 0;

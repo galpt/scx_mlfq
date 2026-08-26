@@ -158,9 +158,10 @@ pub struct Metrics {
 ///
 /// The static fields (`freq_khz`, `llc_id`, `smt`) are seeded once at
 /// attach from the host topology (`topology::web_cpu_static`); the
-/// dynamic fields (`running_queue`, `running_pid`, `rt_occupied`) are
-/// refreshed from the BPF per-CPU maps on every web-metrics poll. The
-/// carriers do not take part in the stats server's `delta()` accounting.
+/// dynamic fields (`running_queue`, `running_pid`, `rt_occupied`,
+/// `running_gpu_submit`) are refreshed from the BPF per-CPU maps on
+/// every web-metrics poll. The carriers do not take part in the stats
+/// server's `delta()` accounting.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PerCpuMetrics {
     /// CPU id.
@@ -182,8 +183,14 @@ pub struct PerCpuMetrics {
     pub running_pid: u32,
     /// True when a realtime-class task currently occupies the CPU.
     pub rt_occupied: bool,
-    /// GPU submit counter of the currently running task, quantised 0..4.
-    pub gpu_submit: u32,
+    /// The `gpu_submit` value of the task now on this CPU, 0..4 in steps
+    /// of FP_SHIFT. This is a snapshot of `mlfq_cpu_state.running_gpu_submit`
+    /// (which mirrors `task_ctx.gpu_submit` at `ops.running()`), not a
+    /// counter. It decays by one on long idle and is bumped at most once
+    /// per 10 ms, so a burst of trace hits for one job counts as one.
+    /// The system-wide lifetime total is `WebMetrics.gpu_submit_total`.
+    #[serde(alias = "gpu_submit")]
+    pub running_gpu_submit: u32,
 }
 
 /// Snapshot served by the web UI's `/api/stats` endpoint.
@@ -203,9 +210,15 @@ pub struct WebMetrics {
     pub queue_runnable: Vec<u64>,
     /// Tracked runnable tasks per LLC domain.
     pub llc_runnable: Vec<u64>,
-    /// Total gpu_submit increments observed.
+    /// Lifetime count of deduped gpu_submit bumps since attach, one per
+    /// 10 ms per-task window. This is the global hit counter
+    /// (`mlfq_gpu_submit_total`), not the per-task 0..4 quant. Each
+    /// logical GPU job that fires 2-3 tracepoints in a burst counts as
+    /// one here, same window as `PerCpuMetrics.running_gpu_submit`.
     pub gpu_submit_total: u64,
-    /// Bitmask of attached GPU tracepoints (bit0 amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched).
+    /// Bitmask of GPU tracepoints that are attached on this run (bit0
+    /// amdgpu_cs, bit1 amdgpu_cs_ioctl, bit2 gpu_sched). Like
+    /// `gpu_submit_total` this is a system gauge, not a per-task value.
     pub gpu_trace_mask: u32,
 }
 
