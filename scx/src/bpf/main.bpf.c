@@ -62,18 +62,17 @@ struct {
 /*
  * Per-CPU Q1 occupancy for SMT isolation, keyed by cpu id.
  *
- * One byte per CPU padded to 8 bytes for map value alignment.
- * The map is per-CPU ARRAY primary, with ARRAY fallback if the
- * verifier rejects the per-CPU variant (the fallback keeps the 8B
- * value and per-CPU lookup semantics via bpf_map_lookup_elem on
- * the current CPU). Occupancy updates are plain per-CPU stores
- * without __sync_* on a shared cache line. Place maps with proper
- * SEC(".maps") and keep the cache-line isolation from mlfq_stats:
- * the occupancy slots live in the array map, never on the BSS stats
- * line. The rodata tables (mlfq_cpu_sibling, etc.) remain.
+ * One byte per CPU padded to 8 bytes for map value alignment and to
+ * keep per-CPU slots isolated from mlfq_stats BSS. The map is
+ * BPF_MAP_TYPE_ARRAY with 8B values, so bpf_map_lookup_elem on a
+ * sibling's key returns that CPU's occupancy (cross-CPU visibility).
+ * Updates are plain stores to the CPU's own slot without __sync_*
+ * on a shared line. Isolation from mlfq_stats is by map storage
+ * (ARRAY, not BSS), so no false sharing dirties the stats line.
+ * The rodata tables (mlfq_cpu_sibling, etc.) remain.
  */
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, MLFQ_MAX_CPUS);
 	__type(key, u32);
 	__type(value, struct mlfq_q1_occupancy);

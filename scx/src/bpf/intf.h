@@ -628,14 +628,15 @@ _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, wake_lat_us) == 32,
 	       "wake_lat_us at 32");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, queue_wait_us) == 36,
 	       "queue_wait_us at 36");
-/* Masking asymmetry: BPF walk feat[9] uses &0xF (keeps 0..15, covers 0..8,
- * id 9+ masks and routes left); Rust feat_value matches with match 0..9
- * and _=>0 fallback. The plain < NR_FEATURES check is authoritative
- * (not &0xF<9 which is tautological). NR_FEATURES 9, so feat[9] holds
- * nine split features and gpu_submit at 8 is quantised 0..4.
+/* Masking asymmetry: BPF walk feat[16] uses &0xF (0..15) with feat[16]
+ * holding nine split features 0..8 (gpu_submit at 8, quant 0..4),
+ * sleep_var_ratio carry-along at 9, and 10..15 zeroed; Rust feat[16]
+ * mirrors this with match 0..10 and _=>0. The plain < NR_FEATURES
+ * check is authoritative (not &0xF<9 which is tautological) and is
+ * unconditional, so 9..15 never indexes OOB. NR_FEATURES 9.
  */
 _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
-	       "NR_FEATURES must be 9 for 1.3.11 ABI (feat[9] 0..8 split, gpu_submit quant 0..4)");
+	       "NR_FEATURES must be 9 for 1.3.11 ABI (feat[16] 0..8 split, gpu_submit quant 0..4, 9 carry-along)");
 
 /*
  * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
@@ -679,11 +680,13 @@ _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
  * Derivation: occupied==1 when the CPU runs a Q1 task (set in
  * running(), cleared in stopping()), 0 otherwise. The 8-byte value
  * keeps array map values naturally aligned and avoids false sharing
- * with the BSS stats line; the map is per-CPU ARRAY, not BSS, so no
- * __sync_* on a shared line is needed. Performance review: no extra
- * cache-line pad needed today — per-CPU ARRAY already isolates each
- * CPU's slot from the BSS stats line; pad further only if perf
- * measurement shows sibling veto contention (documented, not padded now).
+ * with the BSS stats line; the map is BPF_MAP_TYPE_ARRAY, not BSS,
+ * so no __sync_* on a shared line is needed and cross-CPU
+ * bpf_map_lookup_elem returns the sibling's occupancy. Performance
+ * review: no extra cache-line pad needed today — ARRAY already
+ * isolates each CPU's slot from the BSS stats line; pad further only
+ * if perf measurement shows sibling veto contention (documented, not
+ * padded now).
  *
  * Why isolation: keeping occupancy per-CPU avoids the word-bit
  * false sharing of a global q1_mask; sibling lookup is logical via
@@ -1880,14 +1883,12 @@ static __always_inline bool mlfq_check_tree_feature(u8 feature)
 	 * prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
 	 * queue_wait, sq_ema, gpu_submit). The fitter caps splits to
 	 * [0, MLFQ_TREE_NR_FEATURES), and sleep_var_ratio at id 9 is
-	 * carry-along for the next ABI (its slot stays zeroed until
-	 * NR_FEATURES promotes it; BPF walk feat[9] keeps &0xF mask
-	 * for the 9-slot walk, so id 9 masks to 1 and routes left as
-	 * the documented carry-along).
-	 * Why clamp: a feature id >= NR_FEATURES (>=9) would address
-	 * outside feat[9] or read the zeroed carry-along guard; the
-	 * plain < bound is the authoritative ABI check, not the masked
-	 * form (&0xF <9) which is tautological.
+	 * carry-along for the next ABI (zeroed until promoted; BPF walk
+	 * feat[16] holds it at 9 with 10..15 zeroed, &0xF keeps 0..15
+	 * in bounds). The bound check is unconditional, so feature 9..15
+	 * never indexes OOB even with MLFQ_CHECK=0, and serialize_validate
+	 * is defense in depth.
+	 * Why clamp: plain < bound is authoritative, not masked tautology.
 	 *
 	 * Strategy helper: the walk observes the feature vector
 	 * (Strategy pattern without vtable) via this predicate.
@@ -1923,17 +1924,17 @@ static __always_inline bool mlfq_check_bands(u64 t_l, u64 t_h,
  *
  * Derivation: every index is masked to the node budget
  * (MLFQ_TREE_MAX_NODES - 1), so a corrupted tree can never address
- * outside the buffer. feat[9] holds the nine split features in order;
- * sleep_var_ratio at feat id 9 is carry-along (the 1.3.11 ABI keeps it
- * out of the split range, so a tree splitting on 9 is rejected by
- * mlfq_check_tree_feature). An out-of-range feature reads the zeroed
- * slot, and a walk past the tail lands on a zeroed node predicting 0.
- * The walk is the Strategy observed via the feature vector (Observer)
- * without a vtable.
+ * outside the buffer. feat[16] holds nine split features 0..8 plus
+ * sleep_var_ratio carry-along at 9 and 10..15 zeroed; Rust mirrors
+ * feat[16]. An out-of-range feature (>=9) is rejected unconditionally
+ * before dereference, so serialize_validate is defense in depth and
+ * MLFQ_CHECK=0 cannot compile out the bound. Walk past tail lands on
+ * zeroed node predicting 0. The walk is the Strategy observed via the
+ * feature vector (Observer) without a vtable.
  *
  * Why clamp: the 30 s watchdog bounds the dispatch stall, and the
- * 16 ms label clamp bounds the f64 sums; the feat clamp prevents
- * out-of-bounds reads.
+ * 16 ms label clamp bounds the f64 sums; the unconditional feat bound
+ * prevents OOB reads even when MLFQ_CHECK=0.
  *
  * Return: The predicted burst in nsecs.
  */
@@ -1941,9 +1942,10 @@ static __always_inline u64
 mlfq_tree_walk(const struct mlfq_tree_store *store,
 	       const struct mlfq_tree_feats *f)
 {
-	u64 feat[9] = { f->prev_burst_ns, f->sleep_ns, f->ema,
+	u64 feat[16] = { f->prev_burst_ns, f->sleep_ns, f->ema,
 			f->io_wait, f->wake_cnt, f->wake_lat_us,
-			f->queue_wait_us, f->sq_ema, f->gpu_submit };
+			f->queue_wait_us, f->sq_ema, f->gpu_submit,
+			f->sleep_var_ratio, 0, 0, 0, 0, 0, 0 };
 	u32 idx = 0, nidx;
 	const struct mlfq_tree_node *n;
 	u8 feature;
@@ -1959,12 +1961,12 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 		if (n->right == 0)
 			return n->left;
 
-		/* BPF walk masks to 0..15 for the 9-slot feat[]; id 9
-		 * carry-along (sleep_var_ratio) masks to 1 and routes
-		 * left. Rust keeps feat[16] with id 9 as carry-along and
-		 *  _=>0 fallback. Mask asymmetry documented above.
+		/* BPF walk feat[16] with &0xF (0..15); 9 is sleep_var_ratio
+		 * carry-along, 10..15 zeroed. Bound check is unconditional.
 		 */
 		feature = n->feature & 0xF;
+		if (feature >= MLFQ_TREE_NR_FEATURES)
+			return 0;
 #if MLFQ_CHECK
 		if (!mlfq_check_tree_feature(feature))
 			return 0;
