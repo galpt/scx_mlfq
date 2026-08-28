@@ -140,9 +140,7 @@ pub fn plan_llcs(cpu_to_llc: &[(u32, u32)], primary_cpus: &[u32], max_llcs: usiz
     let nr = match max_llc.checked_add(1) {
         Some(v) => v,
         None => {
-            warn!(
-                "LLC id u32::MAX wraps domain count, disabling LLC-aware placement"
-            );
+            warn!("LLC id u32::MAX wraps domain count, disabling LLC-aware placement");
             return plan;
         }
     };

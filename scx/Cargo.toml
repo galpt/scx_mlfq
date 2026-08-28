@@ -27,3 +27,4 @@ scx_cargo = { path = "../../../rust/scx_cargo", version = "1.1.2" }
 
 [features]
 enable_backtrace = []
+count_alloc = []

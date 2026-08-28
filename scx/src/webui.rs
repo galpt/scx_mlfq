@@ -124,7 +124,7 @@ fn unix_handle_client(
         st.metrics.clone()
     };
 
-        let (body, content_type) = match path {
+    let (body, content_type) = match path {
         "/" => (html.as_bytes().to_vec(), "text/html; charset=utf-8"),
         "/api/stats" => {
             let stats = serde_json::to_value(&metrics.stats).unwrap_or_default();

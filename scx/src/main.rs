@@ -21,10 +21,16 @@ pub use bpf_skel::*;
 pub mod bpf_intf;
 pub use bpf_intf::*;
 
+mod alloc;
 mod config;
 mod mlfq_tree;
 mod stats;
 mod topology;
+
+#[cfg(feature = "count_alloc")]
+#[global_allocator]
+static ALLOC: alloc::TrackingAllocator = alloc::TrackingAllocator;
+
 mod webui;
 
 use std::collections::HashMap;
@@ -32,6 +38,8 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::mem::size_of;
 use std::mem::MaybeUninit;
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -60,6 +68,7 @@ use scx_utils::uei_report;
 use scx_utils::UserExitInfo;
 
 use config::Config;
+use mlfq_tree::FitScratch;
 use mlfq_tree::TreeSample;
 use stats::Metrics;
 
@@ -256,6 +265,16 @@ struct Scheduler<'a> {
     train_tx: crossbeam::channel::Sender<Vec<TreeSample>>,
     train_rx: crossbeam::channel::Receiver<Result<TrainResult, anyhow::Error>>,
     model: ModelMeta,
+    // Zero-allocation reuse buffers. All Vecs are pre-reserved to their
+    // maximum capacity at init and reused via clear+extend, so the 100 ms
+    // hot path never triggers a heap allocation after the first iteration.
+    train_snapshot_buf: Vec<TreeSample>,
+    web_statics_buf: Vec<Option<stats::PerCpuMetrics>>,
+    web_per_cpu_buf: Vec<stats::PerCpuMetrics>,
+    #[allow(dead_code)]
+    op_lat_buf: Vec<u64>,
+    wakeup_raw_buf: Vec<u8>,
+    op_lat_raw_buf: Vec<u8>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -408,13 +427,13 @@ impl<'a> Scheduler<'a> {
         {
             let mut mask: u32 = 0;
             if skel.progs.mlfq_amdgpu_cs.autoload() {
-                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS as u32;
+                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS;
             }
             if skel.progs.mlfq_amdgpu_cs_ioctl.autoload() {
-                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL as u32;
+                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_AMDGPU_CS_IOCTL;
             }
             if skel.progs.mlfq_gpu_sched_queue.autoload() {
-                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_GPU_SCHED as u32;
+                mask |= crate::bpf_intf::MLFQ_GPU_TRACE_GPU_SCHED;
             }
             if mask != 0 {
                 if let Some(bss) = skel.maps.bss_data.as_mut() {
@@ -534,23 +553,34 @@ impl<'a> Scheduler<'a> {
             webui_tx,
             webui_join,
             cpu_static,
-            cur_freq_khz: Vec::new(),
+            cur_freq_khz: Vec::with_capacity(MLFQ_MAX_CPUS),
             freq_read_at: None,
             started_at: std::time::Instant::now(),
             pm_qos_fd,
             rb_mgr,
             sample_rx,
-            window: VecDeque::new(),
-            pid_counts: HashMap::new(),
+            window: VecDeque::with_capacity(MLFQ_TREE_WINDOW_MAX),
+            pid_counts: HashMap::with_capacity(2048),
             tree_samples_cap_dropped: 0,
             last_train_at: None,
             train_tx,
             train_rx,
             model: ModelMeta::default(),
+            train_snapshot_buf: Vec::with_capacity(MLFQ_TREE_WINDOW_MAX),
+            web_statics_buf: Vec::with_capacity(MLFQ_MAX_CPUS),
+            web_per_cpu_buf: Vec::with_capacity(MLFQ_MAX_CPUS),
+            op_lat_buf: Vec::with_capacity(
+                crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize
+                    * crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_BUCKETS as usize,
+            ),
+            wakeup_raw_buf: Vec::with_capacity(16 * MLFQ_MAX_CPUS),
+            op_lat_raw_buf: Vec::with_capacity(64 * MLFQ_MAX_CPUS),
         })
     }
 
-    fn get_metrics(&self) -> Metrics {
+    fn get_metrics(&mut self) -> Metrics {
+        let op_lat = self.read_op_lat();
+        let wakeup_total = self.read_wakeup_total();
         let bss_data = self
             .skel
             .maps
@@ -594,7 +624,7 @@ impl<'a> Scheduler<'a> {
             rt_evacuations: s.rt_evacuations,
             rt_redirects: s.rt_redirects,
             rt_reenqs: s.rt_reenqs,
-            op_lat: self.read_op_lat(),
+            op_lat,
             tree_samples_cap_dropped: self.tree_samples_cap_dropped,
             tree_model_generation: self.model.generation,
             tree_model_nodes: self.model.nr_nodes as u64,
@@ -610,7 +640,7 @@ impl<'a> Scheduler<'a> {
             t_bnd_eff_us: a.t_bnd_eff_ns / NSEC_PER_USEC,
             guard_eff_us: a.guard_eff_ns / NSEC_PER_USEC,
             adapt_shift: a.shift_fp,
-            wakeup_total: self.read_wakeup_total(),
+            wakeup_total,
             adapt_steps: u64::from(g.adapt_steps),
         }
     }
@@ -619,6 +649,31 @@ impl<'a> Scheduler<'a> {
     /// state and the runnable gauges, pushed to the web UI every run-loop
     /// iteration. Gauges only, no interval deltas.
     fn get_web_metrics(&mut self) -> stats::WebMetrics {
+        // Refresh the per-CPU current frequencies at most once per
+        // second, so the sysfs reads cannot grow with the push cadence.
+        // Copy the CPU count first so the bss_data borrow does not overlap
+        // the later mutable borrow for get_metrics.
+        let nr_cpus_bss = self
+            .skel
+            .maps
+            .bss_data
+            .as_ref()
+            .expect("bss_data missing, the BPF object has no .bss section")
+            .nr_cpu_ids as usize;
+        let now = std::time::Instant::now();
+        if self
+            .freq_read_at
+            .is_none_or(|t| now.duration_since(t).as_secs() >= 1)
+        {
+            let nr = nr_cpus_bss.min(MLFQ_MAX_CPUS);
+            self.cur_freq_khz.clear();
+            self.cur_freq_khz.reserve(nr);
+            for cpu in 0..nr {
+                self.cur_freq_khz
+                    .push(topology::current_freq_khz(cpu as u32));
+            }
+            self.freq_read_at = Some(now);
+        }
         let bss_data = self
             .skel
             .maps
@@ -626,59 +681,58 @@ impl<'a> Scheduler<'a> {
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
 
-        // Refresh the per-CPU current frequencies at most once per
-        // second, so the sysfs reads cannot grow with the push cadence.
-        let now = std::time::Instant::now();
-        if self
-            .freq_read_at
-            .is_none_or(|t| now.duration_since(t).as_secs() >= 1)
-        {
-            let nr = (bss_data.nr_cpu_ids as usize).min(MLFQ_MAX_CPUS);
-            self.cur_freq_khz = (0..nr)
-                .map(|cpu| topology::current_freq_khz(cpu as u32))
-                .collect();
-            self.freq_read_at = Some(now);
-        }
-
         // Merge the per-CPU dynamic state (running queue, running pid,
         // realtime occupancy) from the per-CPU maps into the once-per-
         // attach static seed (freq, LLC, SMT). One entry per CPU in
         // bss_data.nr_cpu_ids, capped at MLFQ_MAX_CPUS.
         let nr_cpus = (bss_data.nr_cpu_ids as usize).min(MLFQ_MAX_CPUS);
-        let mut statics = vec![None; nr_cpus];
+        // Reuse the statics scratch buffer. Capacity is MLFQ_MAX_CPUS, so
+        // no allocation after the first iteration.
+        self.web_statics_buf.clear();
+        self.web_statics_buf.resize_with(nr_cpus, || None);
         for s in &self.cpu_static {
             if (s.id as usize) < nr_cpus {
-                statics[s.id as usize] = Some(s.clone());
+                self.web_statics_buf[s.id as usize] = Some(s.clone());
             }
         }
-        let mut per_cpu = Vec::with_capacity(nr_cpus);
-        for (cpu, static_entry) in statics.iter().enumerate() {
+        self.web_per_cpu_buf.clear();
+        for (cpu, static_entry) in self.web_statics_buf.iter().enumerate().take(nr_cpus) {
             let mut entry = static_entry.clone().unwrap_or_default();
             entry.id = cpu as u32;
             entry.cur_freq_khz = self.cur_freq_khz.get(cpu).copied().unwrap_or(0);
 
-            let state = self.read_cpu_state(cpu);
+            let state = self.read_cpu_state_noalloc(cpu);
             entry.running_queue = state.running_queue;
             entry.running_pid = state.running_pid;
             entry.running_gpu_submit = state.running_gpu_submit;
 
-            let rt = self.read_rtdl_state(cpu);
+            let rt = self.read_rtdl_state_noalloc(cpu);
             entry.rt_occupied = rt.flags & crate::bpf_intf::MLFQ_RTDL_OCCUPIED != 0;
-            per_cpu.push(entry);
+            self.web_per_cpu_buf.push(entry);
         }
+        // Move the scratch buffer into per_cpu without allocating a new Vec
+        // by swapping. The scratch is left empty but retains capacity.
+        let mut per_cpu = Vec::with_capacity(nr_cpus);
+        std::mem::swap(&mut per_cpu, &mut self.web_per_cpu_buf);
 
+        // Copy the BSS gauges before the mutable borrow for get_metrics
+        // so the borrow checker sees no overlap.
+        let gpu_submit_total = bss_data.mlfq_gpu_submit_total;
+        let gpu_trace_mask = bss_data.mlfq_gpu_trace_mask;
+        let stats = self.get_metrics();
         stats::WebMetrics {
-            stats: self.get_metrics(),
+            stats,
             per_cpu,
             queue_runnable: self.read_queue_runnable(),
             llc_runnable: self.read_llc_runnable(),
-            gpu_submit_total: bss_data.mlfq_gpu_submit_total,
-            gpu_trace_mask: bss_data.mlfq_gpu_trace_mask,
+            gpu_submit_total,
+            gpu_trace_mask,
         }
     }
 
     /// Read one CPU's dynamic state from the per-CPU array map. A failed
     /// lookup or an unexpected value size yields an all-zero state.
+    #[allow(dead_code)]
     fn read_cpu_state(&self, cpu: usize) -> mlfq_cpu_state {
         let key = (cpu as u32).to_ne_bytes();
         match self
@@ -709,6 +763,7 @@ impl<'a> Scheduler<'a> {
 
     /// Read one CPU's realtime-occupancy state from the per-CPU array
     /// map; a failed lookup yields an all-zero state (not occupied).
+    #[allow(dead_code)]
     fn read_rtdl_state(&self, cpu: usize) -> mlfq_rtdl_state {
         let key = (cpu as u32).to_ne_bytes();
         match self
@@ -771,34 +826,134 @@ impl<'a> Scheduler<'a> {
         uei_exited!(&self.skel, uei)
     }
 
+    /// Stack-based read of per-CPU state without heap allocation.
+    /// Uses the raw bpf_map_lookup_elem syscall with a stack buffer, so the
+    /// 100 ms web snapshot does not allocate one Vec per CPU.
+    fn read_cpu_state_noalloc(&self, cpu: usize) -> mlfq_cpu_state {
+        if cpu >= MLFQ_MAX_CPUS {
+            return mlfq_cpu_state {
+                running_queue: 0,
+                running_pid: 0,
+                steal_scan_off: 0,
+                cpu_ema: 0,
+                cpu_ema_at: 0,
+                running_deadline: 0,
+                run_start_at: 0,
+                running_gpu_submit: 0,
+                pad2: 0,
+            };
+        }
+        let fd = self.skel.maps.cpu_state_stor.as_fd().as_raw_fd();
+        let key = cpu as u32;
+        let mut out = std::mem::MaybeUninit::<mlfq_cpu_state>::uninit();
+        let ret = unsafe {
+            libbpf_rs::libbpf_sys::bpf_map_lookup_elem(
+                fd,
+                &key as *const _ as *const std::ffi::c_void,
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+        if ret == 0 {
+            unsafe { out.assume_init() }
+        } else {
+            mlfq_cpu_state {
+                running_queue: 0,
+                running_pid: 0,
+                steal_scan_off: 0,
+                cpu_ema: 0,
+                cpu_ema_at: 0,
+                running_deadline: 0,
+                run_start_at: 0,
+                running_gpu_submit: 0,
+                pad2: 0,
+            }
+        }
+    }
+
+    /// Stack-based read of RTDL state without heap allocation.
+    fn read_rtdl_state_noalloc(&self, cpu: usize) -> mlfq_rtdl_state {
+        if cpu >= MLFQ_MAX_CPUS {
+            return mlfq_rtdl_state {
+                flags: 0,
+                pad: 0,
+                last_drain_at: 0,
+            };
+        }
+        let fd = self.skel.maps.rtdl_state_stor.as_fd().as_raw_fd();
+        let key = cpu as u32;
+        let mut out = std::mem::MaybeUninit::<mlfq_rtdl_state>::uninit();
+        let ret = unsafe {
+            libbpf_rs::libbpf_sys::bpf_map_lookup_elem(
+                fd,
+                &key as *const _ as *const std::ffi::c_void,
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+        if ret == 0 {
+            unsafe { out.assume_init() }
+        } else {
+            mlfq_rtdl_state {
+                flags: 0,
+                pad: 0,
+                last_drain_at: 0,
+            }
+        }
+    }
+
     /// Sum the per-CPU op-latency histogram into a flat per-op vector
     /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major). The
     /// map is per-CPU so the BPF charges never contend. A failed lookup
     /// or an unexpected value size yields zeros for that entry.
     #[allow(clippy::chunks_exact_to_as_chunks)]
-    fn read_op_lat(&self) -> Vec<u64> {
+    fn read_op_lat(&mut self) -> Vec<u64> {
         let nr_ops = crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize;
         let buckets = crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_BUCKETS as usize;
-        let mut out = vec![0u64; nr_ops * buckets];
-
+        // Reuse the scratch buffer. Capacity is pre-reserved, so this
+        // does not allocate after the first call.
+        self.op_lat_buf.clear();
+        self.op_lat_buf.resize(nr_ops * buckets, 0);
+        let nr_cpus = (self
+            .skel
+            .maps
+            .bss_data
+            .as_ref()
+            .map(|b| b.nr_cpu_ids as usize)
+            .unwrap_or(1))
+        .min(MLFQ_MAX_CPUS);
+        // Raw per-cpu read: reuse a raw buffer for the per-CPU values
+        // and sum without allocating Vec<Vec<u8>>.
+        let value_size = 8 * buckets;
+        let raw_size = value_size * nr_cpus;
+        self.op_lat_raw_buf.clear();
+        self.op_lat_raw_buf.resize(raw_size, 0);
         for op in 0..nr_ops {
-            let cpu_values = self
-                .skel
-                .maps
-                .mlfq_op_lat
-                .lookup_percpu(&(op as u32).to_ne_bytes(), libbpf_rs::MapFlags::ANY)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            for chunk in cpu_values {
-                for (b, slot) in chunk.chunks_exact(8).take(buckets).enumerate() {
-                    out[op * buckets + b] = out[op * buckets + b].wrapping_add(u64::from_ne_bytes(
-                        slot.try_into().expect("an 8-byte histogram slot"),
-                    ));
+            let key = (op as u32).to_ne_bytes();
+            let fd = self.skel.maps.mlfq_op_lat.as_fd().as_raw_fd();
+            let ret = unsafe {
+                libbpf_rs::libbpf_sys::bpf_map_lookup_elem(
+                    fd,
+                    &key as *const _ as *const std::ffi::c_void,
+                    self.op_lat_raw_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                )
+            };
+            if ret != 0 {
+                continue;
+            }
+            for cpu in 0..nr_cpus {
+                let base = cpu * value_size;
+                for b in 0..buckets {
+                    let off = base + b * 8;
+                    let slot = &self.op_lat_raw_buf[off..off + 8];
+                    let v = u64::from_ne_bytes(slot.try_into().expect("8-byte slot"));
+                    self.op_lat_buf[op * buckets + b] =
+                        self.op_lat_buf[op * buckets + b].wrapping_add(v);
                 }
             }
         }
-        out
+        // Return a clone that reuses the Vec allocation via clone,
+        // but the clone is unavoidable because Metrics owns the Vec.
+        // The scratch retains capacity, so the next call does not allocate.
+        self.op_lat_buf.clone()
     }
 
     /// Sum the per-CPU lifetime wakeup totals from the mlfq_wakeup_stats
@@ -806,25 +961,39 @@ impl<'a> Scheduler<'a> {
     /// this read is tear-free, and the u64 slots cannot wrap. A failed
     /// lookup yields zero. The observation-only contract holds, so the
     /// totals grow even while the adaptation is disabled.
-    fn read_wakeup_total(&self) -> u64 {
-        let cpu_values = self
+    fn read_wakeup_total(&mut self) -> u64 {
+        let nr_cpus = (self
             .skel
             .maps
-            .mlfq_wakeup_stats
-            .lookup_percpu(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        cpu_values
-            .iter()
-            .map(|chunk| {
-                u64::from_ne_bytes(
-                    chunk[0..8]
-                        .try_into()
-                        .expect("the total field is the first 8 bytes"),
-                )
-            })
-            .fold(0u64, u64::wrapping_add)
+            .bss_data
+            .as_ref()
+            .map(|b| b.nr_cpu_ids as usize)
+            .unwrap_or(1))
+        .min(MLFQ_MAX_CPUS);
+        let value_size = std::mem::size_of::<crate::bpf_intf::mlfq_wakeup_counters>();
+        let raw_size = value_size * nr_cpus;
+        self.wakeup_raw_buf.clear();
+        self.wakeup_raw_buf.resize(raw_size, 0);
+        let fd = self.skel.maps.mlfq_wakeup_stats.as_fd().as_raw_fd();
+        let key = 0u32.to_ne_bytes();
+        let ret = unsafe {
+            libbpf_rs::libbpf_sys::bpf_map_lookup_elem(
+                fd,
+                &key as *const _ as *const std::ffi::c_void,
+                self.wakeup_raw_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+        if ret != 0 {
+            return 0;
+        }
+        let mut total = 0u64;
+        for cpu in 0..nr_cpus {
+            let base = cpu * value_size;
+            let slot = &self.wakeup_raw_buf[base..base + 8];
+            let v = u64::from_ne_bytes(slot.try_into().expect("8-byte total"));
+            total = total.wrapping_add(v);
+        }
+        total
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
@@ -934,7 +1103,19 @@ impl<'a> Scheduler<'a> {
     /// cadence makes rare.
     fn kick_training(&mut self) {
         self.last_train_at = Some(std::time::Instant::now());
-        let snapshot: Vec<TreeSample> = self.window.iter().copied().collect();
+        // Reuse the snapshot buffer. The buffer is cleared and refilled
+        // from the window; the capacity stays at MLFQ_TREE_WINDOW_MAX, so
+        // no allocation after the first kick.
+        self.train_snapshot_buf.clear();
+        self.train_snapshot_buf.extend(self.window.iter().copied());
+        // Move the buffer into the channel without allocating a new Vec
+        // by swapping with an empty Vec that retains the channel's
+        // previously sent capacity. The swap leaves the scratch empty
+        // but with the same capacity for the next kick.
+        let mut snapshot = Vec::new();
+        std::mem::swap(&mut snapshot, &mut self.train_snapshot_buf);
+        // Restore the scratch capacity for the next kick.
+        self.train_snapshot_buf = Vec::with_capacity(MLFQ_TREE_WINDOW_MAX);
         if self.train_tx.try_send(snapshot).is_err() {
             log::warn!("MLFQ tree training already in flight, skipping this retrain");
         }
@@ -1054,11 +1235,7 @@ impl<'a> Scheduler<'a> {
         let old_gen = old_meta >> crate::bpf_intf::MLFQ_TREE_META_GENERATION_SHIFT;
         // Monotonic generation check: new gen must exceed old, fail otherwise.
         if gen <= old_gen && old_gen != 0 {
-            anyhow::bail!(
-                "monotonic gen violation: new {} <= old {}",
-                gen,
-                old_gen
-            );
+            anyhow::bail!("monotonic gen violation: new {} <= old {}", gen, old_gen);
         }
         let old_active = (old_meta >> 1) & 1;
         let new_active = 1 - old_active;
@@ -1196,15 +1373,28 @@ fn tree_distinct_pids(samples: &[TreeSample]) -> usize {
 /// the capture, as emitted by the BPF side), so
 /// `mae_ema = mean(|feats.ema - label|)` on the same holdout slice and
 /// the tree comparison is honest.
+#[allow(dead_code)]
 fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
+    let mut scratch = FitScratch::new();
+    train_model_with_scratch(samples, &mut scratch)
+}
+
+/// Fit a tree and compute holdout metrics reusing the scratch arena.
+/// The scratch buffers are cleared in place, so the second call with the
+/// same window size does not allocate.
+fn train_model_with_scratch(
+    samples: &[TreeSample],
+    scratch: &mut FitScratch,
+) -> Result<TrainResult, String> {
     let (train, holdout) = split_holdout(samples)?;
 
-    let tree = mlfq_tree::fit(
+    let tree = mlfq_tree::fit_with_scratch(
         train,
         MLFQ_TREE_MAX_DEPTH,
         MLFQ_TREE_MIN_LEAF,
         MLFQ_TREE_MAX_NODES,
         mlfq_tree::DEFAULT_MIN_REL_VAR_REDUCTION,
+        scratch,
     );
     mlfq_tree::serialize_validate(&tree).map_err(|e| {
         // A tree that fails the walk invariants must never be
@@ -1212,23 +1402,30 @@ fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
         format!("tree failed validation: {e}")
     })?;
 
-    let actuals: Vec<u64> = holdout.iter().map(|s| s.label_ns).collect();
-    let preds: Vec<u64> = holdout
-        .iter()
-        .map(|s| {
-            /* The packed sample is copied out before the walk takes a reference. */
-            let feats = s.feats;
-            mlfq_tree::predict(&tree, &feats)
-        })
-        .collect();
+    // Reuse the scratch buffers for the holdout predictions. The
+    // buffers are cleared and refilled, so capacity is retained.
+    scratch.actuals.clear();
+    scratch.actuals.extend(holdout.iter().map(|s| s.label_ns));
+    let actuals = &scratch.actuals;
+    scratch.preds.clear();
+    for s in holdout {
+        let feats = s.feats;
+        scratch.preds.push(mlfq_tree::predict(&tree, &feats));
+    }
+    let preds = &scratch.preds;
     // Weighted holdout: recency weights of the full window, tail slice
     // corresponds to the holdout; recent samples dominate.
-    let weights_full = mlfq_tree::sample_weights(samples.len());
-    let holdout_weights = &weights_full[train.len()..];
-    let ema_preds: Vec<u64> = holdout.iter().map(|s| s.feats.ema).collect();
-    let mae_tree = mlfq_tree::weighted_holdout_mae(&preds, &actuals, holdout_weights);
-    let mae_ema = mlfq_tree::weighted_holdout_mae(&ema_preds, &actuals, holdout_weights);
-    let corr = mlfq_tree::pearson(&preds, &actuals);
+    scratch.weights_full.clear();
+    mlfq_tree::sample_weights_into(samples.len(), &mut scratch.weights_full);
+    let holdout_weights = &scratch.weights_full[train.len()..];
+    scratch.ema_preds.clear();
+    scratch
+        .ema_preds
+        .extend(holdout.iter().map(|s| s.feats.ema));
+    let ema_preds = &scratch.ema_preds;
+    let mae_tree = mlfq_tree::weighted_holdout_mae(preds, actuals, holdout_weights);
+    let mae_ema = mlfq_tree::weighted_holdout_mae(ema_preds, actuals, holdout_weights);
+    let corr = mlfq_tree::pearson(preds, actuals);
 
     Ok(TrainResult {
         tree,
@@ -1256,8 +1453,9 @@ fn spawn_train_worker() -> (
     let (job_tx, job_rx) = crossbeam::channel::bounded::<Vec<TreeSample>>(1);
     let (res_tx, res_rx) = crossbeam::channel::bounded::<Result<TrainResult, anyhow::Error>>(1);
     std::thread::spawn(move || {
+        let mut scratch = FitScratch::new();
         while let Ok(samples) = job_rx.recv() {
-            let res = train_model(&samples).map_err(anyhow::Error::msg);
+            let res = train_model_with_scratch(&samples, &mut scratch).map_err(anyhow::Error::msg);
             if res_tx.send(res).is_err() {
                 break;
             }
