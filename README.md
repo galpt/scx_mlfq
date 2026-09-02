@@ -21,6 +21,12 @@ overview of the design.
 RT and DL tasks are scheduled by the kernel rt and dl classes. sched_ext
 sits below the fair class, so this scheduler handles non-RT tasks only.
 
+## Typical Use Cases
+
+- Gaming and other latency-sensitive applications. Interactive tasks wake from short sleeps or I/O, promote to Q1, preempt lower-priority tasks, run at the maximum performance target, and prefer idle big cores on hybrid systems, so wakeup latency stays low.
+- General desktop use. The desktop session stays responsive while background work such as software updates, file indexing, or compilation is demoted to Q3 and no longer competes with interactive tasks.
+- Mixed workloads on laptops and desktops. CPU-bound jobs keep throughput with larger slices while the aging pass re-classifies tasks that wait in the lower queues for more than a second.
+
 ## Repository layout
 
 ```

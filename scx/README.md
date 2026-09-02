@@ -9,6 +9,11 @@ Tasks are classified into three per-CPU queues, Q1 for interactive tasks, Q2 for
 
 The scheduler also implements wakeup boosts, run-out demotion, aging, a guaranteed Q3 share of every dispatch batch, cache-aware stealing and the placement sequence, and the details live in the code comments of the named files. The classification and boost rules are in `src/bpf/classify.bpf.c` and `src/bpf/enqueue.bpf.c`, the steal tiers in `src/bpf/dispatch.bpf.c`, the placement steps in `src/bpf/select_cpu.bpf.c`. Every placement clamps a task's lag to within one lag bound of its queue's virtual clock. This per-queue bounded-lag guarantee is documented in `src/bpf/intf.h`.
 
+## Typical Use Cases
+
+- Gaming and other latency-sensitive applications. Interactive tasks wake from short sleeps or I/O, promote to Q1, preempt lower-priority tasks, run at the maximum performance target, and prefer idle big cores on hybrid systems, so wakeup latency stays low.
+- General desktop use. The desktop session stays responsive while background work such as software updates, file indexing, or compilation is demoted to Q3 and no longer competes with interactive tasks.
+- Mixed workloads on laptops and desktops. CPU-bound jobs keep throughput with larger slices while the aging pass re-classifies tasks that wait in the lower queues for more than a second.
 
 ## Production Ready?
 
@@ -44,7 +49,7 @@ To measure the wakeup latency the scheduler delivers with cyclictest, pin the me
 - The runnable gauges cover tracked tasks only and are advisory.
 - The largest-LLC bias trades clock speed for cache capacity, is Q1-only and non-exclusive, and is off on single-LLC and equal-size machines.
 - The topology is snapshotted at attach, so a CPU hotplug needs a restart.
-- RT and DL tasks are handled by the kernel's own classes before sched_ext.
+- sched_ext cannot schedule RT and DL tasks: the kernel resolves them to the rt and dl classes before sched_ext, so this scheduler handles SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks only.
 - GPU submitter awareness is optional and self pruning. The amdgpu and gpu_scheduler tracepoints are used when they exist, otherwise the feature stays at zero.
 - Requires Linux 7.1 or newer. The queue-DSQ re-enqueue and the `SCX_ENQ_IMMED` wakeup fast-path require 7.1; older kernels are not supported.
 
