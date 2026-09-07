@@ -28,7 +28,7 @@
 /*
  * Look up the per-CPU realtime-occupancy state.
  *
- * Return: The state, or NULL for an invalid CPU or a failed lookup.
+ * Gives The state, or NULL for an invalid CPU or a failed lookup.
  */
 static __always_inline struct mlfq_rtdl_state *mlfq_lookup_rtdl_state(s32 cpu)
 {
@@ -61,7 +61,7 @@ static __always_inline bool mlfq_cpu_occupied(s32 cpu)
  * touched. The caller has already decided the wakeup must not land on
  * an occupied core, and the kernel's idle accounting is unaffected.
  *
- * Return: The first non-occupied CPU @p may run on, or -ENOENT.
+ * Gives The first non-occupied CPU @p may run on, or -ENOENT.
  */
 static __always_inline s32
 mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
@@ -73,8 +73,6 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
 		bpf_for(bit, 0, 64) {
 			u32 cand = word * 64 + bit;
 
-			if (cand >= MLFQ_MAX_CPUS)
-				break;
 			if (!mlfq_bitmap_test_cpu(bm, cand))
 				continue;
 			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
@@ -95,7 +93,7 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
  * @p may run on. An unpopulated LLC bitmap or an unknown LLC proceeds
  * to the flat scan.
  *
- * Return: A non-occupied CPU @p may run on, or -ENOENT.
+ * Gives A non-occupied CPU @p may run on, or -ENOENT.
  */
 static __always_inline s32
 mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
@@ -154,6 +152,7 @@ mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
  */
 static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 {
+/* Drain runs at most once per interval per CPU. */
 	struct mlfq_rtdl_state *rt;
 	bool evacuated = false;
 
@@ -237,7 +236,7 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
  * occupied and attempts the takeover drain. Any other next clears the
  * mark. Because the hook fires on every real switch, the flag always
  * reflects the class of the last task that ran on the CPU, which is
- * exactly the invariant the placement redirect needs. The program is
+ * exactly the rule the placement redirect needs. The program is
  * loaded on every kernel. The flag logic alone drives placement even
  * where the evacuation cannot run, and the evacuation branches inside
  * are ksym-gated so they self-prune on kernels without the reenqueue

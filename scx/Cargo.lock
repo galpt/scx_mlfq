@@ -558,14 +558,14 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libbpf-cargo"
-version = "0.26.2"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67e63283df9689af55b85f91e99dc8b213ae89fc3e1d9bb29ab7f75eb8a8a783"
+checksum = "b60690d8d106293050fe02e0f6d090556b3ca2a2ec9c73271eb47efd69376b12"
 dependencies = [
  "anyhow",
  "cargo_metadata",
  "clap",
- "libbpf-rs",
+ "libbpf-rs 0.27.0",
  "memmap2",
  "serde",
  "serde_json",
@@ -579,6 +579,18 @@ name = "libbpf-rs"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd8e8db46a2d5967b5b3dba7aba32a875dc38f222395040607045635ec1f9b63"
+dependencies = [
+ "bitflags",
+ "libbpf-sys",
+ "libc",
+ "vsprintf",
+]
+
+[[package]]
+name = "libbpf-rs"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e69ad90c37d14f657291712f297a1460a1d1b647da45e0e372996b807c38f02"
 dependencies = [
  "bitflags",
  "libbpf-sys",
@@ -936,7 +948,7 @@ dependencies = [
  "glob",
  "lazy_static",
  "libbpf-cargo",
- "libbpf-rs",
+ "libbpf-rs 0.27.0",
  "ruzstd",
  "sscanf",
  "tar",
@@ -949,14 +961,14 @@ dependencies = [
 
 [[package]]
 name = "scx_mlfq"
-version = "1.3.11"
+version = "1.3.12"
 dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
  "crossbeam",
  "ctrlc",
- "libbpf-rs",
+ "libbpf-rs 0.26.2",
  "log",
  "scx_cargo",
  "scx_stats",
@@ -1006,7 +1018,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "libbpf-cargo",
- "libbpf-rs",
+ "libbpf-rs 0.27.0",
  "libc",
  "log",
  "nix",

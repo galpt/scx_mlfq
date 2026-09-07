@@ -104,6 +104,14 @@ pub struct Metrics {
     pub rt_redirects: u64,
     #[stat(desc = "SCX_ENQ_REENQ re-enqueues counted at enqueue")]
     pub rt_reenqs: u64,
+    #[stat(desc = "EEVDF eligible picks observed at dispatch")]
+    pub eevdf_eligible: u64,
+    #[stat(desc = "EEVDF ineligible heads skipped at dispatch")]
+    pub eevdf_ineligible: u64,
+    #[stat(desc = "EEVDF deadlines expired at charge time")]
+    pub eevdf_deadline_miss: u64,
+    #[stat(desc = "EEVDF lag spread beyond one bound at publish")]
+    pub eevdf_divergence: u64,
     #[stat(
         desc = "Per-op callback latency histogram, 4 ops x 8 buckets in microseconds (stopping, dispatch, enqueue, cpu_release)"
     )]
@@ -162,7 +170,7 @@ pub struct Metrics {
 /// `running_gpu_submit`) are refreshed from the BPF per-CPU maps on
 /// every web-metrics poll. The carriers do not take part in the stats
 /// server's `delta()` accounting.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct PerCpuMetrics {
     /// CPU id.
     pub id: u32,
@@ -207,9 +215,9 @@ pub struct WebMetrics {
     /// One entry per online CPU.
     pub per_cpu: Vec<PerCpuMetrics>,
     /// Tracked runnable tasks per queue; index 0 unused, 1..3 = Q1..Q3.
-    pub queue_runnable: Vec<u64>,
+    pub queue_runnable: [u64; 4],
     /// Tracked runnable tasks per LLC domain.
-    pub llc_runnable: Vec<u64>,
+    pub llc_runnable: [u64; 32],
     /// Lifetime count of deduped gpu_submit bumps since attach, one per
     /// 10 ms per-task window. This is the global hit counter
     /// (`mlfq_gpu_submit_total`), not the per-task 0..4 quant. Each
@@ -224,6 +232,7 @@ pub struct WebMetrics {
 
 /// Bucket edges of the op-latency histogram, matching `enum
 /// mlfq_op_lat_consts` in `src/bpf/intf.h`, in microseconds.
+/* Eight buckets cover 0us to over 250us. */
 const OP_LAT_EDGES_US: [u64; 7] = [
     crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_2 as u64,
     crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_EDGE_5 as u64,
@@ -363,13 +372,23 @@ impl Metrics {
             rt_evacuations: self.rt_evacuations.wrapping_sub(rhs.rt_evacuations),
             rt_redirects: self.rt_redirects.wrapping_sub(rhs.rt_redirects),
             rt_reenqs: self.rt_reenqs.wrapping_sub(rhs.rt_reenqs),
+            eevdf_eligible: self.eevdf_eligible.wrapping_sub(rhs.eevdf_eligible),
+            eevdf_ineligible: self.eevdf_ineligible.wrapping_sub(rhs.eevdf_ineligible),
+            eevdf_deadline_miss: self
+                .eevdf_deadline_miss
+                .wrapping_sub(rhs.eevdf_deadline_miss),
+            eevdf_divergence: self.eevdf_divergence.wrapping_sub(rhs.eevdf_divergence),
             /* The histogram is a per-interval delta like the counters. */
-            op_lat: self
-                .op_lat
-                .iter()
-                .zip(rhs.op_lat.iter())
-                .map(|(lhs, rhs)| lhs.wrapping_sub(*rhs))
-                .collect(),
+            op_lat: {
+                let mut out = Vec::with_capacity(self.op_lat.len());
+                let mut i = 0;
+                while i < self.op_lat.len() {
+                    let r = rhs.op_lat.get(i).copied().unwrap_or(0);
+                    out.push(self.op_lat[i].wrapping_sub(r));
+                    i += 1;
+                }
+                out
+            },
             tree_samples_cap_dropped: self
                 .tree_samples_cap_dropped
                 .wrapping_sub(rhs.tree_samples_cap_dropped),

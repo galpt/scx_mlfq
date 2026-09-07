@@ -81,7 +81,7 @@ pub struct CapacityPlan {
 /// Decide the primary set from the discovered big cores.
 ///
 /// A primary list covering every online CPU means there is no capacity
-/// asymmetry to exploit; an empty list means discovery produced no usable
+/// gap to use. An empty list means discovery produced no usable
 /// data. Both fall back to the uniform-capacity behavior.
 pub fn plan_primary_mask(primary_cpus: &[u32], nr_online: usize) -> CapacityPlan {
     if primary_cpus.is_empty() || primary_cpus.len() >= nr_online {
@@ -553,6 +553,7 @@ pub fn current_freq_khz(cpu: u32) -> u64 {
 /// hybrid systems a failure here leaves the map empty: the selector then
 /// treats every CPU as non-primary and falls back to any idle CPU.
 pub fn write_primary_bitmap(
+    /* Primary bitmap marks big cores, empty means all. */
     skel: &mut crate::bpf_skel::BpfSkel<'_>,
     plan: &CapacityPlan,
 ) -> Result<()> {
@@ -606,7 +607,7 @@ pub fn write_llc_cpu_lists(skel: &mut crate::bpf_skel::BpfSkel<'_>, plan: &LlcPl
                 plan.llc_cpus[llc].len()
             );
         }
-        let list = llc_cpu_list_for(&plan.llc_cpus[llc]);
+        let list = build_llc_cpu_list(&plan.llc_cpus[llc]);
         write_llc_cpu_list_value(&skel.maps.mlfq_llc_cpus, &list, llc as u32)
             .with_context(|| format!("failed to write the LLC {llc} CPU list"))?;
     }
@@ -649,14 +650,6 @@ fn write_bitmap_value(map: &libbpf_rs::Map, value: &mlfq_bitmap, key: u32) -> Re
     };
     map.update(&key_bytes, value_bytes, MapFlags::ANY)?;
     Ok(())
-}
-
-/// Build the Tier-A CPU list one LLC domain publishes.
-///
-/// Thin wrapper kept for the existing call sites. The actual packing
-/// and oversize handling lives in `build_llc_cpu_list`.
-fn llc_cpu_list_for(cpus: &[u32]) -> mlfq_llc_cpu_list {
-    build_llc_cpu_list(cpus)
 }
 
 /// Pack a CPU list into the `mlfq_llc_cpu_list` map value type.
@@ -719,7 +712,7 @@ mod tests {
 
     #[test]
     fn full_primary_list_is_uniform() {
-        // Every online CPU is primary: no asymmetry to exploit.
+        // Every online CPU is primary. No gap to use.
         let plan = plan_primary_mask(&[0, 1, 2, 3, 4, 5, 6, 7], 8);
         assert!(plan.primary_all);
     }
@@ -845,7 +838,7 @@ mod tests {
     fn bitmap_words_count_matches_bpf_constant() {
         assert_eq!(
             mlfq_consts_MLFQ_BITMAP_WORDS,
-            (crate::bpf_intf::mlfq_consts_MLFQ_MAX_CPUS + 63) / 64
+            crate::bpf_intf::mlfq_consts_MLFQ_MAX_CPUS.div_ceil(64)
         );
     }
 
@@ -999,13 +992,13 @@ mod tests {
         // A domain larger than the Tier-A window gets nr == 0: Tier A
         // skips it and Tier B's full rotating window covers the domain.
         let over: Vec<u32> = (0..MAX_LLC_CPUS as u32 + 1).collect();
-        assert_eq!(llc_cpu_list_for(&over).nr, 0);
+        assert_eq!(build_llc_cpu_list(&over).nr, 0);
 
         // A domain that fits the window publishes every CPU, and the
         // window width equals the list bound, so the constant modulo
         // covers the whole populated list.
         let fits: Vec<u32> = (0..MAX_LLC_CPUS as u32).collect();
-        let list = llc_cpu_list_for(&fits);
+        let list = build_llc_cpu_list(&fits);
         assert_eq!(list.nr, MAX_LLC_CPUS as u32);
         assert_eq!(MAX_LLC_CPUS, mlfq_consts_MLFQ_LLC_SCAN_MAX as usize);
     }

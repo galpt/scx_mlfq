@@ -91,10 +91,8 @@ struct WebState {
     metrics: WebMetrics,
 }
 
-/// Serve one unix-socket client with a minimal HTTP/1.1 response. The
-/// two routes mirror the tiny_http server: `/` serves the embedded HTML
-/// (no-store), `/api/stats` the live metrics JSON, everything else a
-/// 404. A malformed request is dropped silently.
+/// Serve one unix client with a minimal HTTP reply. Two routes only.
+/* Unix socket mirrors the loopback routes. */
 fn unix_handle_client(
     mut stream: std::os::unix::net::UnixStream,
     state: &Arc<Mutex<WebState>>,
@@ -311,8 +309,7 @@ fn try_unblock_loader_sandbox() -> bool {
 ///
 /// Only the byte-identical file this process wrote is ever removed: a
 /// foreign or user-edited drop-in is logged and left untouched. `/run`
-/// is tmpfs, so even an exit that skips this restore self-heals at the
-/// next reboot.
+/// is tmpfs, so an exit that skips this restore is clean at reboot.
 pub fn restore_loader_sandbox() {
     if !UNBLOCK_WRITTEN.load(Ordering::SeqCst) {
         return;
@@ -384,10 +381,10 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
 
     // The metrics consumer: keep the newest snapshot behind the mutex.
     // A timeout keeps the loop parked for at most POLL_INTERVAL, so the
-    // shutdown flag is observed within that budget.
+    // shutdown flag is observed within that budget. Joined at the end.
     let state_clone = state.clone();
     let shutdown_clone = shutdown.clone();
-    std::thread::spawn(move || {
+    let inner = std::thread::spawn(move || {
         while !shutdown_clone.load(Ordering::Relaxed) {
             match metrics_rx.recv_timeout(POLL_INTERVAL) {
                 Ok(m) => {
@@ -499,19 +496,30 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
             "Web UI: TCP blocked (spawned by scx_loader?), falling back to {}",
             UNIX_SOCKET_PATH
         );
-        // Remove a stale socket file left by a previous run before
-        // binding, so the bind cannot fail on the leftover path.
-        if let Ok(meta) = std::fs::symlink_metadata(UNIX_SOCKET_PATH) {
-            if meta.file_type().is_socket() {
-                let _ = std::fs::remove_file(UNIX_SOCKET_PATH);
-            }
-        }
-
+        // Bind first. Only on address-in-use remove a stale socket left
+        // by a previous run and retry once, so no check-then-remove race
+        // runs when the path is free.
         let listener = match UnixListener::bind(UNIX_SOCKET_PATH) {
+            Ok(l) => Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if let Ok(meta) = std::fs::symlink_metadata(UNIX_SOCKET_PATH) {
+                    if meta.file_type().is_socket() {
+                        let _ = std::fs::remove_file(UNIX_SOCKET_PATH);
+                    }
+                }
+                UnixListener::bind(UNIX_SOCKET_PATH)
+            }
+            Err(e) => Err(e),
+        };
+        let listener = match listener {
             Ok(l) => l,
             Err(e) => {
                 log::warn!("Web UI: Unix socket bind failed: {}", e);
                 log::warn!("Web UI disabled. Use --no-webui to silence.");
+                while !shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let _ = inner.join();
                 return;
             }
         };
@@ -540,6 +548,10 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
             // The UI simply shows disconnected.
             log::error!("Web UI: failed to set the unix socket nonblocking: {e}");
             log::warn!("Web UI disabled. Use --no-webui to silence.");
+            while !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = inner.join();
             return;
         }
         while !shutdown.load(Ordering::Relaxed) {
@@ -572,6 +584,7 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         }
     }
 
+    let _ = inner.join();
     log::info!("Web UI stopped");
 }
 
@@ -614,10 +627,7 @@ mod tests {
         // Any other or errno-less error is conservatively not a sandbox
         // failure.
         assert!(!sandbox_failure(&std::io::Error::from_raw_os_error(110)));
-        assert!(!sandbox_failure(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "no errno"
-        )));
+        assert!(!sandbox_failure(&std::io::Error::other("no errno")));
     }
 
     #[test]
@@ -669,7 +679,7 @@ mod tests {
         // An io::Error without an errno (a custom error payload) yields
         // None, so the classification stays off rather than guessing.
         let no_errno: Box<dyn std::error::Error + Send + Sync + 'static> =
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, "no errno"));
+            Box::new(std::io::Error::other("no errno"));
         assert!(boxed_io_error(no_errno.as_ref()).is_none());
 
         // A non-io error with no io::Error in the source chain yields

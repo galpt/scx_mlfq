@@ -27,10 +27,17 @@
  * behavior. With LLC awareness unpopulated (map lookup failed or
  * mlfq_nr_llcs == 0) Tier A is skipped and Tier B degrades to today's
  * plain window, including its same-LLC probing. In both tiers the
- * earliest eligible remote deadline wins. The kernel enforces affinity
- * on the move itself: consume_dispatch_q() in ext.c skips heads that
- * cannot run on the consuming CPU, so the BPF pre-check only prefers the
- * earliest eligible head and avoids wasted moves.
+ * earliest eligible remote deadline wins (pruned-min: the own head is
+ * served before any remote head within the quota, and a same-LLC head
+ * beats a cross-LLC head regardless of deadline for cache warmth).
+ * Eligibility is tested during the tier scan, not after the pick, so an
+ * earlier ineligible head never starves a later eligible one; an
+ * ineligible head stays queued for its own DSQ (DELAY for that DSQ)
+ * while other DSQs with eligible heads are still served. The kernel
+ * enforces affinity on the move itself: consume_dispatch_q() in ext.c
+ * skips heads that cannot run on the consuming CPU, so the BPF
+ * pre-check only prefers the earliest eligible head and avoids wasted
+ * moves.
  *
  * The three quotas are served by bounded loops: every queue consumes its
  * own DSQ with a quota-bounded move loop, then scans at most the
@@ -74,30 +81,37 @@
  * @cand: Remote CPU to probe.
  * @cpu: Local CPU, the affinity target of the peeked tasks.
  *
+ * One candidate keeps the keep path cheap, the slot loops scan the rest.
  * Three lockless peeks, one per queue DSQ, each gated on nr_queued so an
- * empty DSQ is skipped without a peek. A head that can run on @cpu means
- * the slot loops below have work to steal.
+ * empty DSQ is skipped without a peek. A head that can run on @cpu and is
+ * owed service means the slot loops below have work to steal, an ineligible
+ * head stays for its own CPU.
  *
- * Return: true if any queue DSQ head can run on @cpu.
+ * Gives true if any queue DSQ head can run on @cpu and is eligible.
  */
 static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
 {
 	struct task_struct *t;
+	u8 qid;
 
-	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cand))) {
-		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(1, cand));
-		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-			return true;
-	}
-	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cand))) {
-		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(2, cand));
-		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-			return true;
-	}
-	if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cand))) {
-		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(3, cand));
-		if (t && bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
-			return true;
+	for (qid = 1; qid <= MLFQ_NR_QUEUES; qid++) {
+		struct queue_ctx *qq = mlfq_lookup_queue(qid);
+
+		if (!qq)
+			continue;
+		if (!scx_bpf_dsq_nr_queued(mlfq_dsq_id(qid, cand)))
+			continue;
+		t = __COMPAT_scx_bpf_dsq_peek(mlfq_dsq_id(qid, cand));
+		if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
+			continue;
+		{
+			struct task_ctx *tc = mlfq_lookup_task_ctx(t);
+
+			if (!tc)
+				return true;
+			if (mlfq_eligible_bpf(qq, tc->vruntime, 0, 0, false))
+				return true;
+		}
 	}
 	return false;
 }
@@ -145,8 +159,9 @@ static __always_inline bool mlfq_remote_work_probe(s32 cand, s32 cpu)
  * second loop whose bound depends on how many moves the first one made
  * cannot converge within the kernel's jump-sequence limit.
  *
- * Return: The number of tasks moved.
+ * Gives The number of tasks moved.
  */
+/* Tier A steals same LLC first, Tier B next. */
 static __always_inline u32
 mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		    struct mlfq_cpu_state *cpu_state, u64 nr_cpus,
@@ -168,7 +183,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 	 * below replaces it with the consuming CPU's own-LLC base, taken
 	 * from the null-checked own_llc_list. Keeping the base non-null
 	 * everywhere is what lets the slot loop index it directly.
-	 * clang's loop-invariant code motion would otherwise hoist the
+	 * clang motion would otherwise hoist the
 	 * &list->cpus[] address computation above the null check, and the
 	 * BPF verifier rejects pointer arithmetic on a possibly-null map
 	 * value ("map_value_or_null").
@@ -191,8 +206,12 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			tier_a_nr = MLFQ_LLC_SCAN_MAX;
 	}
 
-	/* Hoist off and mlfq_dsq_id reuse: off computed once per queue, dsq ids reused via locals. 3072 tail cut documented: MLFQ_ALPHA 3072 is the EMA tail cut. No new bpf_for. */
+	/* Hoist off and mlfq_dsq_id reuse: off computed once per queue, dsq ids reused via locals. */
 	u32 off = cpu_state ? cpu_state->steal_scan_off % (u32)nr_cpus : 0;
+	struct queue_ctx *qq = mlfq_lookup_queue(qid);
+
+	if (!qq)
+		return moved;
 
 	bpf_for(slot, 0, quota) {
 		struct task_struct *best = NULL;
@@ -200,21 +219,67 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		s32 best_cpu = cpu;
 		u32 cand, i;
 		bool tier_a_ran = false;
+		u64 slot_curr_vr = 0;
+		u32 slot_curr_w = 0;
+		bool slot_curr_valid = false;
 
 		/*
-		 * Own head first: move_to_local pops the min-deadline head
-		 * of the own DSQ and returns false when the DSQ is empty
-		 * or nothing can run on this CPU, which then proceeds
-		 * to the steal scan. The move is same-LLC by construction.
-		 * The source DSQ is owned by this consuming CPU, so the
-		 * task's LLC ownership record is unchanged and no
-		 * runnable-accounting adjustment is needed (the ownership
-		 * adjust only fires at the steal below, where the source
-		 * DSQ is remote and the domain may differ).
+		 * The running task on this CPU belongs to the average when
+		 * its queue matches, the fair.c including-curr average. The
+		 * slot snapshots it once, so every eligibility test in the
+		 * slot sees the same service point.
 		 */
-		if (scx_bpf_dsq_move_to_local(own_dsq, 0)) {
-			moved++;
-			continue;
+		if (cpu_state && cpu_state->running_queue == qid &&
+		    cpu_state->running_weight) {
+			slot_curr_vr = cpu_state->running_vruntime;
+			slot_curr_w = cpu_state->running_weight;
+			slot_curr_valid = true;
+		}
+
+		/*
+		 * Own head first, gated on eligibility including the running
+		 * task. The peek checks the head can run here and is owed
+		 * service. An eligible head is moved directly, which pops
+		 * the min deadline head without a scan. An ineligible head
+		 * is left queued for the average to catch up (DELAY for
+		 * this DSQ), and the slot tries the steal tiers for eligible
+		 * remote work instead. The local drain stays first, but
+		 * eligibility stays primary. Only move_to_local moves work.
+		 */
+		if (scx_bpf_dsq_nr_queued(own_dsq)) {
+			struct task_struct *own = __COMPAT_scx_bpf_dsq_peek(own_dsq);
+
+			if (own && bpf_cpumask_test_cpu((u32)cpu, own->cpus_ptr)) {
+				struct task_ctx *own_tctx = mlfq_lookup_task_ctx(own);
+				bool own_ok = true;
+
+				if (own_tctx)
+					own_ok = mlfq_eligible_bpf(qq, own_tctx->vruntime,
+								   slot_curr_vr, slot_curr_w,
+								   slot_curr_valid);
+				if (own_ok) {
+					if (scx_bpf_dsq_move_to_local(own_dsq, 0)) {
+						if (own_tctx) {
+							if (mlfq_sums_present(own_tctx)) {
+								u8 sq = mlfq_sums_qid(own_tctx);
+
+								if (sq == qid) {
+									mlfq_sum_sub(qq, own_tctx->vruntime,
+										     own_tctx->weight ? own_tctx->weight : 1);
+									mlfq_sums_clear(own_tctx);
+								} else {
+									mlfq_sums_leave(own_tctx);
+								}
+							}
+						}
+						__sync_fetch_and_add(&mlfq_stats.eevdf_eligible, 1);
+						moved++;
+						continue;
+					}
+				} else {
+					__sync_fetch_and_add(&mlfq_stats.eevdf_ineligible, 1);
+				}
+			}
 		}
 
 		/*
@@ -250,6 +315,8 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			tier_a_ran = true;
 			bpf_for(i, 0, MLFQ_LLC_SCAN_MAX) {
 				struct task_struct *t;
+				struct task_ctx *tc;
+				bool ok = true;
 				u64 cand_dsq;
 				u32 idx = (off + i) % MLFQ_LLC_SCAN_MAX;
 
@@ -265,12 +332,51 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 				t = __COMPAT_scx_bpf_dsq_peek(cand_dsq);
 				if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
 					continue;
-				if (!best ||
-				    mlfq_time_before(t->scx.dsq_vtime,
-						     best->scx.dsq_vtime)) {
+				/*
+				 * A head later than the current best can never
+				 * win, so skip the eligibility lookup for it.
+				 * Otherwise eligibility comes first: an
+				 * ineligible head stays queued (DELAY for its
+				 * DSQ) and never becomes best, so an earlier
+				 * ineligible head cannot starve a later
+				 * eligible one.
+				 */
+				if (best && mlfq_time_before(best->scx.dsq_vtime,
+							     t->scx.dsq_vtime))
+					continue;
+				tc = mlfq_lookup_task_ctx(t);
+				if (tc)
+					ok = mlfq_eligible_bpf(qq, tc->vruntime,
+							       slot_curr_vr,
+							       slot_curr_w,
+							       slot_curr_valid);
+				if (!ok)
+					continue;
+				if (!best) {
 					best = t;
 					best_dsq = cand_dsq;
 					best_cpu = (s32)cand;
+				} else if (mlfq_time_before(t->scx.dsq_vtime, best->scx.dsq_vtime)) {
+					best = t;
+					best_dsq = cand_dsq;
+					best_cpu = (s32)cand;
+				} else if (!mlfq_time_before(best->scx.dsq_vtime, t->scx.dsq_vtime)) {
+					/* Equal deadlines tiebreak on vruntime then pid, deterministic. */
+					struct task_ctx *bc = mlfq_lookup_task_ctx(best);
+
+					if (tc && bc) {
+						if (tc->vruntime < bc->vruntime ||
+						    (tc->vruntime == bc->vruntime && t->pid < best->pid)) {
+							best = t;
+							best_dsq = cand_dsq;
+							best_cpu = (s32)cand;
+						}
+					} else if (t->pid < best->pid) {
+						/* Stale lookup falls back to pid parity. */
+						best = t;
+						best_dsq = cand_dsq;
+						best_cpu = (s32)cand;
+					}
 				}
 			}
 		}
@@ -294,6 +400,8 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		if (!best && (!tier_a_ran || mlfq_nr_llcs != 1)) {
 			bpf_for(i, 0, mlfq_steal_scan) {
 				struct task_struct *t;
+				struct task_ctx *tc;
+				bool ok = true;
 
 				cand = (off + i) % (u32)nr_cpus;
 				if (cand == (u32)cpu)
@@ -329,22 +437,60 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 					if (!t || !bpf_cpumask_test_cpu((u32)cpu, t->cpus_ptr))
 						continue;
 					/*
+					 * A head later than the current best can
+					 * never win, so skip the eligibility
+					 * lookup for it. Otherwise eligibility
+					 * comes first, so an earlier ineligible
+					 * head cannot starve a later eligible
+					 * one. An ineligible head stays queued
+					 * (DELAY for its DSQ).
+					 */
+					if (best && mlfq_time_before(best->scx.dsq_vtime,
+								     t->scx.dsq_vtime))
+						continue;
+					tc = mlfq_lookup_task_ctx(t);
+					if (tc)
+						ok = mlfq_eligible_bpf(qq, tc->vruntime,
+								       slot_curr_vr,
+								       slot_curr_w,
+								       slot_curr_valid);
+					if (!ok)
+						continue;
+					/*
 					 * Prefer the earlier deadline, the same
 					 * time_before64() order the kernel's priq
-					 * uses (scx_dsq_priq_less()).
+					 * uses (scx_dsq_priq_less()). Equal
+					 * deadlines tiebreak on vruntime then pid.
 					 */
-					if (!best ||
-					    mlfq_time_before(t->scx.dsq_vtime,
-							     best->scx.dsq_vtime)) {
+					if (!best) {
 						best = t;
 						best_dsq = cand_dsq;
 						best_cpu = (s32)cand;
+					} else if (mlfq_time_before(t->scx.dsq_vtime, best->scx.dsq_vtime)) {
+						best = t;
+						best_dsq = cand_dsq;
+						best_cpu = (s32)cand;
+					} else if (!mlfq_time_before(best->scx.dsq_vtime, t->scx.dsq_vtime)) {
+						struct task_ctx *bc = mlfq_lookup_task_ctx(best);
+
+						if (tc && bc) {
+							if (tc->vruntime < bc->vruntime ||
+							    (tc->vruntime == bc->vruntime && t->pid < best->pid)) {
+								best = t;
+								best_dsq = cand_dsq;
+								best_cpu = (s32)cand;
+							}
+						} else if (t->pid < best->pid) {
+							best = t;
+							best_dsq = cand_dsq;
+							best_cpu = (s32)cand;
+						}
 					}
 				}
 			}
 		}
 
-		/* Nothing eligible anywhere. This queue has no work. */
+		/* Nothing anywhere, or nothing eligible. This queue has no work. */
 		if (!best)
 			break;
 
@@ -353,6 +499,7 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 		 * re-validates affinity on the move, so a concurrent
 		 * cpuset change can fail it. Only a successful move
 		 * counts and adjusts the runnable-ownership record.
+		 * Only move_to_local moves work, never a direct dispatch.
 		 */
 		if (scx_bpf_dsq_move_to_local(best_dsq, 0)) {
 			struct task_ctx *tctx = mlfq_lookup_task_ctx(best);
@@ -373,13 +520,25 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			 * this pre-check and the kernel move can make the
 			 * moved task differ from @best. The head-pop API
 			 * offers no post-move verification, so the adjust
-			 * targets @best regardless; the gauges are advisory
-			 * and self-heal at the moved task's next episode
-			 * boundary (mlfq_runnable_exit()).
+			 * targets @best regardless. The gauges are advisory
+			 * and recover at the moved task next episode end.
 			 */
-			if (tctx)
+			if (tctx) {
 				mlfq_runnable_enter(tctx, qid,
 						    mlfq_llc_of_cpu((u32)cpu));
+				if (mlfq_sums_present(tctx)) {
+					u8 sq = mlfq_sums_qid(tctx);
+
+					if (sq == qid) {
+						mlfq_sum_sub(qq, tctx->vruntime,
+							     tctx->weight ? tctx->weight : 1);
+						mlfq_sums_clear(tctx);
+					} else {
+						mlfq_sums_leave(tctx);
+					}
+				}
+			}
+			__sync_fetch_and_add(&mlfq_stats.eevdf_eligible, 1);
 			moved++;
 			if (best_cpu != cpu) {
 				__sync_fetch_and_add(&mlfq_stats.steals, 1);
@@ -460,6 +619,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (cpu_state)
 		cpu_state->steal_scan_off++;
+/* Keep grants a fresh slice with no DSQ insert. */
 
 	/*
 	 * Keep the outgoing task when nothing else is dispatchable here.
@@ -484,7 +644,7 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * through put_prev_task_scx(), with ops.enqueue() and flags == 0 on
 	 * slice exhaustion and the SCX_ENQ_HEAD local insert when slice
 	 * remains, so queue
-	 * placement and accounting resume naturally.
+	 * placement and accounting resume on the next switch.
 	 *
 	 * The keep is an accounting freeze. While it repeats, no context
 	 * switch happens, so vruntime, the queue clock, the EMA gauges and

@@ -116,8 +116,8 @@ volatile u32 mlfq_idle_count;
  * Per-LLC and per-queue runnable gauges, maintained by
  * mlfq_runnable_enter()/mlfq_runnable_exit() at every tracked insert
  * and leave-runnable event. mlfq_llc_runnable[llc] is the number of
- * tracked runnable tasks owned by each LLC domain; mlfq_queue_runnable
- * is the same count split per queue (index 0 unused, 1..3 = Q1..Q3);
+ * tracked runnable tasks owned by each LLC domain; the queue gauges
+ * are the same count split per queue (q1, q2 and q3 hold Q1..Q3);
  * mlfq_llc_idle[llc] mirrors mlfq_idle_count per domain, the steering
  * gate of the least-loaded-LLC placement step. The counts are advisory:
  * they cover tracked tasks only (the drop paths never touch them) and
@@ -128,7 +128,9 @@ volatile u32 mlfq_idle_count;
  * reasoning below stays accurate.
  */
 volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
-volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
+volatile u32 mlfq_queue_runnable_q1;
+volatile u32 mlfq_queue_runnable_q2;
+volatile u32 mlfq_queue_runnable_q3;
 volatile u32 mlfq_llc_idle[MLFQ_MAX_LLCS];
 volatile struct mlfq_stats mlfq_stats;
 
@@ -179,9 +181,10 @@ struct mlfq_tree_map mlfq_tree_map SEC(".maps");
  * with the write-hammered mlfq_stats counters. The
  * __attribute__((aligned(64))) on this instance pins it to a dedicated
  * 64-byte cache line, so the compiler places it on the line boundary
- * following mlfq_stats (256 bytes, a whole number of lines), and the
+ * following mlfq_stats (320 bytes, a whole number of lines), and the
  * two blocks never share a line.
  */
+/* Tree control sits on its own cache line. */
 volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
 
 /*
@@ -190,7 +193,7 @@ volatile struct mlfq_tree_ctrl mlfq_tree_ctrl __attribute__((aligned(64)));
  * userspace daemon drains it every 100 ms for the regression-tree
  * training. 1 MB holds about 12.4k samples of 84 bytes (1.3.11 ABI),
  * roughly 6.2 s of emission at the global rate limit, which absorbs a
- * multi-second daemon stall; drop-on-full is the natural backpressure
+ * multi-second daemon stall. Drop on full is the base backpressure
  * when the daemon cannot keep up, and the emission rate limits keep the
  * steady-state rate at one sample per MLFQ_TREE_SAMPLE_RATE_LIMIT_NS
  * globally and one per MLFQ_TREE_PER_TASK_LIMIT_NS per task.
@@ -353,21 +356,21 @@ static __always_inline __attribute__((unused)) u32 mlfq_core_of_cpu(u32 cpu)
 const volatile u32 mlfq_llc_largest = MLFQ_MAX_LLCS;
 
 /*
- * Q1 occupancy helpers - Observer for per-CPU occupancy, Strategy for veto.
+ * Q1 occupancy helpers for per-CPU occupancy and veto.
  *
  * The occupancy is tracked per-CPU in the q1_occupancy ARRAY map, one
  * 8-byte slot per CPU. Updates are plain stores to the CPU's own slot,
- * never a __sync_* on a BSS shared line, so no false sharing dirties
- * mlfq_stats. The sibling veto is logical: mlfq_cpu_sibling[CPU]
- * gives the sibling, mlfq_cpu_core[CPU] the core id, not a word bit.
- * is_smt_sibling_q1_busy checks the logical sibling's occupancy.
+ * never a locked op on a BSS shared line, so no false sharing dirties
+ * mlfq_stats. The sibling veto is logical. mlfq_cpu_sibling gives
+ * the sibling, mlfq_cpu_core gives the core id, not a word bit.
+ * is_smt_sibling_q1_busy checks the logical sibling occupancy.
  */
 
-/**
+/*
  * mlfq_q1_is_occupied - Test if CPU runs a Q1 task.
  * @cpu: CPU id.
  *
- * Return: true if occupancy slot is set.
+ * Gives true if occupancy slot is set.
  */
 static __always_inline bool mlfq_q1_is_occupied(u32 cpu)
 {
@@ -380,7 +383,7 @@ static __always_inline bool mlfq_q1_is_occupied(u32 cpu)
 	return occ && occ->occupied;
 }
 
-/**
+/*
  * mlfq_q1_set - Mark or clear Q1 occupancy for CPU.
  * @cpu: CPU id.
  * @occupied: true to set, false to clear.
@@ -401,14 +404,14 @@ static __always_inline void mlfq_q1_set(u32 cpu, bool occupied)
 		occ->occupied = occupied ? 1 : 0;
 }
 
-/**
+/*
  * is_smt_sibling_q1_busy - Logical sibling Q1 veto.
  * @cpu: Candidate CPU.
  *
  * Uses rodata mlfq_cpu_sibling logical lookup, not word-bit
  * arithmetic. When SMT is off or sibling is self, returns false.
  *
- * Return: true if sibling runs Q1.
+ * Gives true if sibling runs Q1.
  */
 static __always_inline bool is_smt_sibling_q1_busy(s32 cpu)
 {
@@ -433,7 +436,7 @@ static __always_inline bool is_smt_sibling_q1_busy(s32 cpu)
  * interval of arrivals, since the exchange zeroes it at every fold,
  * so the u64 sum stays far below overflow.
  *
- * Return: The arrivals since the last fold, as a u64 sum.
+ * Gives The arrivals since the last fold, as a u64 sum.
  */
 static __always_inline u64 mlfq_wakeup_window_fold(void)
 {
@@ -718,8 +721,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	}
 
 	/*
-	 * Snapshot the CPU count once; the DSQ creation loop and the
-	 * id-space invariant below are keyed on it.
+	 * Snapshot the CPU count once. The DSQ loop and the id rule
+	 * below are keyed on it.
 	 */
 	nr_cpus = (u32)nr_cpu_ids;
 	if (nr_cpus == 0) {
@@ -757,13 +760,29 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	 * computed as the unsigned remainder of dispatch_max_batch (see
 	 * dispatch.bpf.c). Quotas that cover the whole batch would wrap
 	 * that remainder and unbind the Q3 service loop, so the
-	 * configuration is rejected outright.
+	 * configuration is rejected outright. A zero batch would stall
+	 * every dispatch, so it is rejected as well.
 	 */
-	if (mlfq_q1_quota + mlfq_q2_quota >= mlfq_dispatch_max_batch) {
+	if (!mlfq_dispatch_max_batch ||
+	    mlfq_q1_quota + mlfq_q2_quota >= mlfq_dispatch_max_batch) {
 		scx_bpf_error("Q1+Q2 quotas (%u+%u) must leave a Q3 share of "
 			      "max batch %u",
 			      mlfq_q1_quota, mlfq_q2_quota,
 			      mlfq_dispatch_max_batch);
+		return -EINVAL;
+	}
+
+	/*
+	 * Zero rodata would stall the scheduler (a zero slice never
+	 * advances vruntime, a zero budget freezes the gauges, a zero
+	 * half-life divides by zero, a zero preempt slice grants nothing).
+	 * The front-end writes the intf.h defaults before load, so zero
+	 * here means a bad build, rejected outright.
+	 */
+	if (!mlfq_q1_slice_ns || !mlfq_q2_slice_ns || !mlfq_q3_slice_ns ||
+	    !mlfq_budget_max_ns || !mlfq_alpha || !mlfq_ema_half_life_ns ||
+	    !mlfq_preempt_slice_ns) {
+		scx_bpf_error("rodata slices/budget/alpha/half-life/preempt must be non-zero");
 		return -EINVAL;
 	}
 
@@ -800,6 +819,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 			return -EINVAL;
 		}
 		q->max_slice_ns = mlfq_queue_slice(key);
+		/*
+		 * The weight scale shift stays zero. The 32 bit key clamp
+		 * and the weight clamp keep every key times weight product
+		 * inside s64 for the supported task counts, so no rescale
+		 * is needed. The field is reserved for a future growth
+		 * step and is pinned here, so a stale map image cannot
+		 * carry a non-zero shift into this build.
+		 */
+		q->sum_shift = 0;
 	}
 
 	/*
