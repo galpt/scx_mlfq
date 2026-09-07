@@ -60,12 +60,13 @@
  * (put_prev_set_next_task() early-returns on next == prev), refilling the
  * task at the 20 ms SCX_SLICE_DFL granularity and freezing
  * running()/stopping() accounting until the next real context switch.
- * Before keeping, the three queue heads of one remote CPU (the rotating
- * scan candidate) are probed as a single probe. A CPU whose own queues
- * are empty should still pull the most-owed remote task instead of
- * running the previous task for a full slice. Resolving the keep up
- * front reads the queue state once, before the slot loops churn it, and
- * keeps the loop bodies to a single job each.
+ * Before keeping, a bounded window of remote candidates
+ * from the rotating scan is probed. A CPU whose own queues
+ * are empty should still pull the most-owed remote task
+ * instead of running the previous task for a full slice.
+ * Resolving the keep up front reads the queue state once,
+ * before the slot loops churn it, and keeps the loop bodies
+ * to a single job each.
  *
  * Realtime-takeover interaction. Stealing from an occupied CPU's queue
  * DSQs stays legal. The steal scan is the second evacuation channel
@@ -505,16 +506,15 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * property is unaffected. The cost is that a solo task's
 	 * classification gauges under-count its run until the freeze ends.
 	 *
-	 * Before keeping, the three queue DSQ heads of one remote CPU (the
-	 * rotating scan candidate) are probed: a CPU whose own queues are
-	 * empty should still pull the most-owed remote task instead of
-	 * running the previous task for a full slice. The probe is gated
-	 * on nr_queued and is three lockless peeks. The cached prev task is
-	 * revalidated against the current affinity on every reuse: a
-	 * concurrent cpuset change that dropped this CPU falls through to
-	 * the slot loops instead of keeping a task where it may no longer
-	 * run. The slice grant rides the compat wrapper (which falls back to
-	 * the direct store on older kernels), never a direct write.
+	 * Before keeping, a bounded window of remote candidates
+	 * is probed: a CPU whose own queues are empty should still
+	 * pull the most-owed remote task instead of running the
+	 * previous task for a full slice. Each probe is gated on
+	 * nr_queued and is three lockless peeks. The cached prev
+	 * task is revalidated on every reuse: a cpuset change that
+	 * dropped this CPU falls through to the slot loops instead
+	 * of keeping a task where it may no longer run. The slice
+	 * grant rides the compat wrapper, never a direct write.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
 	    bpf_cpumask_test_cpu((u32)cpu, prev->cpus_ptr) &&
@@ -533,17 +533,28 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 
 				if (nr_cpus > 1) {
 					/*
-					 * Probe the rotating scan candidate.
+					 * Probe a bounded window of remote
+					 * candidates from the rotating scan.
 					 * On a one-CPU machine there is no
-					 * remote CPU to probe.
+					 * remote CPU to probe. The window is
+					 * capped, so the cost stays flat.
 					 */
-					cand = cpu_state ?
-						(s32)(cpu_state->steal_scan_off %
-						      (u32)nr_cpus) : 0;
-					if (cand == cpu)
-						cand = (s32)(((u32)cand + 1) %
-							     (u32)nr_cpus);
-					remote_work = mlfq_remote_work_probe(cand, cpu);
+					u32 k, base;
+
+					base = cpu_state ?
+					       cpu_state->steal_scan_off %
+					       (u32)nr_cpus : 0;
+					bpf_for(k, 0, MLFQ_KEEP_PROBE_MAX) {
+						cand = (s32)((base + k) %
+							(u32)nr_cpus);
+						if (cand == cpu)
+							continue;
+						if (mlfq_remote_work_probe(
+							    cand, cpu)) {
+							remote_work = true;
+							break;
+						}
+					}
 				}
 				if (!remote_work) {
 					scx_bpf_task_set_slice(prev, slice);

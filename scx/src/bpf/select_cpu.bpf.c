@@ -114,6 +114,34 @@ mlfq_pick_idle_primary(const struct task_struct *p,
 }
 
 /*
+ * Whether @p may run on any CPU of LLC @llc.
+ * The list holds at most the scan window, so one
+ * bounded pass covers it. The pick below rechecks
+ * the mask per candidate, this only skips the walk
+ * when no candidate can match.
+ */
+static __always_inline bool mlfq_llc_has_allowed(
+	const struct task_struct *p, u32 llc)
+{
+	const struct mlfq_llc_cpu_list *list;
+	u32 n, i;
+
+	list = bpf_map_lookup_elem(&mlfq_llc_cpus, &llc);
+	if (!list || !list->nr)
+		return false;
+	n = list->nr > MLFQ_LLC_SCAN_MAX ?
+	    MLFQ_LLC_SCAN_MAX : list->nr;
+	bpf_for(i, 0, MLFQ_LLC_SCAN_MAX) {
+		if (i >= n)
+			break;
+		if (bpf_cpumask_test_cpu(list->cpus[i],
+					 p->cpus_ptr))
+			return true;
+	}
+	return false;
+}
+
+/*
  * mlfq_interactive_on_wakeup - Whether a wakeup will be treated as interactive.
  * @p: The task being woken.
  * @tctx: The task context.
@@ -189,6 +217,14 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	tctx = mlfq_lookup_task_ctx(p);
 	if (!tctx)
+		return prev_cpu;
+
+	/*
+	 * Pinned tasks stay on their CPU. The kernel keeps
+	 * them out of this callback, but a defensive return
+	 * keeps the path safe when the flag races the call.
+	 */
+	if (p->nr_cpus_allowed == 1)
 		return prev_cpu;
 
 	/* SCX_WAKE_SYNC fast-path: synchronous waker handoff for Q1/Q2.
@@ -454,25 +490,23 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 		waker_llc = MLFQ_MAX_LLCS;
 
 	/*
-	 * Step 1.9, the largest-LLC bias for interactive wakeups. When the
-	 * machine has a strictly-largest LLC domain and it is not the
-	 * waker's own (which step 2 is about to scan), an interactive
-	 * wakeup is placed there first. Cache capacity serves Q1 latency
-	 * best, the clock tradeoff of a larger (often lower-clocked) L3
-	 * is worth it for interactive work, and the idle claim is
-	 * authoritative, so the bias is non-exclusive. The
-	 * mlfq_llc_has_primary gate keeps the "interactive never parks on
-	 * an efficiency core" invariant on hybrid systems and
-	 * require_primary is an extra defense. The step is dead on
-	 * single-LLC machines, on ties or failed discovery (the
-	 * MLFQ_MAX_LLCS sentinel), and when the largest domain is the
-	 * waker's. The MLFQ_MAX_LLCS bound in the gate keeps the
-	 * has_primary index verifier-bounded.
+	 * Step 1.9, the largest-LLC bias for interactive wakeups.
+	 * When the machine has a strictly-largest LLC domain and
+	 * it is not the waker's own, an interactive wakeup is
+	 * placed there first. The discovery keeps the bias only
+	 * when the cache winner covers the other domains in
+	 * frequency, so a slower stacked domain never pulls
+	 * work off faster cores. The per-task gate skips the
+	 * walk when the task may not run there. The idle claim
+	 * stays authoritative, so the bias is non-exclusive.
+	 * The step is dead on single-LLC machines, on ties or
+	 * failed discovery, and when the largest is the waker.
 	 */
 	if (interactive && mlfq_llc_largest < MLFQ_MAX_LLCS &&
 	    mlfq_llc_largest < mlfq_nr_llcs &&
 	    mlfq_llc_largest != waker_llc &&
-	    mlfq_llc_has_primary[mlfq_llc_largest]) {
+	    mlfq_llc_has_primary[mlfq_llc_largest] &&
+	    mlfq_llc_has_allowed(p, mlfq_llc_largest)) {
 		cpu_id = mlfq_pick_idle_in_bitmap(&mlfq_llc_bitmaps,
 						  mlfq_llc_largest, p,
 						  true, primary_bm);
@@ -591,6 +625,13 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	return prev_cpu;
 
 direct:
+	/*
+	 * Final target check. A cpuset change between the pick
+	 * and the return must not park the task where it may
+	 * not run. The fallback is the validated prev CPU.
+	 */
+	if (!mlfq_cpu_allowed(p, cpu_id))
+		return prev_cpu;
 	tctx->wake_cpu_state = MLFQ_WAKE_CPU_VALID | MLFQ_WAKE_CPU_IDLE;
 	return cpu_id;
 }

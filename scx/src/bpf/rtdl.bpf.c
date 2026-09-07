@@ -92,10 +92,12 @@ static __always_inline bool mlfq_local_insert_safe(s32 cpu)
  * @target_cpu owns the queue DSQ.
  * @redirected is true for a fallback pick.
  * A local insert never kicks.
- * A redirected insert always kicks when the target can run it.
- * The claim made for the first target does not cover the new one.
- * A plain insert kicks only when no claim was made or when the task
- * can run on a few CPUs only.
+ * A kick needs an allowed and remote and unoccupied target.
+ * A redirected insert kicks when the target can run it.
+ * The claim for the first target does not cover the new one.
+ * A plain insert kicks only when no claim was made or when
+ * the task can run on a few CPUs only. Inserts to the global
+ * DSQ never reach here, so the global fallback stays allowed.
  */
 static __always_inline bool mlfq_needs_shared_kick(const struct task_struct *p,
 						   u64 enq_flags, s32 target_cpu,
@@ -108,6 +110,8 @@ static __always_inline bool mlfq_needs_shared_kick(const struct task_struct *p,
 	if (target_cpu < 0 || target_cpu >= (s32)nr_cpu_ids)
 		return false;
 	if (nr_cpu_ids == 0)
+		return false;
+	if (!bpf_cpumask_test_cpu((u32)target_cpu, p->cpus_ptr))
 		return false;
 	if (mlfq_cpu_occupied(target_cpu))
 		return false;
@@ -144,6 +148,8 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
 
 			if (cand >= MLFQ_MAX_CPUS)
 				break;
+			if (cand >= nr_cpu_ids)
+				continue;
 			if (!mlfq_bitmap_test_cpu(bm, cand))
 				continue;
 			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
@@ -269,10 +275,8 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 * work. One straight call with no loop.
 	 */
 	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu)) {
-		if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
-			scx_bpf_reenqueue_local___v2___compat();
+		if (mlfq_reenqueue_local_step())
 			evacuated = true;
-		}
 	}
 
 	/*
@@ -284,25 +288,25 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 * queued depth is only the second gate, never the
 	 * only one.
 	 */
-	if (__COMPAT_has_generic_reenq()) {
+	{
 		u64 q1 = mlfq_dsq_id(1, cpu);
 		u64 q2 = mlfq_dsq_id(2, cpu);
 		u64 q3 = mlfq_dsq_id(3, cpu);
 
 		if (q1 < SCX_DSQ_LOCAL_ON &&
 		    scx_bpf_dsq_nr_queued(q1)) {
-			scx_bpf_dsq_reenq___compat(q1, 0);
-			evacuated = true;
+			if (mlfq_reenqueue_one(q1))
+				evacuated = true;
 		}
 		if (q2 < SCX_DSQ_LOCAL_ON &&
 		    scx_bpf_dsq_nr_queued(q2)) {
-			scx_bpf_dsq_reenq___compat(q2, 0);
-			evacuated = true;
+			if (mlfq_reenqueue_one(q2))
+				evacuated = true;
 		}
 		if (q3 < SCX_DSQ_LOCAL_ON &&
 		    scx_bpf_dsq_nr_queued(q3)) {
-			scx_bpf_dsq_reenq___compat(q3, 0);
-			evacuated = true;
+			if (mlfq_reenqueue_one(q3))
+				evacuated = true;
 		}
 	}
 

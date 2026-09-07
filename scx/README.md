@@ -47,7 +47,7 @@ To measure the wakeup latency the scheduler delivers with cyclictest, pin the me
 - The bounded-lag guarantee is per-queue. Cross-queue lag conservation is absent.
 - The queues are per-CPU user dispatch queues, so locality comes from placement while idle CPUs steal owed tasks from wherever they sit.
 - The runnable gauges cover tracked tasks only and are advisory.
-- The largest-LLC bias trades clock speed for cache capacity, is Q1-only and non-exclusive, and is off on single-LLC and equal-size machines.
+- The largest-LLC bias trades clock speed for cache capacity, is Q1-only and non-exclusive, checks the winner against per-domain frequency so a slower stacked domain never pulls work off faster cores, skips domains the task may not run on, and is off on single-LLC and equal-size machines.
 - The topology is snapshotted at attach, so a CPU hotplug needs a restart.
 - sched_ext cannot schedule RT and DL tasks: the kernel resolves them to the rt and dl classes before sched_ext, so this scheduler handles SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks only.
 - GPU submitter awareness is optional and self pruning. The amdgpu and gpu_scheduler tracepoints are used when they exist, otherwise the feature stays at zero.

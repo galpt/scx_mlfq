@@ -273,6 +273,13 @@ enum mlfq_consts {
 	MLFQ_STEER_LLC_MAX		= 4ULL,
 
 	/*
+	 * Keep probe cap: the number of remote candidates the keep
+	 * path may probe before granting the slice. The bound keeps
+	 * the probe cost flat on large machines.
+	 */
+	MLFQ_KEEP_PROBE_MAX		= 4ULL,
+
+	/*
 	 * Number of 64-bit words needed to hold one CPU bit per CPU.
 	 */
 	MLFQ_BITMAP_WORDS		= (MLFQ_MAX_CPUS + 63) / 64,
@@ -1829,17 +1836,16 @@ static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
  * @nr_queued: scx_bpf_dsq_nr_queued() depth of the target queue DSQ,
  *	read before the insert (no new state, existing kfunc only).
  *
- * Cycle 3 throughput: solo-task batching without a new knob. When nothing
- * is queued behind (nr_queued == 0) the grant is 2x base (Q1 2 ms, Q2
- * 4 ms, Q3 8 ms, still below the 20 ms SCX_SLICE_DFL), which halves the
- * context-switch rate with no fairness cost because no task waits. Under
- * any pressure the grant is exactly @base, the existing behavior, so the
- * fallback is the current slice. Pure EEVDF is preserved: the virtual
- * slice and deadline still use @base (q->max_slice_ns); only the physical
- * grant varies, and vruntime charging follows the actual runtime in
- * stopping(), so a longer solo run simply places later next time.
- * Overflow: @base <= 4 ms, so base << 1 fits u64; the shift-carry check
- * keeps the fallback to @base on the impossible wrap.
+ * Solo-task batching without a new knob. When nothing is queued
+ * behind (nr_queued == 0) the grant is 2x base (Q1 2 ms, Q2 4 ms,
+ * Q3 8 ms), which halves the switch rate with no fairness cost
+ * because no task waits. Under any pressure the grant is capped
+ * at @base, so contention never stretches the slice. The virtual
+ * slice and deadline still use @base, only the physical grant
+ * varies, and charging follows the actual runtime, so a longer
+ * solo run simply places later next time.
+ * Overflow: @base <= 4 ms, so base << 1 fits u64, and the carry
+ * check keeps the fallback to @base on the impossible wrap.
  *
  * Return: The effective slice grant.
  */
