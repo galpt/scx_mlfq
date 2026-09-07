@@ -599,8 +599,42 @@ static __always_inline u32 mlfq_llc_of_cpu(u32 cpu)
 
 	if (cpu >= MLFQ_MAX_CPUS)
 		return MLFQ_MAX_LLCS;
-	llc = mlfq_cpu_llc[cpu];
+	/*
+	 * The index is masked to the array bound for the verifier. The
+	 * range check above proves cpu < MLFQ_MAX_CPUS at runtime, so the
+	 * mask is identity there, but the verifier cannot derive the bound
+	 * of a runtime CPU id (smp id, task cpu, or first-cpu fallback)
+	 * from the comparison alone once the call sites multiply. The
+	 * explicit mask keeps the rodata access bounded on every kernel.
+	 */
+	llc = mlfq_cpu_llc[cpu & (MLFQ_MAX_CPUS - 1)];
 	return llc < MLFQ_MAX_LLCS && llc < mlfq_nr_llcs ? llc : MLFQ_MAX_LLCS;
+}
+
+/*
+ * mlfq_cpu_allowed - Revalidate a cached CPU against the current affinity.
+ * @p: The task the CPU must be able to run.
+ * @cpu: The cached CPU (prev, target, or selected) to revalidate.
+ *
+ * Every reuse of a cached CPU must pass this: the CPU is in the online
+ * range and still present in the task's allowed mask. A concurrent cpuset
+ * change can drop a previously valid CPU between the claim and the reuse,
+ * so the check runs at each reuse with a fallback to the enqueueing CPU
+ * and a cache refresh (clearing wake_cpu_state) at the call site. A
+ * negative, out-of-range, or above-bound CPU never validates. The
+ * MLFQ_MAX_CPUS bound keeps every later rodata index derived from an
+ * allowed CPU verifier-bounded.
+ *
+ * Return: true when @cpu may be used for @p.
+ */
+static __always_inline bool mlfq_cpu_allowed(const struct task_struct *p,
+					     s32 cpu)
+{
+	if (cpu < 0 || cpu >= (s32)MLFQ_MAX_CPUS)
+		return false;
+	if (cpu >= (s32)nr_cpu_ids)
+		return false;
+	return bpf_cpumask_test_cpu((u32)cpu, p->cpus_ptr);
 }
 
 #include "vtime.bpf.c"

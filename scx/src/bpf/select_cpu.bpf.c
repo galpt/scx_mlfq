@@ -194,18 +194,25 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	/* SCX_WAKE_SYNC fast-path: synchronous waker handoff for Q1/Q2.
 	 * Strategy: when wake_flags carries SCX_WAKE_SYNC or the task
 	 * carries MLFQ_TF_DRM_WAKE and the wakee is Q1/Q2, keep cache hot
-	 * by staying on waker's CPU. Affinity is checked, RT hard gate
-	 * (mlfq_cpu_occupied) is never relaxed and strands Q1/Q2 behind
-	 * an RT-occupied LOCAL until rtdl drain; RT-occupied waker CPU
-	 * falls through to regular placement. SMT sibling veto is
-	 * intentionally bypassed for this handoff (cache-hot policy,
-	 * zero-knob). Null cur (bpf_get_current_task_btf failed) also
-	 * falls through. The insert uses SCX_DSQ_LOCAL + SCX_ENQ_IMMED
-	 * (never SCX_ENQ_HEAD) as the zero-knob policy and the queue's
-	 * own slice (Q1 1ms, Q2 2ms) to match enqueue's per-queue slice,
-	 * not SCX_SLICE_DFL (20ms), so the dispatch slice accounting stays
-	 * consistent. MLFQ_TF_DRM_WAKE is cleared after the insert, no
-	 * new branch depth, no new loop.
+	 * by staying on waker's CPU. The cached waker CPU is revalidated
+	 * against the current affinity on every reuse (range plus mask);
+	 * a concurrent cpuset change falls through to regular placement.
+	 * The FIFO local veto (occupied or already queued) is never relaxed:
+	 * an occupied or congested local would strand the wakee behind the
+	 * takeover or unrelated work, so it falls through to the queue DSQ
+	 * instead. SMT sibling veto is intentionally bypassed for this
+	 * handoff (cache-hot policy, zero-knob). Null cur
+	 * (bpf_get_current_task_btf failed) also falls through. In the
+	 * select context SCX_DSQ_LOCAL resolves to the returned CPU, so the
+	 * direct uses SCX_DSQ_LOCAL (never LOCAL_ON, never ENQ_HEAD) with
+	 * SCX_ENQ_IMMED: when the claimed CPU cannot run the task right
+	 * away the kernel bounces it back through ops.enqueue() into the
+	 * queue DSQ instead of stacking it on a busy local. The queue's own
+	 * slice (Q1 1ms, Q2 2ms) matches enqueue's per-queue slice, not
+	 * SCX_SLICE_DFL (20ms), so the dispatch slice accounting stays
+	 * consistent. The slice write rides the insert kfunc (the safe-direct
+	 * primitive), never a direct store. MLFQ_TF_DRM_WAKE is cleared after
+	 * the insert, no new branch depth, no new loop.
 	 */
 	if (((wake_flags & SCX_WAKE_SYNC) || (tctx->flags & MLFQ_TF_DRM_WAKE)) && tctx->queue <= 2) {
 		struct task_struct *cur = bpf_get_current_task_btf();
@@ -213,9 +220,8 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 		if (cur) {
 			s32 cur_cpu = scx_bpf_task_cpu(cur);
 
-			if (cur_cpu >= 0 && cur_cpu < (s32)MLFQ_MAX_CPUS &&
-			    !mlfq_cpu_occupied(cur_cpu) &&
-			    bpf_cpumask_test_cpu((u32)cur_cpu, p->cpus_ptr)) {
+			if (mlfq_cpu_allowed(p, cur_cpu) &&
+			    mlfq_local_insert_safe(cur_cpu)) {
 				u64 slice = tctx->queue == 1 ?
 					    MLFQ_Q1_SLICE_NS : MLFQ_Q2_SLICE_NS;
 
@@ -232,10 +238,12 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	tctx->wake_cpu_state = 0;
 
 	/*
-	 * The task allowed on prev_cpu (cpuset) may have changed since
-	 * the last run; fix that up.
+	 * The cached prev CPU is revalidated against the current affinity on
+	 * every reuse: range plus mask via the shared helper. A concurrent
+	 * cpuset change falls back to the first allowed CPU, with the same
+	 * empty-mask safety as before.
 	 */
-	if (!bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
+	if (!mlfq_cpu_allowed(p, prev_cpu)) {
 		first_cpu = bpf_cpumask_first(p->cpus_ptr);
 		if (first_cpu >= nr_cpu_ids)
 			/*
@@ -268,15 +276,70 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	/*
 	 * Q3 isolation path: bounded bpf_for scans with SMT soft veto.
-	 * Phase 1 (strict) respects SMT sibling Q1 busy as veto (64 cap);
-	 * Phase 2 (relaxed) drops SMT veto but never the RT hard gate
-	 * (32 cap). Both scans are MLFQ_MAX_CPUS-bounded and verifier
+	 * Cycle 3 throughput first: LLC-local strict pick before the global
+	 * scans. A Q3 wakeup that stays in the waker's cache domain keeps
+	 * its working set warm and avoids a cross-LLC steal later, the cheap
+	 * measured win (schbench RPS up, steals_same_llc up vs
+	 * steals_cross_llc). The LLC-local attempt uses the same strict
+	 * predicate as the global Phase 1 (affinity + RT hard gate + SMT
+	 * soft veto) over the waker's mlfq_llc_cpus list, capped at
+	 * MLFQ_LLC_SCAN_MAX, so a hit skips both global scans entirely
+	 * (fewer peeks/claims on the wakeup path). Unpopulated LLC
+	 * awareness (mlfq_nr_llcs == 0), an unmapped waker, an empty list
+	 * (oversized domain the front-end left at nr == 0), or no idle
+	 * LLC-local CPU falls through to the existing global scans
+	 * unchanged. Phase 1 (strict) respects SMT sibling Q1 busy as veto
+	 * (64 cap); Phase 2 (relaxed) drops SMT veto but never the RT hard
+	 * gate (32 cap). Both scans are MLFQ_MAX_CPUS-bounded and verifier
 	 * flat (bpf_for). Fallback returns prev_cpu when no idle Q3 CPU
 	 * is found.
 	 */
 	if (tctx->queue == 3) {
 		s32 cand;
 		int cnt = 0;
+
+		{
+			s32 waker = bpf_get_smp_processor_id();
+			u32 wllc = MLFQ_MAX_LLCS;
+
+			if (waker >= 0 && (u32)waker < MLFQ_MAX_CPUS &&
+			    mlfq_nr_llcs > 0) {
+				u32 tmp =
+					mlfq_cpu_llc[(u32)waker &
+						     (MLFQ_MAX_CPUS - 1)];
+
+				if (tmp < MLFQ_MAX_LLCS && tmp < mlfq_nr_llcs)
+					wllc = tmp;
+			}
+			if (wllc < MLFQ_MAX_LLCS && wllc < mlfq_nr_llcs) {
+				const struct mlfq_llc_cpu_list *ll =
+					bpf_map_lookup_elem(&mlfq_llc_cpus,
+							    &wllc);
+
+				if (ll && ll->nr > 0) {
+					u32 n = ll->nr;
+					u32 i;
+
+					if (n > MLFQ_LLC_SCAN_MAX)
+						n = MLFQ_LLC_SCAN_MAX;
+					bpf_for(i, 0, MLFQ_LLC_SCAN_MAX) {
+						s32 c;
+
+						if (i >= n)
+							break;
+						c = (s32)ll->cpus[i];
+						if (!is_cpu_available_for_q3(
+							    c, p, true))
+							continue;
+						if (!scx_bpf_test_and_clear_cpu_idle(
+							    c))
+							continue;
+						cpu_id = c;
+						goto direct;
+					}
+				}
+			}
+		}
 
 		bpf_for(cand, 0, MLFQ_MAX_CPUS) {
 			if (cand >= (s32)nr_cpu_ids)

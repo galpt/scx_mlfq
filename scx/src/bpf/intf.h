@@ -1149,6 +1149,19 @@ static __always_inline void mlfq_bitmap_set_cpu(struct mlfq_bitmap *bm, u32 cpu)
  * Same convention as fair.c vruntime_cmp()/time_before64(): the kernel
  * DSQ orders by min deadline with the same wrapping semantics.
  *
+ * Audit (Cycle 2, 1.3.13): every timestamp delta in the scheduler uses
+ * this signed form (last_sleep_at, last_run_at, enq_at, run_start_at,
+ * cpu_ema_at, sample_last_at, last_gpu_submit_at, last_drain_at,
+ * step_at, queued_at + aging, clock/vruntime/deadline/dsq_vtime). A
+ * plain < on u64 timestamps would misorder across the u64 epoch wrap;
+ * the (s64)(b - a) > 0 form keeps the wrap point indistinguishable
+ * from any other point. Duration-vs-duration compares (sleep_ns vs
+ * window, delta vs budget, elapsed vs interval, run_elapsed vs guard)
+ * correctly stay plain compares: deltas are magnitudes, never
+ * timestamps, and all time deltas are additionally clamped before
+ * virtual scaling (see mlfq_update_vruntime and the lifecycle
+ * wait/gauge clamps), so no delta can approach the 2^63 wrap half.
+ *
  * Return: true if @a is before @b.
  */
 static __always_inline bool mlfq_time_before(u64 a, u64 b)
@@ -1808,6 +1821,38 @@ static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
 	if (ema >= t_h)
 		return 3;
 	return 2;
+}
+
+/**
+ * mlfq_pressure_slice - Queue-pressure-aware physical slice grant.
+ * @base: Base per-queue slice (mlfq_queue_slice(qid): 1/2/4 ms).
+ * @nr_queued: scx_bpf_dsq_nr_queued() depth of the target queue DSQ,
+ *	read before the insert (no new state, existing kfunc only).
+ *
+ * Cycle 3 throughput: solo-task batching without a new knob. When nothing
+ * is queued behind (nr_queued == 0) the grant is 2x base (Q1 2 ms, Q2
+ * 4 ms, Q3 8 ms, still below the 20 ms SCX_SLICE_DFL), which halves the
+ * context-switch rate with no fairness cost because no task waits. Under
+ * any pressure the grant is exactly @base, the existing behavior, so the
+ * fallback is the current slice. Pure EEVDF is preserved: the virtual
+ * slice and deadline still use @base (q->max_slice_ns); only the physical
+ * grant varies, and vruntime charging follows the actual runtime in
+ * stopping(), so a longer solo run simply places later next time.
+ * Overflow: @base <= 4 ms, so base << 1 fits u64; the shift-carry check
+ * keeps the fallback to @base on the impossible wrap.
+ *
+ * Return: The effective slice grant.
+ */
+static __always_inline u64 mlfq_pressure_slice(u64 base, u32 nr_queued)
+{
+	if (nr_queued == 0) {
+		u64 doubled = base << 1;
+
+		if (doubled < base)
+			return base;
+		return doubled;
+	}
+	return base;
 }
 
 /**

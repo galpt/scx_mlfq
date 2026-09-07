@@ -506,9 +506,15 @@ void BPF_STRUCT_OPS(mlfq_dispatch, s32 cpu, struct task_struct *prev)
 	 * rotating scan candidate) are probed: a CPU whose own queues are
 	 * empty should still pull the most-owed remote task instead of
 	 * running the previous task for a full slice. The probe is gated
-	 * on nr_queued and is three lockless peeks.
+	 * on nr_queued and is three lockless peeks. The cached prev task is
+	 * revalidated against the current affinity on every reuse: a
+	 * concurrent cpuset change that dropped this CPU falls through to
+	 * the slot loops instead of keeping a task where it may no longer
+	 * run. The slice grant rides the compat wrapper (which falls back to
+	 * the direct store on older kernels), never a direct write.
 	 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED) &&
+	    bpf_cpumask_test_cpu((u32)cpu, prev->cpus_ptr) &&
 	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
 	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)) &&
 	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu))) {

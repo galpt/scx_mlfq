@@ -57,17 +57,79 @@ static __always_inline bool mlfq_cpu_occupied(s32 cpu)
 }
 
 /*
+ * mlfq_local_insert_safe - Veto a FIFO local insert to a bad CPU.
+ * @cpu: The CPU whose local DSQ would receive the task.
+ *
+ * A FIFO local insert bypasses the virtual-time order and shadows the
+ * queue DSQs while it sits, so it is allowed only when the CPU can run
+ * the task immediately: not occupied by a higher-priority class and with
+ * an empty local DSQ. An occupied CPU would strand the task behind the
+ * takeover until the drain, and a non-empty local would queue it behind
+ * unrelated work. Both cases fall back to the owning queue DSQ, which
+ * the steal scans serve. The idle claim itself is not tested here; the
+ * caller holds it via test_and_clear.
+ *
+ * Return: true when the local insert may proceed.
+ */
+static __always_inline bool mlfq_local_insert_safe(s32 cpu)
+{
+	if (cpu < 0 || cpu >= (s32)nr_cpu_ids)
+		return false;
+	if (mlfq_cpu_occupied(cpu))
+		return false;
+	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu))
+		return false;
+	return true;
+}
+
+/*
+ * mlfq_needs_shared_kick - Whether a queue-DSQ insert needs an idle kick.
+ * @p: The task just queued.
+ * @enq_flags: The enqueue flags of the insert.
+ * @target_cpu: The CPU owning the queue DSQ.
+ *
+ * Local inserts never kick (the target runs its local DSQ without one).
+ * A queue-DSQ insert kicks only when the target is another CPU, is not
+ * occupied, and either the selection was skipped (no idle claim was made,
+ * so nobody was woken to look) or the task is affinity-constrained (only
+ * a few CPUs may serve its queue). A wakeup that already went through the
+ * selection and may run anywhere needs no extra kick: the claim or the
+ * fallback already woke the right CPU, and an extra kick is a redundant
+ * inter-processor interrupt on the wakeup path.
+ *
+ * Return: true when the caller must kick @target_cpu idle.
+ */
+static __always_inline bool mlfq_needs_shared_kick(const struct task_struct *p,
+						   u64 enq_flags, s32 target_cpu)
+{
+	if (target_cpu == bpf_get_smp_processor_id())
+		return false;
+	if (target_cpu < 0 || target_cpu >= (s32)nr_cpu_ids)
+		return false;
+	if (mlfq_cpu_occupied(target_cpu))
+		return false;
+	if (__COMPAT_is_enq_cpu_selected(enq_flags) &&
+	    p->nr_cpus_allowed == (u32)nr_cpu_ids)
+		return false;
+	return true;
+}
+
+/*
  * Pick a non-occupied CPU out of a membership bitmap for @p. The same
  * word-major, bit-minor bounded walk the idle scan in select_cpu.bpf.c
  * uses, skipping occupied CPUs instead of busy ones. No idle marks are
  * touched. The caller has already decided the wakeup must not land on
  * an occupied core, and the kernel's idle accounting is unaffected.
+ * When @strict_smt is true the same SMT-sibling Q1 predicate the
+ * selection uses (is_smt_sibling_q1_busy) is also a veto; when false
+ * only the realtime hard gate applies. No new heuristic: the predicate
+ * is exactly the selection's.
  *
  * Return: The first non-occupied CPU @p may run on, or -ENOENT.
  */
 static __always_inline s32
 mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
-			       const struct task_struct *p)
+			       const struct task_struct *p, bool strict_smt)
 {
 	u32 word, bit;
 
@@ -83,6 +145,8 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
 				continue;
 			if (mlfq_cpu_occupied((s32)cand))
 				continue;
+			if (strict_smt && is_smt_sibling_q1_busy((s32)cand))
+				continue;
 			return (s32)cand;
 		}
 	}
@@ -95,12 +159,15 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
  * (the waker's CPU). The LLC pass walks the origin's membership bitmap.
  * When it finds nothing, a flat bounded scan takes any non-occupied CPU
  * @p may run on. An unpopulated LLC bitmap or an unknown LLC proceeds
- * to the flat scan.
+ * to the flat scan. @strict_smt adds the selection's SMT-sibling Q1 veto
+ * to both passes (same predicate, no new heuristic); false keeps the
+ * realtime-only hard gate.
  *
  * Return: A non-occupied CPU @p may run on, or -ENOENT.
  */
 static __always_inline s32
-mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
+mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin,
+			 bool strict_smt)
 {
 	const struct mlfq_bitmap *bm;
 	s32 pick;
@@ -112,7 +179,8 @@ mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
 		if (origin_llc < MLFQ_MAX_LLCS && origin_llc < mlfq_nr_llcs) {
 			bm = bpf_map_lookup_elem(&mlfq_llc_bitmaps, &origin_llc);
 			if (bm) {
-				pick = mlfq_pick_unoccupied_in_bitmap(bm, p);
+				pick = mlfq_pick_unoccupied_in_bitmap(bm, p,
+								      strict_smt);
 				if (pick >= 0)
 					return pick;
 			}
@@ -131,6 +199,8 @@ mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
 		if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
 			continue;
 		if (mlfq_cpu_occupied((s32)cand))
+			continue;
+		if (strict_smt && is_smt_sibling_q1_busy((s32)cand))
 			continue;
 		return (s32)cand;
 	}

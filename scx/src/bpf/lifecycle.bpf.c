@@ -222,6 +222,7 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 	 */
 	if (tctx->enq_at && !mlfq_time_before(now, tctx->enq_at)) {
 		u64 wait = now - tctx->enq_at;
+		u64 gauge_wait;
 
 		if (wait > 0xFFFFFFFFULL)
 			wait = 0xFFFFFFFFULL;
@@ -231,7 +232,17 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 			tctx->sq_ema = mlfq_ema_climb(tctx->sq_ema, wait,
 						      MLFQ_SQ_EMA_MAX_NS,
 						      mlfq_alpha);
-			mlfq_sys_gauge.wait_total += wait;
+			/*
+			 * Time-delta clamp: the gauge input is capped to
+			 * MLFQ_SYS_LAT_MAX_NS (16 ms), so one stalled
+			 * episode cannot saturate the 1 s half-life gauge
+			 * for seconds. The stored features keep the full
+			 * wait (capped to u32 above); only the advisory
+			 * gauge is bounded. Pure EEVDF untouched.
+			 */
+			gauge_wait = wait > MLFQ_SYS_LAT_MAX_NS ?
+				     MLFQ_SYS_LAT_MAX_NS : wait;
+			mlfq_sys_gauge.wait_total += gauge_wait;
 			mlfq_sys_gauge.wait_count++;
 		}
 	}
@@ -282,11 +293,32 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	now = scx_bpf_now();
 	if (tctx->last_run_at && mlfq_time_before(tctx->last_run_at, now))
 		delta = now - tctx->last_run_at;
+	/* Update adjacent to check: clear the stamp on the same lines that
+	 * read it, so a later path cannot re-read a consumed run start. */
 	tctx->last_run_at = 0;
 
+	/*
+	 * Time-delta clamp: bound a stalled segment to
+	 * MLFQ_TREE_LABEL_MAX_NS (192 ms) before any virtual scaling, so a
+	 * watchdog-scale stall cannot jump vruntime and the queue clock.
+	 * Normal 1/2/4 ms slices never hit the bound; pure EEVDF preserved.
+	 * mlfq_update_vruntime() clamps again as defense in depth.
+	 */
+	if (delta > MLFQ_TREE_LABEL_MAX_NS)
+		delta = MLFQ_TREE_LABEL_MAX_NS;
+
 	if (delta) {
-		/* vruntime advance + EMA climb for this run segment. */
+		/*
+		 * Update adjacent to check: charge vruntime and immediately
+		 * advance the owning queue's clock from it, before the EMA
+		 * and per-CPU gauges are touched. The clock advance's
+		 * time_before check then observes the fresh service point
+		 * with no intervening queue-state churn.
+		 */
 		mlfq_update_vruntime(tctx, delta);
+		q = mlfq_lookup_queue(tctx->queue);
+		if (q)
+			mlfq_queue_advance_clock(q, tctx->vruntime);
 		mlfq_ema_climb_task(tctx, delta);
 		/*
 		 * The per-CPU busy gauge: the run segment climbs the
@@ -310,18 +342,6 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 						      mlfq_alpha);
 			cpu->cpu_ema_at = now;
 		}
-		/*
-		 * Advance the owning queue's virtual clock with the
-		 * virtual time just charged. The clock follows the
-		 * service given to the queue, and placement anchors new
-		 * arrivals to it. The queue lookup can fail when the task's
-		 * queue state was not carried over, which is tolerated. The
-		 * clock only needs to be near the service point and the
-		 * placement clamp bounds the staleness.
-		 */
-		q = mlfq_lookup_queue(tctx->queue);
-		if (q)
-			mlfq_queue_advance_clock(q, tctx->vruntime);
 		__sync_fetch_and_add(&mlfq_stats.total_runtime, delta);
 
 		tctx->prev_burst_ns = delta;
