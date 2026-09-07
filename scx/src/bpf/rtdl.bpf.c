@@ -9,11 +9,13 @@
  * switches the CPU to the higher-priority class and only hands it back
  * when the higher-priority queue empties. This module tracks which CPUs
  * a realtime task is running on through a sched_switch hook, drains the
- * DSQs of a CPU that is taken over so its tasks are not stranded, and
- * (in the placement modules) redirects wakeups away from occupied
- * cores. The occupancy flag is the scheduler's view of a CPU the SCX
- * classes cannot run on. It is updated on every real context switch,
- * so it always reflects the class of the last task that ran.
+ * local DSQ of a CPU that is taken over so its tasks are not stranded,
+ * and (in the placement modules) redirects wakeups away from occupied
+ * cores. The queue DSQs of a taken-over CPU are served by the steal
+ * scans as the second channel. The occupancy flag is the scheduler's
+ * view of a CPU the SCX classes cannot run on. It is updated on every
+ * real context switch, so it always reflects the class of the last task
+ * that ran.
  */
 
 /*
@@ -28,7 +30,7 @@
 /*
  * Look up the per-CPU realtime-occupancy state.
  *
- * Gives The state, or NULL for an invalid CPU or a failed lookup.
+ * Return: The state, or NULL for an invalid CPU or a failed lookup.
  */
 static __always_inline struct mlfq_rtdl_state *mlfq_lookup_rtdl_state(s32 cpu)
 {
@@ -61,7 +63,7 @@ static __always_inline bool mlfq_cpu_occupied(s32 cpu)
  * touched. The caller has already decided the wakeup must not land on
  * an occupied core, and the kernel's idle accounting is unaffected.
  *
- * Gives The first non-occupied CPU @p may run on, or -ENOENT.
+ * Return: The first non-occupied CPU @p may run on, or -ENOENT.
  */
 static __always_inline s32
 mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
@@ -73,6 +75,8 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
 		bpf_for(bit, 0, 64) {
 			u32 cand = word * 64 + bit;
 
+			if (cand >= MLFQ_MAX_CPUS)
+				break;
 			if (!mlfq_bitmap_test_cpu(bm, cand))
 				continue;
 			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
@@ -93,7 +97,7 @@ mlfq_pick_unoccupied_in_bitmap(const struct mlfq_bitmap *bm,
  * @p may run on. An unpopulated LLC bitmap or an unknown LLC proceeds
  * to the flat scan.
  *
- * Gives A non-occupied CPU @p may run on, or -ENOENT.
+ * Return: A non-occupied CPU @p may run on, or -ENOENT.
  */
 static __always_inline s32
 mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
@@ -135,24 +139,24 @@ mlfq_pick_unoccupied_cpu(const struct task_struct *p, s32 origin)
 }
 
 /*
- * mlfq_rtdl_drain - Evacuation pass for a taken-over CPU.
+ * mlfq_rtdl_drain - Local-only evacuation pass for a taken-over CPU.
  * @cpu: The CPU a realtime task took over.
  * @now: Current time (scx_bpf_now()).
  *
- * Rate-limited evacuation pass. The rate-limit gate is load-bearing.
+ * Rate-limited, straight-line evacuation pass for the local DSQ only.
  * The kernel reenqueues the local DSQ on a takeover without a repeat
  * guard of its own, so the interval bounds the churn a takeover can
  * stir up, in particular the pinned-task reenqueue loop, which the
- * kernel lets run unthrottled. The pass is skipped entirely when every
- * DSQ this CPU owns is empty, which also keeps the gate from being
- * consumed by the takeover blips themselves. The stop-class blips that
- * interrupt a takeover are safe for the same reason, because the drain
- * they trigger is rate-limited and a no-op when there is nothing to
- * drain.
+ * kernel lets run unthrottled. The pass is skipped entirely when the
+ * local DSQ is empty, which also keeps the gate from being consumed by
+ * the takeover blips themselves. The stop-class blips that interrupt a
+ * takeover are safe for the same reason, because the drain they trigger
+ * is rate-limited and a no-op when there is nothing to drain. The queue
+ * DSQs are not drained here, and the steal scans serve them as the
+ * second channel on every kernel.
  */
 static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 {
-/* Drain runs at most once per interval per CPU. */
 	struct mlfq_rtdl_state *rt;
 	bool evacuated = false;
 
@@ -174,30 +178,25 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 		return;
 
 	/*
-	 * Nonempty gate: when every DSQ this CPU owns is empty there is
-	 * nothing to evacuate, so the pass is skipped without consuming
-	 * the rate-limit window.
+	 * Nonempty gate: when the local DSQ is empty there is nothing to
+	 * evacuate, so the pass is skipped without consuming the
+	 * rate-limit window. The queue DSQs are not gated here, since the
+	 * steal scans drain them as the second channel.
 	 */
-	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)) &&
-	    !scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu)))
+	if (!scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu))
 		return;
 
 	/*
-	 * The evacuation is version-gated. The local DSQ is reenqueued
-	 * from anywhere only where the call-from-anywhere kfunc exists
-	 * (v6.19+), and the queue DSQs only through the generic
-	 * reenqueue (v7.1+), with three explicit constant-id calls.
-	 * The reenqueue itself re-anchors the tasks in the queue DSQs.
-	 * The enqueue redirect then relocates them off the occupied CPU,
-	 * so the drain plus the redirect is what actually evacuates. On
-	 * 6.18 the drain is a no-op by kernel limitation. The local DSQ
-	 * is reenqueued by ops.cpu_release, whose reenqueue the redirect
+	 * The local-only evacuation is version-gated. The local DSQ is
+	 * reenqueued from anywhere only where the call-from-anywhere kfunc
+	 * exists (v6.19+), as one straight-line call with no loop. The
+	 * reenqueue itself re-anchors the tasks in the queue DSQs. The
+	 * enqueue redirect then relocates them off the occupied CPU, so
+	 * the drain plus the redirect is what actually evacuates. On 6.18
+	 * the drain is a no-op by kernel limitation. The local DSQ is
+	 * reenqueued by ops.cpu_release, whose reenqueue the redirect
 	 * likewise relocates, and the queue DSQs are served by the steal
-	 * scans on every kernel. On 6.19 the local reenqueue runs and
-	 * can consume the gate while the queue DSQs wait for the steal
-	 * scans. This is the intermediate kernel degradation. The probe
+	 * scans on every kernel, which is the second channel. The probe
 	 * is the compat layer's stable surface, and the call goes
 	 * straight to the v2 kfunc, which is what the from-anywhere
 	 * wrapper does internally. Spelling it out keeps the drain
@@ -205,15 +204,6 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
 	 */
 	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
 		scx_bpf_reenqueue_local___v2___compat();
-		evacuated = true;
-	}
-	if (__COMPAT_has_generic_reenq()) {
-		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(1, cpu)))
-			scx_bpf_dsq_reenq(mlfq_dsq_id(1, cpu), 0);
-		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(2, cpu)))
-			scx_bpf_dsq_reenq(mlfq_dsq_id(2, cpu), 0);
-		if (scx_bpf_dsq_nr_queued(mlfq_dsq_id(3, cpu)))
-			scx_bpf_dsq_reenq(mlfq_dsq_id(3, cpu), 0);
 		evacuated = true;
 	}
 
@@ -233,15 +223,15 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
  * The sched_switch hook. The kernel fires this tracepoint on every real
  * context switch. The program reads next->prio to learn the class of
  * the task the CPU is about to run. A realtime next marks the CPU
- * occupied and attempts the takeover drain. Any other next clears the
- * mark. Because the hook fires on every real switch, the flag always
- * reflects the class of the last task that ran on the CPU, which is
- * exactly the rule the placement redirect needs. The program is
- * loaded on every kernel. The flag logic alone drives placement even
- * where the evacuation cannot run, and the evacuation branches inside
- * are ksym-gated so they self-prune on kernels without the reenqueue
- * kfuncs. The body is straight-line with at most a few bounded map
- * operations per switch. There are no loops.
+ * occupied and attempts the local-only takeover drain. Any other next
+ * clears the mark. Because the hook fires on every real switch, the
+ * flag always reflects the class of the last task that ran on the CPU,
+ * which is exactly the invariant the placement redirect needs. The
+ * program is loaded on every kernel. The flag logic alone drives
+ * placement even where the evacuation cannot run, and the evacuation
+ * branch inside is ksym-gated so it self-prunes on kernels without the
+ * reenqueue kfunc. The body is straight-line with at most a few bounded
+ * map operations per switch. There are no loops.
  */
 SEC("?tp_btf/sched_switch")
 int BPF_PROG(mlfq_sched_switch, bool preempt,

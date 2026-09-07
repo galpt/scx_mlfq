@@ -13,7 +13,7 @@
 //! `src/bpf/main.bpf.c` (see `src/bpf/intf.h` for the compile-time
 //! defaults, which are the source of truth for every value here).
 //!
-//! The scheduler has fixed values. The production path uses `Config::default()`
+//! The scheduler is knob-free. The production path uses `Config::default()`
 //! validated by `Config::validate()`. `ConfigBuilder` exists only to drive
 //! the validation contract from the unit tests.
 
@@ -57,8 +57,12 @@ const EMA_HALF_LIFE_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_EMA_HALF_LIFE_NS
 /// Aging period.
 const AGING_PERIOD_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_AGING_PERIOD_NS as u64;
 
-/// Short-sleep boost window, from `src/bpf/intf.h`.
-const SHORT_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_NS as u64;
+/// Short-sleep boost window. Periodic wakeup cadences such as the 60 Hz
+/// frame interval stay interactive. The per-task boost rate limit bounds
+/// the churn. The value is set against the slowest common cadence, so
+/// faster refresh rates, which sleep less per frame, fall inside the
+/// window as well.
+const SHORT_SLEEP_NS: u64 = 32 * NSEC_PER_MSEC;
 const SHORT_SLEEP_RATE_LIMIT_NS: u64 =
     crate::bpf_intf::mlfq_consts_MLFQ_SHORT_SLEEP_RATE_LIMIT_NS as u64;
 const HYSTERESIS_SLEEP_NS: u64 = crate::bpf_intf::mlfq_consts_MLFQ_HYSTERESIS_SLEEP_NS as u64;
@@ -172,7 +176,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Validate the configuration against the rules the BPF side
+    /// Validate the configuration against the invariants the BPF side
     /// relies on (`src/bpf/intf.h`).
     ///
     /// An invalid configuration is a programming error, not a runtime
@@ -229,9 +233,6 @@ impl Config {
         if self.long_sleep_ns == 0 {
             bail!("long-sleep window must be non-zero");
         }
-        if self.preempt_slice_ns == 0 {
-            bail!("preempt slice must be non-zero");
-        }
         if self.q1_quota == 0 || self.q2_quota == 0 {
             bail!(
                 "dispatch quotas must be non-zero (got Q1={} Q2={})",
@@ -243,10 +244,11 @@ impl Config {
             bail!("dispatch_max_batch must be non-zero");
         }
         /*
-         * dispatch serves Q1 up to quota, then Q2, then Q3 remainder.
-         * Quotas that fill the batch starve Q3 on a busy system.
+         * dispatch() serves Q1 up to its quota, then Q2 up to its quota,
+         * then the Q3 remainder within dispatch_max_batch.
+         * If the quotas consume the whole batch, Q3 never runs on a busy
+         * system. The Q3 starvation bound depends on this slack.
          */
-        /* Quotas keep headroom for Q3 in the batch. */
         if u64::from(self.q1_quota) + u64::from(self.q2_quota) >= u64::from(self.dispatch_max_batch)
         {
             bail!(
@@ -360,10 +362,10 @@ impl Config {
 ///
 /// Every setter is optional; unset fields fall back to the `intf.h`
 /// defaults. `build()` validates the result and returns an error for any
-/// configuration that would break a BPF rule.
+/// configuration that would break a BPF invariant.
 ///
-/// Production code never uses this type. The scheduler has fixed
-/// values, so `main.rs` applies `Config::default()` directly. The
+/// Production code never uses this type: the scheduler is deliberately
+/// knob-free, so `main.rs` applies `Config::default()` directly. The
 /// builder lives under `#[cfg(test)]` and exercises every field through
 /// the validation contract.
 #[cfg(test)]
@@ -534,7 +536,8 @@ impl ConfigBuilder {
 
     /// Assemble and validate the configuration.
     ///
-    /// Gives an error if any rule is broken. The result is valid.
+    /// Returns an error if any invariant is violated; the resulting
+    /// `Config` is guaranteed valid.
     pub fn build(self) -> Result<Config> {
         let defaults = Config::default();
         let cfg = Config {
@@ -743,6 +746,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_gauge_params() {
+        assert!(ConfigBuilder::default().budget_max_ns(0).build().is_err());
+        assert!(ConfigBuilder::default().alpha(0).build().is_err());
+        assert!(ConfigBuilder::default()
+            .ema_half_life_ns(0)
+            .build()
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_zero_sleep_windows() {
+        assert!(ConfigBuilder::default().short_sleep_ns(0).build().is_err());
+        assert!(ConfigBuilder::default()
+            .short_sleep_rate_limit_ns(0)
+            .build()
+            .is_err());
+        assert!(ConfigBuilder::default()
+            .hysteresis_sleep_ns(0)
+            .build()
+            .is_err());
+        assert!(ConfigBuilder::default().long_sleep_ns(0).build().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_rtdl_drain_interval() {
+        assert!(ConfigBuilder::default()
+            .rtdl_drain_interval_ns(0)
+            .build()
+            .is_err());
+    }
+
+    #[test]
     fn rejects_tree_bands_out_of_order() {
         assert!(ConfigBuilder::default().tree_t_int_ns(0).build().is_err());
         let cfg = ConfigBuilder::default()
@@ -781,22 +816,5 @@ mod tests {
         assert!(s.contains("quotas: Q1=4 Q2=8 max_batch=32"));
         assert!(s.contains("tree_bands: T_INT=1000us T_BOUND=3000us"));
         assert!(s.contains("adapt_enabled=true"));
-    }
-
-    #[test]
-    fn builder_all_setters_round_trip() {
-        let d = Config::default();
-        let cfg = ConfigBuilder::default()
-            .budget_max_ns(d.budget_max_ns)
-            .alpha(d.alpha)
-            .ema_half_life_ns(d.ema_half_life_ns)
-            .short_sleep_ns(d.short_sleep_ns)
-            .short_sleep_rate_limit_ns(d.short_sleep_rate_limit_ns)
-            .hysteresis_sleep_ns(d.hysteresis_sleep_ns)
-            .long_sleep_ns(d.long_sleep_ns)
-            .rtdl_drain_interval_ns(d.rtdl_drain_interval_ns)
-            .build()
-            .unwrap();
-        assert_eq!(cfg, d);
     }
 }

@@ -56,7 +56,7 @@ typedef int pid_t;
 #endif
 
 /*
- * Instrumentation. Set to 1 to compile the check predicates
+ * Instrumentation. Set to 1 to compile the invariant checks
  * into the BPF object; they are compiled out by default. The check
  * predicates themselves live under the same guard and are exercised by the
  * native unit-test harness with MLFQ_CHECK forced on.
@@ -152,10 +152,8 @@ enum mlfq_consts {
 	 * additionally requires the wakeup's fresh deadline to precede the
 	 * resident's. Zero, the default, makes the interactive rule
 	 * unconditional: a wakeup that just became runnable is served
-	 * ahead of the resident at the next scheduling event. The grant
-	 * is capped to MLFQ_PREEMPT_SLICE_NS, so the displaced task
-	 * resumes at the next event and the zero guard cannot thrash.
-	 * Internal tuning constant, not a user-facing knob.
+	 * ahead of the resident at the next scheduling event. Internal
+	 * tuning constant, not a user-facing knob.
 	 */
 	MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS	= 0ULL,
 
@@ -300,9 +298,10 @@ enum mlfq_consts {
 	MLFQ_SAMPLE_RING_BYTES		= (1 * 1024 * 1024),
 
 	/*
-	 * The ops watchdog timeout, in milliseconds. The kernel's
-	 * maximum detection latency for a stalled scheduler; the
-	 * scheduler exits and the kernel reverts to CFS when it fires.
+	 * The ops watchdog timeout, in milliseconds. The 30 s timeout is
+	 * the kernel's maximum detection latency for a stalled scheduler,
+	 * and the scheduler exits and the kernel reverts to CFS when it
+	 * fires.
 	 */
 	MLFQ_OPS_TIMEOUT_MS		= 30000,
 
@@ -322,20 +321,19 @@ enum mlfq_consts {
 	 * Number of features the CART splitter may use. The fitter caps
 	 * split feature ids to [0, MLFQ_TREE_NR_FEATURES), so a value
 	 * here is the contract with mlfq_tree.rs and the walk's feat[]
-	 * indexing. The 1.3.11 ABI carries nine split features
+	 * indexing. The 1.3.12 ABI carries nine split features
 	 * (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
 	 * queue_wait, sq_ema, gpu_submit) with sleep_var_ratio remain
 	 * carry-along quantised via FP_SHIFT (0..4 steps).
 	 */
 	MLFQ_TREE_NR_FEATURES		= 9,
-/* Nine split ids stay the shared ABI. */
 
 	/*
 	 * Adaptation control law. The adaptation is a proportional-only
 	 * controller on the system wakeup-latency gauge. The band edges
 	 * move by a common relative shift, slew-limited per step, within
 	 * the hard floor/ceiling ranges below. The target latency equals
-	 * the interactive slice, the base service target of the Q1
+	 * the interactive slice, the natural service target of the Q1
 	 * boost; k = 0.5 maps a full-range gauge error to half the shift
 	 * range, and the slew caps a single step at 10% of the base, so a
 	 * full swing needs at least five steps and one bad sample can
@@ -424,7 +422,7 @@ enum mlfq_consts {
 
 /* task_ctx flags */
 enum mlfq_task_flags {
-	MLFQ_TF_FIRST_RUN		= 1U << 0,	/* first run, half slice */
+	MLFQ_TF_FIRST_RUN		= 1U << 0,	/* first placement */
 	/*
 	 * The current enqueue was a wakeup: the enqueue-to-run wait
 	 * measured at ops.running() is a wakeup-to-run latency and feeds
@@ -441,52 +439,6 @@ enum mlfq_task_flags {
 	 * and is not persisted across the measurement.
 	 */
 	MLFQ_TF_DRM_WAKE			= 1U << 2,
-	/*
-	 * First ever enqueue of the task. Set at reset alongside
-	 * FIRST_RUN, cleared at the first placement. While set, the
-	 * placement initializes vruntime to the queue average instead
-	 * of preserving lag, so a new task joins at zero lag. FIRST_RUN
-	 * is separate and controls the half slice only, cleared at the
-	 * first running instead.
-	 */
-	MLFQ_TF_INITIAL			= 1U << 3,
-	/*
-	 * The stored deadline is relative to the queue average. Set on
-	 * a weight change where the absolute deadline was converted to
-	 * relative form, cleared when the next placement commits it.
-	 * The placement adds vruntime back, so a reweighted task keeps
-	 * its request position across the weight change.
-	 */
-	MLFQ_TF_REL_DEADLINE		= 1U << 4,
-	/*
-	 * The task holds a per-queue sums entry for the queue stored in
-	 * bits 6-7. Set when the task joins the sums, cleared when it
-	 * leaves. A task in a local DSQ or running holds no entry, so a
-	 * re-enqueue from the local DSQ must not subtract. The queue
-	 * bits hold qid - 1 while set, so the leave subtracts from the
-	 * queue the task joined, not the queue it is rejoining.
-	 */
-	MLFQ_TF_IN_SUMS		= 1U << 5,
-};
-
-/*
- * Sums-queue bits in task_ctx.flags. Bits 6-7 hold qid - 1 while
- * MLFQ_TF_IN_SUMS is set (0..2 for qid 1..3, 3 never stored). The
- * size of task_ctx stays 240 bytes, no ABI change.
- */
-#define MLFQ_SUM_QID_SHIFT	6
-#define MLFQ_SUM_QID_MASK	(0xC0U)
-
-/*
- * EEVDF ABI version of this header. Bumped when the placement math
- * or the queue sums change in a way that alters scheduling behavior.
- * The task storage stays 240 bytes for 1.3.12, so no storage migration
- * is needed, and the tree sample stays version 4.
- */
-enum mlfq_eevdf_abi {
-	MLFQ_EEVDF_ABI_VERSION		= 1,
-	MLFQ_AVG_MIN_WEIGHT		= 2,
-	MLFQ_SUM_SHIFT_MAX		= 10,
 };
 
 /*
@@ -509,35 +461,35 @@ enum mlfq_eevdf_abi {
  * of the scheduler's ABI.
  */
 
-/*
+/**
  * struct mlfq_tree_feats - Feature vector of the prediction tree.
  *
- * Fact. the vector is the per-task state the CART predictor may
- * split on. Rule. field order and offsets are the shared ABI
+ * Theorem: the vector is the per-task state the CART predictor may
+ * split on. Invariant: field order and offsets are the shared ABI
  * with emitted samples (mlfq_tree_sample) and the Rust TreeFeats
  * mirror; any reordering breaks bindgen and the ring-buffer parse.
  *
- * Steps. prev_burst/sleep/ema/io_wait/wake_cnt are the original
+ * Derivation: prev_burst/sleep/ema/io_wait/wake_cnt are the original
  * 32-byte prefix. wake_lat/queue_wait/sq_ema measure the previous
  * episode's enqueue-to-run service, appended without reordering. The
  * 7.1 ABI adds sleep_var_ratio, the fixed-point (FP_SHIFT=8) variation
  * ratio of sleep intervals, to capture frame-cadence regularity; it
  * stays carry-along until the fitter promotes it. sq_ema remains at
- * offset 40, sleep_var_ratio at 48. The 1.3.11 ABI adds gpu_submit,
+ * offset 40, sleep_var_ratio at 48. The 1.3.12 ABI adds gpu_submit,
  * the quantised (FP_SHIFT 0..4) gpu submission count, at offset 56
  * with pad2 for 64-byte alignment. The resulting 64-byte record keeps
  * every u64 at an 8-byte offset and the packed sample at 84 bytes.
  *
- * Bound. wake_lat/queue_wait are bounded via _MAX constants and
+ * Why clamp: wake_lat/queue_wait are bounded via _MAX constants and
  * label clamp, so the fitter's f64 sums stay overflow-free; the var
  * ratio is FP_ONE-scaled and clamped to [0, FP_ONE*2] to bound
  * threshold midpoints; gpu_submit is clamped to [0,4] quant steps.
  *
- * path helper: classification selects the queue via the tree
- * walk (path) observing this feature state (reader) without a
- * indirect; helpers are static inline.
+ * Strategy helper: classification selects the queue via the tree
+ * walk (Strategy) observing this feature state (Observer) without a
+ * vtable; helpers are static inline.
  *
- * 64 bytes, packed fields plainly aligned.
+ * 64 bytes, packed fields naturally aligned.
  */
 struct mlfq_tree_feats {
 	u64 prev_burst_ns;		/* last completed run segment */
@@ -558,7 +510,7 @@ struct mlfq_tree_feats {
  * One node of the serialized tree. threshold is the split point in
  * nsecs. left is the left child index, or the leaf prediction in nsecs
  * when right == 0. right is the right child index, 0 marking a leaf.
- * feature is the split feature id (0..8, indexing the walk's feat[]
+ * feature is the split feature id (0..4, indexing the walk's feat[]
  * slots). 24 bytes.
  */
 struct mlfq_tree_node {
@@ -627,26 +579,26 @@ struct mlfq_tree_ctrl {
 
 extern volatile struct mlfq_tree_ctrl mlfq_tree_ctrl;
 
-/*
+/**
  * struct mlfq_tree_sample - One training sample for the daemon.
  *
- * Fact. the ring-buffer record is the atomic training unit.
- * Rule. 84 bytes packed aligned(4), field order is the shared ABI.
+ * Theorem: the ring-buffer record is the atomic training unit.
+ * Invariant: 84 bytes packed aligned(4), field order is the shared ABI.
  *
- * Steps. pid/queue (8 bytes) + feats 64 bytes + label 8 bytes +
+ * Derivation: pid/queue (8 bytes) + feats 64 bytes + label 8 bytes +
  * version 4 bytes = 84. The feats vector is the 64-byte form (sq_ema
  * at 40, sleep_var_ratio at 48, gpu_submit at 56). label_ns is clamped to
  * MLFQ_TREE_LABEL_MAX_NS, so the fitter's f64 sums never sum near-u64
  * values.
  *
- * Bound. version is MLFQ_TREE_SAMPLE_VERSION (4 for 1.3.11 ABI);
+ * Why clamp: version is MLFQ_TREE_SAMPLE_VERSION (4 for 1.3.12 ABI);
  * mismatch drops the record instead of misreading fields.
  *
- * reader helper: stopping path observes task state to emit this
- * record; daemon observes the ring buffer (reader) without shared
+ * Observer helper: stopping path observes task state to emit this
+ * record; daemon observes the ring buffer (Observer) without shared
  * state.
  *
- * 84 bytes packed aligned(4); every field keeps its base offset.
+ * 84 bytes packed aligned(4); every field keeps its natural offset.
  */
 struct mlfq_tree_sample {
 	u32 pid;
@@ -677,7 +629,7 @@ _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, wake_lat_us) == 32,
 	       "wake_lat_us at 32");
 _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, queue_wait_us) == 36,
 	       "queue_wait_us at 36");
-/* Masking gap: BPF walk feat[16] uses &0xF (0..15) with feat[16]
+/* Masking asymmetry: BPF walk feat[16] uses &0xF (0..15) with feat[16]
  * holding nine split features 0..8 (gpu_submit at 8, quant 0..4),
  * sleep_var_ratio carry-along at 9, and 10..15 zeroed; Rust feat[16]
  * mirrors this with match 0..10 and _=>0. The plain < NR_FEATURES
@@ -685,7 +637,7 @@ _Static_assert(__builtin_offsetof(struct mlfq_tree_feats, queue_wait_us) == 36,
  * unconditional, so 9..15 never indexes OOB. NR_FEATURES 9.
  */
 _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
-	       "NR_FEATURES must be 9 for 1.3.11 ABI (feat[16] 0..8 split, gpu_submit quant 0..4, 9 carry-along)");
+	       "NR_FEATURES must be 9 for 1.3.12 ABI (feat[16] 0..8 split, gpu_submit quant 0..4, 9 carry-along)");
 
 /*
  * Sentinel "no LLC owner" value for task_ctx.last_llc. Valid LLC domain
@@ -696,45 +648,44 @@ _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
  */
 #define MLFQ_LLC_UNOWNED 0xFFU
 
-/*
+/**
  * struct task_ctx - Per-task state in BPF task storage.
  *
- * Fact. the task is the unit of EEVDF placement and MLFQ
- * classification. Rule. vruntime anchored to the queue average
- * via the signed bounded lag clamp, vlag in [-limit, limit].
+ * Theorem: the task is the unit of EEVDF placement and MLFQ
+ * classification. Invariant: vruntime anchored to queue clock via
+ * bounded-lag clamp, vlag >=0.
  *
- * Steps. 96-byte classification/vtime block, 24-byte
+ * Derivation: 96-byte classification/vtime block, 24-byte
  * enqueue-to-run measurement block, plus the 80-byte MLFQ tree sample
  * block (the 64-byte feature vector plus pending_queue and
  * pending_valid padded to 64-bit) plus 24-byte sleep cadence EMA
  * block (mean 8, var 8, ratio 4 + pad 4) plus 4-byte gpu_submit
  * plus 4-byte pad plus 8-byte gpu_submit dedup timestamp.
- * Total 240 bytes aligned for the 1.3.12 ABI, unchanged from 1.3.11
+ * Total 240 bytes aligned for the 1.3.12 ABI
  * (232 before gpu_submit timestamp, 224 before gpu_submit, gpu_submit at 224,
  * last_gpu_submit_at at 232). The 64-byte vector keeps sq_ema at 40,
  * sleep_var_ratio at 48 and gpu_submit at 56 quantised 0..4.
  *
- * Bound. placement lag clamped to [-limit, limit] for bounded lag,
- * with lag inflation preserving the average across joins. Service EMAs
- * clamped to MAX to bound thresholds and f64 sums.
+ * Why clamp: placement lag clamped to [0, limit] for bounded-lag;
+ * service EMAs clamped to MAX to bound thresholds and f64 sums.
  * gpu_submit dedup window is MLFQ_TREE_PER_TASK_LIMIT_NS (10 ms),
  * the same per-task rate limit as the training-sample gate, so a
  * single logical GPU submission that fires 2-3 tracepoints
  * (amdgpu_cs, amdgpu_cs_ioctl, gpu_sched) is counted once.
  */
 
-/*
+/**
  * struct mlfq_q1_occupancy - Per-CPU Q1 occupancy for SMT isolation.
  *
- * Fact. each CPU's Q1 occupancy is the soft SMT veto the selection
- * observes. Rule. one byte per CPU, padded to 8 bytes for array
+ * Theorem: each CPU's Q1 occupancy is the soft SMT veto the selection
+ * observes. Invariant: one byte per CPU, padded to 8 bytes for array
  * map value alignment and to keep per-CPU slots on separate cache
- * lines from mlfq_stats (reader: select_cpu observes occupancy,
- * path: veto is direct via helper).
+ * lines from mlfq_stats (Observer: select_cpu observes occupancy,
+ * Strategy: veto is pluggable via helper).
  *
- * Steps. occupied==1 when the CPU runs a Q1 task (set in
+ * Derivation: occupied==1 when the CPU runs a Q1 task (set in
  * running(), cleared in stopping()), 0 otherwise. The 8-byte value
- * keeps array map values plainly aligned and avoids false sharing
+ * keeps array map values naturally aligned and avoids false sharing
  * with the BSS stats line; the map is BPF_MAP_TYPE_ARRAY, not BSS,
  * so no __sync_* on a shared line is needed and cross-CPU
  * bpf_map_lookup_elem returns the sibling's occupancy. Performance
@@ -743,7 +694,7 @@ _Static_assert(MLFQ_TREE_NR_FEATURES == 9,
  * if perf measurement shows sibling veto contention (documented, not
  * padded now).
  *
- * Split. keeping occupancy per-CPU avoids the word-bit
+ * Why isolation: keeping occupancy per-CPU avoids the word-bit
  * false sharing of a global q1_mask; sibling lookup is logical via
  * mlfq_cpu_sibling table, not bit arithmetic.
  *
@@ -756,8 +707,8 @@ struct mlfq_q1_occupancy {
 
 struct task_ctx {
 	u64 vruntime;			/* last placed virtual runtime */
-	s64 vlag;			/* clamped virtual lag, in [-limit, limit] */
-	u64 deadline;			/* last computed virtual deadline, absolute unless REL_DEADLINE */
+	s64 vlag;			/* clamped lag at placement, >= 0 */
+	u64 deadline;			/* last computed virtual deadline */
 	u64 ema;			/* EMA interactivity gauge [0, BUDGET_MAX] */
 	u64 last_run_at;		/* scx_bpf_now() at ops.running() */
 	u64 last_sleep_at;		/* scx_bpf_now() at stopping(!runnable) */
@@ -781,7 +732,7 @@ struct task_ctx {
 	 * as not counted. The read-modify-write is lock-free. The kernel
 	 * serializes enqueue/dequeue/stopping per task, so the counter
 	 * RMWs stay exact in the absence of a cross-rq race; a torn read
-	 * can only defer one release, recovered by the next episode
+	 * can only defer one release, self-healed by the next episode
 	 * entry.
 	 */
 	u8  last_llc;			/* owning LLC, MLFQ_LLC_UNOWNED if none */
@@ -855,12 +806,14 @@ _Static_assert(__builtin_offsetof(struct task_ctx, sleep_var_ratio) == 136,
 #define MLFQ_WAKE_CPU_VALID	0x02U
 
 /*
- * Per-queue EEVDF runqueue. clock is the legacy monotone service point,
- * kept for observability and advanced alongside the average. The average
- * itself is the weighted mean of the queued vruntimes, tracked with the
- * relative sums below, plus the running task when it belongs to the queue.
- * Placement anchors lag to the average, eligibility tests against it, and
- * the zero point advances monotonically so stale reads stay eligible.
+ * Per-queue virtual clock. clock is the service point the queue
+ * has reached. It advances monotonically as the queue's tasks run, and
+ * placement anchors a task's lag to it. No weighted-average aggregate is
+ * maintained because computing it needs consistent reads of two shared
+ * sums, which in BPF would require mutual exclusion; the bounded-lag
+ * theorem is instead enforced by clamping the task lag to the clock at
+ * placement, which is exact enough for the safety properties and keeps
+ * the placement lock-free.
  */
 struct queue_ctx {
 	/*
@@ -871,16 +824,8 @@ struct queue_ctx {
 	 */
 	u64 clock;
 	u64 max_slice_ns;		/* per-queue request size */
-	s64 sum_w_vruntime;		/* sum of (vruntime - zero) * weight, queued only */
-	s64 sum_weight;			/* sum of queued weights, scaled */
-	u64 zero_vruntime;		/* base the relative sums are measured from */
-	u32 sum_shift;			/* weight scale shift, 0 until overflow */
-	u32 pad_shift;			/* explicit pad for 8 byte alignment */
-	u64 pad[2];			/* keep the struct at 64 bytes, one cache line */
+	u64 pad[6];			/* one queue_ctx per cacheline */
 };
-
-_Static_assert(sizeof(struct queue_ctx) == 64,
-	       "queue_ctx must be 64 bytes, one cache line with sums and zero");
 
 /*
  * Global idle tracking. mlfq_idle_count is the number of currently idle
@@ -894,22 +839,22 @@ _Static_assert(sizeof(struct queue_ctx) == 64,
 extern volatile u32 mlfq_idle_count;
 extern const volatile u32 mlfq_idle_tracking;
 
-/*
+/**
  * struct mlfq_cpu_state - Per-CPU occupancy and scheduling state.
  *
- * Fact. each CPU's running queue, deadline and EMA are the
+ * Theorem: each CPU's running queue, deadline and EMA are the
  * observable state the dispatch and selection helpers observe.
- * Rule. one entry per CPU, 64 bytes, one cache line; array key
+ * Invariant: one entry per CPU, 64 bytes, one cache line; array key
  * is cpu id.
  *
- * Steps. running_queue/pid/deadline track the current occupant
+ * Derivation: running_queue/pid/deadline track the current occupant
  * for same-queue preemption (mlfq_sameq_preempt_owed). cpu_ema is the
  * busy-ns EMA (MLFQ_BUDGET_MAX_NS ceiling, MLFQ_EMA_HALF_LIFE_NS
  * decay) used for cpuperf level (mlfq_cpuperf_from_ema). steal_scan_off
- * rotates the Tier-B steal scan (reader: dispatch observes this
- * state, path: scan order is a direct helper without indirect).
+ * rotates the Tier-B steal scan (Observer: dispatch observes this
+ * state, Strategy: scan order is a pluggable helper without vtable).
  *
- * Bound. cpu_ema clamped to [0, BUDGET_MAX] bounds the cpuperf
+ * Why clamp: cpu_ema clamped to [0, BUDGET_MAX] bounds the cpuperf
  * level to [0, SCX_CPUPERF_ONE] and bounds virtual-time math; deadline
  * 0 marks unknown and never preempts.
  *
@@ -919,39 +864,32 @@ struct mlfq_cpu_state {
 	s32 running_queue;		/* queue of the running task, 0 none */
 	u32 running_pid;
 	u32 steal_scan_off;		/* rotating remote-scan start for Q2/Q3 */
-	u32 pad0;			/* explicit pad for 8 byte alignment */
 	u64 cpu_ema;			/* busy-ns EMA of this CPU's activity */
 	u64 cpu_ema_at;			/* scx_bpf_now() of the last update */
 	u64 running_deadline;		/* running task's deadline, 0 unknown */
 	u64 run_start_at;		/* scx_bpf_now() at ops.running() */
 	u32 running_gpu_submit;		/* gpu_submit 0..4 of the running task */
-	u32 running_weight;		/* weight of the running task, for avg curr */
-	u64 running_vruntime;		/* vruntime of the running task, for avg curr */
+	u32 pad2;
 };
-
-_Static_assert(sizeof(struct mlfq_cpu_state) == 64,
-	       "mlfq_cpu_state must be 64 bytes, one cache line with curr vruntime");
-_Static_assert(__builtin_offsetof(struct mlfq_cpu_state, running_vruntime) == 56,
-	       "running_vruntime at 56");
 
 /* Per-CPU realtime-occupancy flags. */
 #define MLFQ_RTDL_OCCUPIED			(1U << 0)
 
-/*
+/**
  * struct mlfq_rtdl_state - Per-CPU realtime occupancy.
  *
- * Fact. the RT occupancy flag is the gate the scheduler observes
- * before placing work. Rule. one entry per CPU, flags
+ * Theorem: the RT occupancy flag is the gate the scheduler observes
+ * before placing work. Invariant: one entry per CPU, flags
  * MLFQ_RTDL_OCCUPIED when the last sched_switch saw RT/DL.
  *
- * Steps. sched_switch hook (rtdl.bpf.c) observes the switched-in
- * task class (reader) and sets flags; enqueue and select_cpu observe
- * flags to redirect or skip the CPU (path via helper predicates,
- * static inline, no indirect). last_drain_at rate-limits the evacuation
+ * Derivation: sched_switch hook (rtdl.bpf.c) observes the switched-in
+ * task class (Observer) and sets flags; enqueue and select_cpu observe
+ * flags to redirect or skip the CPU (Strategy via helper predicates,
+ * static inline, no vtable). last_drain_at rate-limits the evacuation
  * scan to MLFQ_RTDL_DRAIN_INTERVAL_NS, so a takeover blip cannot
  * thrash.
  *
- * Bound. flags is a single bit, checked under the 7.1-only
+ * Why clamp: flags is a single bit, checked under the 7.1-only
  * watchdog (30 s); drain interval clamps the churn to 1/ms per CPU,
  * bounding the DSQ moves under continuous RT preemption.
  *
@@ -1034,24 +972,20 @@ struct mlfq_stats {
 	u64 rt_evacuations;		/* DSQ evacuation passes that ran */
 	u64 rt_redirects;		/* wakeups redirected off occupied CPUs */
 	u64 rt_reenqs;			/* SCX_ENQ_REENQ re-enqueues counted */
-	/* EEVDF diagnostics (vtime, dispatch, lifecycle). */
-	u64 eevdf_eligible;		/* eligible picks observed at dispatch */
-	u64 eevdf_ineligible;		/* ineligible heads skipped at dispatch */
-	u64 eevdf_deadline_miss;	/* vruntime past deadline at charge time */
-	u64 eevdf_divergence;		/* lag spread beyond one bound at publish */
 	/*
-	 * The counter struct is 36 counters plus 4 pad words, 40 u64s or
-	 * 320 bytes (five 64 byte lines). The counters before the pad are
-	 * write-hammered by the hot paths, and the published tree meta
-	 * line (mlfq_tree_ctrl) must not share a line with them. The
-	 * isolation itself comes from the __aligned(64) on the
-	 * mlfq_tree_ctrl instance in main.bpf.c, which pins that line to
-	 * a dedicated cache line. The size stays a whole number of lines,
-	 * so the two never land on the same line by layout accident. The
-	 * pad keeps the multiple; adding any counter requires recomputing
-	 * it.
+	 * The counter struct is exactly 32 u64s = 256 bytes (four 64-byte
+	 * lines): the counters before the pad are write-hammered by the
+	 * hot paths, and the published tree meta line (mlfq_tree_ctrl)
+	 * must not share a line with them. The isolation itself comes
+	 * from the __aligned(64) on the mlfq_tree_ctrl
+	 * instance in main.bpf.c, which pins that line to a dedicated
+	 * cache line. The size hygiene here lets the aligned instance sit
+	 * on the following boundary by the plain declaration order, so
+	 * the two never land on the same line by layout accident. The pad
+	 * is empty at this exact field count; adding any counter requires
+	 * recomputing it to keep the 256-byte size.
 	 */
-	u64 pad[4];
+	u64 pad[0];
 };
 
 /*
@@ -1176,14 +1110,14 @@ static __always_inline u64 mlfq_dsq_id(u8 qid, s32 cpu)
 	return MLFQ_DSQ_BASE + (u64)cpu * MLFQ_DSQ_STRIDE + (u64)(qid - 1);
 }
 
-/*
+/**
  * mlfq_bitmap_test_cpu - Test a CPU's bit in a bitmap.
  * @bm: The bitmap.
  * @cpu: The CPU id.
  *
  * Out-of-range CPUs never have their bit set.
  *
- * Gives True if @cpu's bit is set.
+ * Return: True if @cpu's bit is set.
  */
 static __always_inline bool mlfq_bitmap_test_cpu(const struct mlfq_bitmap *bm,
 						 u32 cpu)
@@ -1193,7 +1127,7 @@ static __always_inline bool mlfq_bitmap_test_cpu(const struct mlfq_bitmap *bm,
 	return bm->words[cpu >> 6] & (1ULL << (cpu & 63));
 }
 
-/*
+/**
  * mlfq_bitmap_set_cpu - Set a CPU's bit in a bitmap.
  * @bm: The bitmap.
  * @cpu: The CPU id.
@@ -1207,7 +1141,7 @@ static __always_inline void mlfq_bitmap_set_cpu(struct mlfq_bitmap *bm, u32 cpu)
 	bm->words[cpu >> 6] |= (1ULL << (cpu & 63));
 }
 
-/*
+/**
  * mlfq_time_before - Wrapping-safe u64 "before" comparison.
  * @a: First comparable as u64.
  * @b: Second comparable as u64.
@@ -1215,14 +1149,14 @@ static __always_inline void mlfq_bitmap_set_cpu(struct mlfq_bitmap *bm, u32 cpu)
  * Same convention as fair.c vruntime_cmp()/time_before64(): the kernel
  * DSQ orders by min deadline with the same wrapping semantics.
  *
- * Gives true if @a is before @b.
+ * Return: true if @a is before @b.
  */
 static __always_inline bool mlfq_time_before(u64 a, u64 b)
 {
 	return (s64)(b - a) > 0;
 }
 
-/*
+/**
  * mlfq_ss_boost_allowed - Short-sleep boost rate-limit check.
  * @last_boost_at: scx_bpf_now() of the last short-sleep boost (0 = never).
  * @now: Current time.
@@ -1233,7 +1167,7 @@ static __always_inline bool mlfq_time_before(u64 a, u64 b)
  * cannot chain boosts. The first boost (never boosted before) is always
  * allowed.
  *
- * Gives true if a new boost may be granted at @now.
+ * Return: true if a new boost may be granted at @now.
  */
 static __always_inline bool mlfq_ss_boost_allowed(u64 last_boost_at, u64 now,
 						  u64 rate_limit)
@@ -1243,7 +1177,7 @@ static __always_inline bool mlfq_ss_boost_allowed(u64 last_boost_at, u64 now,
 	return mlfq_time_before(last_boost_at + rate_limit, now);
 }
 
-/*
+/**
  * mlfq_boost_eligible - IPC boost eligibility at wakeup.
  * @sleep_ns: Sleep duration at wakeup (scx_bpf_now() delta, 0 = none).
  * @window_ns: Short-sleep window (MLFQ_SHORT_SLEEP_NS).
@@ -1252,12 +1186,12 @@ static __always_inline bool mlfq_ss_boost_allowed(u64 last_boost_at, u64 now,
  *
  * A wakeup is boost-eligible when it is an I/O wakeup regardless of the
  * sleep length, or when the sleep fell within the short-sleep window. The
- * I/O-wait case covers the other plain interactive wakeup source beside
+ * I/O-wait case covers the other classic interactive wakeup source beside
  * the short-sleep window. The rate limit is applied separately by the
  * caller (mlfq_ss_boost_allowed()), so an I/O wakeup burst cannot chain
  * boosts.
  *
- * Gives true if the wakeup is boost-eligible.
+ * Return: true if the wakeup is boost-eligible.
  */
 static __always_inline bool mlfq_boost_eligible(u64 sleep_ns, u64 window_ns,
 						bool io_wait)
@@ -1267,7 +1201,7 @@ static __always_inline bool mlfq_boost_eligible(u64 sleep_ns, u64 window_ns,
 	return sleep_ns && sleep_ns <= window_ns;
 }
 
-/*
+/**
  * mlfq_ss_boost_pending - Short-sleep boost decision for a wakeup.
  * @tctx: The task context.
  * @sleep_ns: Sleep duration at wakeup.
@@ -1282,7 +1216,7 @@ static __always_inline bool mlfq_boost_eligible(u64 sleep_ns, u64 window_ns,
  * whether a wakeup will be treated as interactive before the
  * classification runs, so both paths agree on the same condition.
  *
- * Gives true if the wakeup qualifies for the Q1 boost.
+ * Return: true if the wakeup qualifies for the Q1 boost.
  */
 static __always_inline bool mlfq_ss_boost_pending(const struct task_ctx *tctx,
 						  u64 sleep_ns, bool io_wait,
@@ -1293,7 +1227,7 @@ static __always_inline bool mlfq_ss_boost_pending(const struct task_ctx *tctx,
 	       mlfq_ss_boost_allowed(tctx->last_ss_boost_at, now, rate_limit);
 }
 
-/*
+/**
  * mlfq_cpuperf_from_ema - CPU performance level for a busy-ns gauge.
  * @ema: The per-CPU EMA of the recent run time.
  *
@@ -1303,7 +1237,7 @@ static __always_inline bool mlfq_ss_boost_pending(const struct task_ctx *tctx,
  * ceiling is the per-task budget, so a CPU saturated over the gauge
  * window maps to the maximum.
  *
- * Gives The cpuperf level in [0, SCX_CPUPERF_ONE].
+ * Return: The cpuperf level in [0, SCX_CPUPERF_ONE].
  */
 static __always_inline u32 mlfq_cpuperf_from_ema(u64 ema)
 {
@@ -1312,453 +1246,132 @@ static __always_inline u32 mlfq_cpuperf_from_ema(u64 ema)
 	return perf > MLFQ_CPUPERF_Q1 ? MLFQ_CPUPERF_Q1 : (u32)perf;
 }
 
-/*
+/**
  * calc_delta_fair_bpf - Scale a runtime delta to virtual time.
  * @delta: Physical time in nsecs.
  * @weight: Task weight in scx scale (nice-0 = 100, min 1).
  *
  * EEVDF virtual time grows at rate w_i/NICE_0_LOAD while running. With
- * the scx weight scale this is delta * 100 / weight.
+ * the scx weight scale this is delta * 100 / weight, the fair.c
+ * calc_delta_fair() form on the scx weight scale. The delta is clamped
+ * before the multiply so the product never wraps the 64-bit range, and
+ * a zero weight is treated as one, so the division is always defined
+ * and the result stays in the virtual-time range.
  *
- * Gives The virtual time delta.
+ * Return: The virtual time delta.
  */
 static __always_inline u64 calc_delta_fair_bpf(u64 delta, u32 weight)
 {
+	if (!weight)
+		weight = 1;
+	if (delta > 0xFFFFFFFFFFFFFFFFULL / 100)
+		delta = 0xFFFFFFFFFFFFFFFFULL / 100;
 	return delta * 100 / weight;
 }
 
-/*
- * mlfq_avg_weight - Scaled weight for the average sums.
- * @q: The queue holding the shift.
- * @weight: Task weight in scx scale.
- *
- * The sums use the scaled weight to keep the key times weight products
- * inside s64. The shift starts at zero and grows only on overflow, and
- * the scaled weight never drops below MLFQ_AVG_MIN_WEIGHT, so an idle
- * queue still carries a non-zero denominator. The scaling preserves
- * ordering, since every weight in one queue shares the same shift.
- *
- * Gives The scaled weight.
- */
-static __always_inline u64 mlfq_avg_weight(const struct queue_ctx *q, u32 weight)
-{
-	u64 w = weight;
-
-	if (q && q->sum_shift)
-		w >>= q->sum_shift > MLFQ_SUM_SHIFT_MAX ? MLFQ_SUM_SHIFT_MAX : q->sum_shift;
-	if (w < MLFQ_AVG_MIN_WEIGHT)
-		w = MLFQ_AVG_MIN_WEIGHT;
-	return w;
-}
-
-/*
- * mlfq_entity_key - Relative vruntime of a task against the queue base.
- * @q: The queue holding zero_vruntime.
- * @vruntime: Task vruntime.
- *
- * The relative form keeps the summed products small, since zero tracks
- * the service point and the deltas stay near one lag bound. The result
- * is signed, so tasks ahead of the base yield negative keys.
- *
- * Gives vruntime minus zero as s64.
- */
-static __always_inline s64 mlfq_entity_key(const struct queue_ctx *q, u64 vruntime)
-{
-	return (s64)(vruntime - q->zero_vruntime);
-}
-
-/*
+/**
  * mlfq_lag_limit - Placement lag bound (fair.c entity_lag()).
  * @q: The queue.
  * @weight: Task weight.
  *
- * limit = calc_delta_fair(max_slice + TICK, weight). A task lag is kept
- * inside [-limit, limit], the bounded lag horizon of entity_lag() in
- * kernel/sched/fair.c. The limit uses the raw task weight, as fair.c
- * does; the sums use the scaled weight floored to MLFQ_AVG_MIN_WEIGHT
- * only to keep an empty queue's denominator non-zero. The two weights
- * differ only for weight 1 (floored to 2 in the sums), where the limit
- * stays conservative (twice the sums-implied bound), never tighter.
+ * limit = calc_delta_fair(max_slice + TICK, weight). A task is placed at
+ * most one request plus one tick behind the queue's virtual clock, the
+ * bounded-lag horizon of entity_lag() in kernel/sched/fair.c.
  *
- * Gives The lag bound in virtual-time nsecs.
+ * Return: The lag bound in virtual-time nsecs.
  */
 static __always_inline u64 mlfq_lag_limit(const struct queue_ctx *q, u32 weight)
 {
 	return calc_delta_fair_bpf(q->max_slice_ns + MLFQ_TICK_NS, weight);
 }
 
-/*
- * mlfq_entity_lag_raw - Signed lag of a vruntime against an average.
- * @avg: Queue average vruntime.
- * @vruntime: Task vruntime.
- * @limit: Lag bound from mlfq_lag_limit().
+/**
+ * mlfq_clock_read - Read a queue virtual clock as an estimate.
+ * @q: The queue.
  *
- * lag = clamp(avg - vruntime, -limit, limit). Positive lag means owed
- * service, negative lag means ahead. The clamp bounds the steady state
- * spread to one request plus one tick either way.
+ * A single read of the clock, with no lock and no retry. The value may
+ * be stale under a concurrent advance, and the placement clamp absorbs
+ * the staleness, so the estimate is exact enough for the bounded-lag
+ * safety properties while the read stays lock-free.
  *
- * Gives The clamped signed lag.
+ * Return: The estimated clock.
  */
-static __always_inline s64 mlfq_entity_lag_raw(u64 avg, u64 vruntime, u64 limit)
+static __always_inline u64 mlfq_clock_read(const struct queue_ctx *q)
 {
-	s64 vlag = (s64)(avg - vruntime);
-	s64 bound = (s64)limit;
-
-	if (vlag > bound)
-		vlag = bound;
-	if (vlag < -bound)
-		vlag = -bound;
-	return vlag;
+	return q->clock;
 }
 
-/*
- * mlfq_inflate_lag - Preserve lag across a queue join.
- * @lag: Stored virtual lag before placement.
- * @sum_weight: Queued weight sum, without the joining task.
- * @w: Scaled weight of the joining task.
- *
- * Joining moves the average, so the stored lag would evaporate without
- * compensation. The inflated lag is lag * (W + w) / W, which inverts the
- * averaging step and leaves the effective lag after placement equal to
- * the stored lag. A zero sum means an empty queue, where no inflation
- * is needed. Overflow saturates to the input sign, which the caller
- * clamps again.
- *
- * Gives The inflated lag.
- */
-static __always_inline s64 mlfq_inflate_lag(s64 lag, s64 sum_weight, u64 w)
-{
-	s64 inflated;
-	u64 mag;
-	bool neg = false;
-
-	if (!lag || sum_weight <= 0)
-		return lag;
-	if (lag < 0) {
-		neg = true;
-		mag = (u64)(-lag);
-	} else {
-		mag = (u64)lag;
-	}
-	/* Guard the multiply, saturate before it can wrap. */
-	{
-		u64 total = (u64)sum_weight + w;
-
-		if (mag > (u64)0x7FFFFFFFFFFFFFFFULL / total)
-			return neg ? (s64)-0x7FFFFFFFFFFFFFFFLL : (s64)0x7FFFFFFFFFFFFFFFLL;
-		mag = mag * total / (u64)sum_weight;
-	}
-	if (mag > (u64)0x7FFFFFFFFFFFFFFFULL)
-		mag = (u64)0x7FFFFFFFFFFFFFFFULL;
-	inflated = (s64)mag;
-	return neg ? -inflated : inflated;
-}
-
-/*
- * mlfq_avg_from_sums - Weighted average from the relative sums.
- * @sum_w: Sum of key times weight, queued only.
- * @sum_weight: Sum of weights, queued only.
- * @zero: Base vruntime.
- * @curr_key: Key of the running task, 0 when none.
- * @curr_w: Scaled weight of the running task, 0 when none.
- *
- * avg = zero + (sum_w + curr_key * curr_w) / (sum_weight + curr_w).
- * The division uses floor for positive sums and ceiling for negative
- * sums, the left bias that keeps avg plus zero eligible. An empty
- * queue with no running task yields zero, and a single running task
- * yields its vruntime directly.
- *
- * Gives The average vruntime.
- */
-static __always_inline u64 mlfq_avg_from_sums(s64 sum_w, s64 sum_weight, u64 zero,
-					      s64 curr_key, u64 curr_w)
-{
-	s64 runtime = sum_w;
-	s64 weight = sum_weight;
-	u64 mag, div;
-	bool neg;
-
-	if (curr_w) {
-		runtime += curr_key * (s64)curr_w;
-		weight += (s64)curr_w;
-	}
-	if (weight <= 0) {
-		if (curr_w)
-			return zero + (u64)curr_key;
-		return zero;
-	}
-	/* BPF has no signed division, so divide the magnitude in u64. */
-	neg = runtime < 0;
-	mag = neg ? (u64)(-runtime) : (u64)runtime;
-	if (neg)
-		mag += (u64)weight - 1;
-	div = mag / (u64)weight;
-	if (neg)
-		return zero - div;
-	return zero + div;
-}
-
-/*
- * mlfq_vruntime_eligible_raw - Eligibility of a vruntime against sums.
- * @sum_w: Sum of key times weight, queued only.
- * @sum_weight: Sum of weights, queued only.
- * @zero: Base vruntime.
- * @vruntime: Vruntme under test.
- * @curr_key: Key of the running task, 0 when none.
- * @curr_w: Scaled weight of the running task, 0 when none.
- *
- * Eligible means owed service, lag >= 0, tested without division as
- * sum_w + curr >= (vruntime - zero) * (sum_weight + curr_w). A stale
- * or empty sum (weight <= 0) is eligible, so a torn read never starves
- * a task. The key is tested unclamped here; the BPF callers clamp it to
- * 32 bits before the call, so the product stays inside s64 for every
- * reachable vruntime and the overflow arm only fires on a corrupted
- * sum. Overflow of the right hand side yields eligible when the key
- * is behind and ineligible when ahead, the same sign rule as fair.c,
- * symmetric by lag sign, never by weight.
- *
- * Gives True when eligible.
- */
-static __always_inline bool mlfq_vruntime_eligible_raw(s64 sum_w, s64 sum_weight, u64 zero,
-						       u64 vruntime, s64 curr_key, u64 curr_w)
-{
-	s64 avg = sum_w;
-	s64 load = sum_weight;
-	s64 key = (s64)(vruntime - zero);
-	u64 mag_key, mag_load, prod;
-	bool neg;
-
-	if (curr_w) {
-		avg += curr_key * (s64)curr_w;
-		load += (s64)curr_w;
-	}
-	if (load <= 0)
-		return true;
-	/* BPF has no signed overflow builtin, guard by magnitude. */
-	neg = key < 0;
-	mag_key = neg ? (u64)(-key) : (u64)key;
-	mag_load = (u64)load;
-	/* Overflow yields eligible when behind and ineligible when ahead. */
-	if (mag_key && mag_load > (u64)0x7FFFFFFFFFFFFFFFULL / mag_key)
-		return neg;
-	prod = mag_key * mag_load;
-	if (neg)
-		return avg >= -(s64)prod;
-	return avg >= (s64)prod;
-}
-
-/*
+/**
  * mlfq_queue_advance_clock - Advance a queue's virtual clock.
  * @q: The queue.
  * @vruntime: The virtual runtime just charged for the queue.
  *
  * The clock follows the service given to the queue. It is advanced to
  * @vruntime whenever @vruntime is ahead of it, as a monotone max update.
- * The clock never moves backward. The compare-and-swap stores only when
- * the clock still holds the value the advance read, and the winner of a
- * contended update is the store that lands first, not necessarily the
- * largest one. A losing update can therefore leave the clock behind the
- * true service point by at most the virtual-time spread of the
- * concurrent updates; the placement clamp bounds the error this creates
- * and the next advance heals it. The single-shot compare-and-swap never
- * retries, so the update cost is constant and contention degrades to a
- * stale clock, never to a convoy.
+ * The clock never moves backward. The single compare-and-swap stores
+ * only when the clock still holds the value the advance read, and the
+ * winner of a contended update is the store that lands first, not
+ * necessarily the largest one. A losing update can therefore leave the
+ * clock behind the true service point by at most the virtual-time
+ * spread of the concurrent updates, the placement clamp bounds the
+ * error this creates and the next advance heals it. The single-shot
+ * compare-and-swap never retries, so the update cost is constant and
+ * contention degrades to a stale clock, never to a convoy.
  */
 static __always_inline void mlfq_queue_advance_clock(struct queue_ctx *q,
 						     u64 vruntime)
 {
-	u64 cur = q->clock;
+	u64 cur = mlfq_clock_read(q);
 
 	if (mlfq_time_before(cur, vruntime))
 		__sync_val_compare_and_swap(&q->clock, cur, vruntime);
 }
 
-/*
- * mlfq_update_zero_raw - Advance the zero base by delta.
- * @sum_w: Pointer to the weighted sum, adjusted by -delta * sum_weight.
- * @zero: Pointer to the base, advanced by delta.
- * @sum_weight: Current weight sum.
- * @delta: Signed advance, as s64.
- *
- * Moving the base keeps the relative keys small, which keeps the key
- * times weight products inside s64. The update preserves the average,
- * since the sum is reduced by exactly the base movement times the
- * weight. Pure math for the harness, the BPF side wraps it in atomics.
- */
-static __always_inline void mlfq_update_zero_raw(s64 *sum_w, u64 *zero,
-						 s64 sum_weight, s64 delta)
-{
-	if (!delta)
-		return;
-	*sum_w -= sum_weight * delta;
-	*zero += (u64)delta;
-}
-
-/*
- * mlfq_update_deadline_raw - Refresh a deadline after service.
- * @vruntime: Current vruntime after the charge.
- * @deadline: Pointer to the deadline, updated when expired.
- * @vslice: Virtual slice for one request.
- *
- * When vruntime has reached the deadline, the task consumed its request
- * and the deadline moves to vruntime plus one virtual slice. Otherwise
- * the deadline is unchanged. Pure math, no side effects beyond the
- * deadline store.
- *
- * Gives True when the deadline moved.
- */
-static __always_inline bool mlfq_update_deadline_raw(u64 vruntime, u64 *deadline, u64 vslice)
-{
-	if ((s64)(vruntime - *deadline) < 0)
-		return false;
-	*deadline = vruntime + vslice;
-	if (!*deadline)
-		*deadline = 1;
-	return true;
-}
-
-/*
- * mlfq_avg_queued - Queued-only average from a queue snapshot.
- * @q: The queue.
- *
- * avg = zero + sum_w / sum_weight, with the left bias for eligibility.
- * Stale reads stay monotone, since zero only moves forward and the sums
- * are adjusted with it. An empty queue yields zero, the same idle value
- * the BPF average publishes.
- *
- * Gives The queued-only average.
- */
-static __always_inline u64 mlfq_avg_queued(const struct queue_ctx *q)
-{
-	s64 runtime = q->sum_w_vruntime;
-	s64 weight = q->sum_weight;
-	u64 mag, div;
-	bool neg;
-
-	if (weight <= 0)
-		return q->zero_vruntime;
-	neg = runtime < 0;
-	mag = neg ? (u64)(-runtime) : (u64)runtime;
-	if (neg)
-		mag += (u64)weight - 1;
-	div = mag / (u64)weight;
-	if (neg)
-		return q->zero_vruntime - div;
-	return q->zero_vruntime + div;
-}
-
-/*
- * mlfq_avg_for_place - Placement average, with the running task included.
- * @q: The queue.
- * @curr_vr: Vruntme of the running task on the target CPU, 0 when none.
- * @curr_w: Weight of that task, 0 when none.
- * @curr_valid: True when the running task belongs to @q.
- *
- * The queued sums exclude the running task, but fair.c places against
- * the average including it. The helper folds the running task in
- * without side effects; an empty queue with only the running task
- * yields its vruntime, and no running task yields the queued average.
- *
- * Gives The average vruntime to place against.
- */
-static __always_inline u64 mlfq_avg_for_place(const struct queue_ctx *q,
-					      u64 curr_vr, u32 curr_w,
-					      bool curr_valid)
-{
-	s64 curr_key = 0;
-	u64 w = 0;
-
-	if (!curr_valid || !curr_w)
-		return mlfq_avg_queued(q);
-	curr_key = (s64)(curr_vr - q->zero_vruntime);
-	if (curr_key > (s64)(1LL << 32))
-		curr_key = (s64)(1LL << 32);
-	if (curr_key < -(s64)(1LL << 32))
-		curr_key = -(s64)(1LL << 32);
-	w = mlfq_avg_weight(q, curr_w);
-	return mlfq_avg_from_sums(q->sum_w_vruntime, q->sum_weight,
-				  q->zero_vruntime, curr_key, w);
-}
-
-/*
- * mlfq_place_vruntime_raw - Placement vruntime from an average and lag.
- * @avg: Queue average vruntime.
- * @lag: Inflated signed lag.
- * @is_initial: True for the first ever enqueue.
- *
- * A new task joins at the average with zero lag. Any other task is
- * placed at average minus lag, which preserves positive lag as owed
- * service and negative lag as ahead credit within the clamp.
- *
- * Gives The vruntime to commit.
- */
-static __always_inline u64 mlfq_place_vruntime_raw(u64 avg, s64 lag, bool is_initial)
-{
-	if (is_initial)
-		return avg;
-	return avg - (u64)lag;
-}
-
-/*
- * mlfq_place_entity_deadline_with_curr - Placement deadline with running task.
+/**
+ * mlfq_place_entity_deadline - Compute a placement deadline, read-only.
  * @q: The queue being placed into.
  * @tctx: The task being placed.
- * @curr_vr: Vruntme of the running task on the target CPU, 0 when none.
- * @curr_w: Weight of that task, 0 when none.
- * @curr_valid: True when the running task belongs to @q.
  *
- * The placement formula of mlfq_place_entity() without the commit, but
- * against the average including the running task, the fair.c placement
- * average. The lag is the signed clamp in [-limit, limit] inflated by
- * (W + w) / W, and the deadline is the placed vruntime plus one virtual
- * slice, halved for FIRST_RUN. A task with INITIAL joins at the average.
- * A relative deadline adds vruntime back instead of recomputing the
- * slice. The wakeup preemption decision uses this to compare deadlines
- * before any placement is committed.
+ * The placement formula of mlfq_place_entity() without the commit. The
+ * deadline a placement against @q's virtual clock would produce, computed
+ * from the pre-placement task state. The wakeup-preemption decision uses
+ * it to compare a wakeup's fresh deadline against the resident's before
+ * deciding to preempt; the preempt path inserts into the local DSQ
+ * without placement (the deadline is re-anchored on the next real
+ * placement), so the comparison must not consume the placement.
  *
- * Gives The deadline the placement would commit.
+ * Return: The deadline the placement would commit.
  */
 static __always_inline u64
-mlfq_place_entity_deadline_with_curr(const struct queue_ctx *q,
-				     const struct task_ctx *tctx,
-				     u64 curr_vr, u32 curr_w,
-				     bool curr_valid)
+mlfq_place_entity_deadline(const struct queue_ctx *q,
+			   const struct task_ctx *tctx)
 {
-	u32 w = tctx->weight ? tctx->weight : 1;
-	u64 limit = mlfq_lag_limit(q, w);
-	u64 avg = mlfq_avg_for_place(q, curr_vr, curr_w, curr_valid);
-	u64 w_scaled = mlfq_avg_weight(q, w);
-	u64 vslice, vruntime_new, deadline;
-	s64 lag;
+	u64 w = tctx->weight;
+	u64 limit = mlfq_lag_limit(q, (u32)w);
+	u64 clock = mlfq_clock_read(q);
+	u64 lag, vslice, vruntime_new, deadline;
 
-	if (tctx->flags & MLFQ_TF_INITIAL) {
-		vruntime_new = avg;
-	} else {
-		lag = mlfq_entity_lag_raw(avg, tctx->vruntime, limit);
-		lag = mlfq_inflate_lag(lag, q->sum_weight, w_scaled);
-		/* Reclamp after inflation, the average moved under us. */
-		if (lag > (s64)limit)
-			lag = (s64)limit;
-		if (lag < -(s64)limit)
-			lag = -(s64)limit;
-		vruntime_new = mlfq_place_vruntime_raw(avg, lag, false);
-	}
+	/*
+	 * The lag is measured in the wrapping order of the virtual-time
+	 * clock: a task ahead of the clock sits at it (fair.c
+	 * DELAY_ZERO), a task behind is clamped to the clock minus
+	 * the bound. The wrapping-aware comparison keeps the u64 epoch
+	 * boundary indistinguishable from any other point.
+	 */
+	lag = mlfq_time_before(clock, tctx->vruntime) ? 0 : clock - tctx->vruntime;
+	if (lag > limit)
+		lag = limit;
 
-	if (tctx->flags & MLFQ_TF_REL_DEADLINE) {
-		deadline = vruntime_new + tctx->deadline;
-		if (!deadline)
-			deadline = 1;
-		return deadline;
-	}
+	vruntime_new = clock - lag;
 
-	vslice = calc_delta_fair_bpf(q->max_slice_ns, w);
-	/* New tasks ease into competition with half a slice. */
+	vslice = calc_delta_fair_bpf(q->max_slice_ns, (u32)w);
+	/* fair.c PLACE_DEADLINE_INITIAL: new tasks start with half a slice. */
 	if (tctx->flags & MLFQ_TF_FIRST_RUN)
 		vslice /= 2;
 
 	deadline = vruntime_new + vslice;
 	/*
-	 * A deadline that lands exactly on the wrap point computes to zero,
+	 * A deadline that lands exactly on the wrap point computes to zero;
 	 * zero is the sentinel for a failed placement, so move the wrapped
 	 * deadline to one, which is positionally identical in the wrapping
 	 * order the DSQ rbtree uses.
@@ -1768,223 +1381,79 @@ mlfq_place_entity_deadline_with_curr(const struct queue_ctx *q,
 	return deadline;
 }
 
-/*
- * mlfq_place_entity_deadline - Compute a placement deadline, read-only.
- * @q: The queue being placed into.
- * @tctx: The task being placed.
- *
- * The placement formula of mlfq_place_entity() without the commit. The
- * average comes from the queued sums, the lag is the signed clamp in
- * [-limit, limit] inflated by (W + w) / W, and the deadline is the
- * placed vruntime plus one virtual slice, halved for FIRST_RUN. A task
- * with INITIAL joins at the average. A relative deadline adds vruntime
- * back instead of recomputing the slice. The wakeup preemption decision
- * uses this to compare deadlines before any placement is committed.
- *
- * Gives The deadline the placement would commit.
- */
-static __always_inline u64
-mlfq_place_entity_deadline(const struct queue_ctx *q,
-			   const struct task_ctx *tctx)
-{
-	return mlfq_place_entity_deadline_with_curr(q, tctx, 0, 0, false);
-}
-
-/*
- * mlfq_place_entity_with_curr - Place with the running task included.
- * @q: The queue being placed into.
- * @tctx: The task being placed.
- * @curr_vr: Vruntme of the running task on the target CPU, 0 when none.
- * @curr_w: Weight of that task, 0 when none.
- * @curr_valid: True when the running task belongs to @q.
- *
- * Same as mlfq_place_entity() but against the average including the
- * running task, the fair.c placement average. The caller passes the
- * target CPU's running task when its queue matches, otherwise no curr.
- *
- * Gives The placement deadline, also stored in tctx->deadline.
- */
-static __always_inline u64 mlfq_place_entity_with_curr(struct queue_ctx *q,
-						       struct task_ctx *tctx,
-						       u64 curr_vr, u32 curr_w,
-						       bool curr_valid)
-{
-	u32 w = tctx->weight ? tctx->weight : 1;
-	u64 limit = mlfq_lag_limit(q, w);
-	u64 avg = mlfq_avg_for_place(q, curr_vr, curr_w, curr_valid);
-	u64 w_scaled = mlfq_avg_weight(q, w);
-	u64 vslice, vruntime_new, deadline;
-	s64 lag;
-
-	if (tctx->flags & MLFQ_TF_INITIAL) {
-		vruntime_new = avg;
-		lag = 0;
-	} else {
-		lag = mlfq_entity_lag_raw(avg, tctx->vruntime, limit);
-		lag = mlfq_inflate_lag(lag, q->sum_weight, w_scaled);
-		/* Reclamp after inflation, the average moved under us. */
-		if (lag > (s64)limit)
-			lag = (s64)limit;
-		if (lag < -(s64)limit)
-			lag = -(s64)limit;
-		vruntime_new = mlfq_place_vruntime_raw(avg, lag, false);
-	}
-
-	if (tctx->flags & MLFQ_TF_REL_DEADLINE) {
-		deadline = vruntime_new + tctx->deadline;
-		if (!deadline)
-			deadline = 1;
-	} else {
-		vslice = calc_delta_fair_bpf(q->max_slice_ns, w);
-		/* New tasks ease into competition with half a slice. */
-		if (tctx->flags & MLFQ_TF_FIRST_RUN)
-			vslice /= 2;
-		deadline = vruntime_new + vslice;
-		/*
-		 * A deadline that lands exactly on the wrap point computes
-		 * to zero, zero is the sentinel for a failed placement, so
-		 * move the wrapped deadline to one, which is positionally
-		 * identical in the wrapping order the DSQ rbtree uses.
-		 */
-		if (!deadline)
-			deadline = 1;
-	}
-
-	tctx->vruntime = vruntime_new;
-	tctx->vlag = lag;
-	tctx->deadline = deadline;
-	tctx->flags &= ~(MLFQ_TF_INITIAL | MLFQ_TF_REL_DEADLINE);
-
-	return deadline;
-}
-
-/*
+/**
  * mlfq_place_entity - Place a task on the virtual-time timeline.
  * @q: The queue being placed into.
  * @tctx: The task being placed.
  *
- * EEVDF placement against the queue average is this.
+ * EEVDF placement against the queue's virtual clock is this.
  *
- *   avg          = zero + sum_w / sum_weight
  *   limit        = calc_delta_fair(max_slice + TICK, weight)
- *   lag          = clamp(avg - vruntime, -limit, limit)
- *   lag          = lag * (W + w) / W
- *   vruntime_new = avg - lag (or avg when INITIAL)
+ *   lag          = clamp(clock - vruntime, 0, limit)
+ *   vruntime_new = clock - lag       (== clamp(vruntime, clock - limit, clock))
  *   vslice       = calc_delta_fair(slice_q, weight)
  *   if (FIRST_RUN) vslice /= 2
- *   if (REL_DEADLINE) deadline = vruntime_new + rel
- *   else deadline = vruntime_new + vslice
+ *   deadline     = vruntime_new + vslice
  *
- * A task behind the average keeps owed lag within one bound, a task
- * ahead keeps negative lag within one bound, and a new task joins at
- * zero lag. The inflation preserves lag across the join, the heavy
- * task zero update is done by the caller, and eligibility is tested at
- * dispatch, so min deadline selection over eligible tasks is EEVDF.
+ * A task that has fallen behind the service point is re-anchored within
+ * one lag limit of the clock, the bounded-lag property of fair.c
+ * entity_lag(); a task that is ahead of the clock is placed at the
+ * clock itself, the fair.c DELAY_ZERO semantics that do not carry
+ * leading credit. The stored lag is therefore bounded in [0, limit],
+ * and every queued task is eligible, so min-deadline
+ * selection over the queue DSQs is EEVDF selection over the queued set.
  *
- * Updates tctx->vruntime, tctx->vlag in [-limit, limit] and
- * tctx->deadline. Clears INITIAL and REL_DEADLINE on commit.
+ * Updates tctx->vruntime, tctx->vlag (>= 0) and tctx->deadline.
  *
- * Gives The placement deadline, also stored in tctx->deadline.
+ * Return: The placement deadline, also stored in tctx->deadline.
  */
-/* Placement keeps lag within one bound. */
-static __always_inline u64 mlfq_place_entity(struct queue_ctx *q,
+static __always_inline u64 mlfq_place_entity(const struct queue_ctx *q,
 					     struct task_ctx *tctx)
 {
-	return mlfq_place_entity_with_curr(q, tctx, 0, 0, false);
+	u64 w = tctx->weight;
+	u64 limit = mlfq_lag_limit(q, (u32)w);
+	u64 clock = mlfq_clock_read(q);
+	u64 lag, vruntime_new, deadline;
+
+	/*
+	 * The commit of the mlfq_place_entity_deadline() formula: the
+	 * deadline is computed first from the pre-placement state, then
+	 * the clamped lag and its vruntime are committed.
+	 */
+	deadline = mlfq_place_entity_deadline(q, tctx);
+
+	lag = mlfq_time_before(clock, tctx->vruntime) ? 0 : clock - tctx->vruntime;
+	if (lag > limit)
+		lag = limit;
+	vruntime_new = clock - lag;
+
+	tctx->vruntime = vruntime_new;
+	tctx->vlag = (s64)lag;
+	tctx->deadline = deadline;
+
+	return deadline;
 }
 
-/*
- * mlfq_eevdf_weight - EEVDF weight mapping for classification output.
- * @weight: Cached scx weight.
- *
- * The classifier works in scx weight scale, while the virtual time math
- * needs a non-zero weight. The mapping clamps to [1, 10000] and guards
- * zero, so a corrupted cache never divides by zero. Classification is
- * otherwise unchanged.
- *
- * Gives The weight the virtual time math must use.
- */
-static __always_inline u32 mlfq_eevdf_weight(u32 weight)
-{
-	if (!weight)
-		return 1;
-	if (weight > 10000)
-		return 10000;
-	return weight;
-}
-
-/*
- * mlfq_clamp_qid - Clamp a queue id to the valid range.
- * @qid The queue id to check.
- *
- * An out of range id would alias another queue. Clamp to queue 2,
- * the neutral queue.
- *
- * Gives The queue id when 1 to 3, 2 otherwise.
- */
-static __always_inline u8 mlfq_clamp_qid(u32 qid)
-{
-	if (qid < 1U)
-		return 2;
-	if (qid > 3U)
-		return 2;
-	return (u8)qid;
-}
-
-/*
- * mlfq_sums_present - Whether the task holds a sums entry.
+/**
+ * mlfq_task_eligible - Advisory eligibility test for a placed task.
  * @tctx: The task.
  *
- * Gives True when the task joined the sums and has not left.
+ * A placed task carries its lag in [0, limit], so every queued task is
+ * eligible and min-deadline selection over the queue DSQs is EEVDF
+ * selection over the queued set, the fair.c pick_eevdf() order. The
+ * test is advisory-only: it never blocks service, and the fallback is
+ * the min-deadline head, so an ineligible head is skipped at most once
+ * before the fallback serves it. The dispatch keeps the within-queue
+ * order, the quotas and the LLC tiers unchanged under the test.
+ *
+ * Return: True when the task is eligible for service.
  */
-static __always_inline bool mlfq_sums_present(const struct task_ctx *tctx)
+static __always_inline bool mlfq_task_eligible(const struct task_ctx *tctx)
 {
-	return (tctx->flags & MLFQ_TF_IN_SUMS) != 0;
+	return tctx->vlag >= 0;
 }
 
-/*
- * mlfq_sums_qid - Queue the task's sums entry belongs to.
- * @tctx: The task.
- *
- * Decodes bits 6-7 as qid - 1. The value 4 never stores (only 0..2
- * for qid 1..3) and marks a corrupted entry the caller must not use.
- *
- * Gives The stored queue id in 1..4, 4 when corrupted.
- */
-static __always_inline u8 mlfq_sums_qid(const struct task_ctx *tctx)
-{
-	return (u8)(((tctx->flags >> MLFQ_SUM_QID_SHIFT) & 0x3U) + 1);
-}
-
-/*
- * mlfq_sums_set - Record a sums join.
- * @tctx: The task.
- * @qid: Queue joined, clamped to 1..3.
- *
- * Encodes qid - 1 in bits 6-7 and sets IN_SUMS. The task size is
- * unchanged.
- */
-static __always_inline void mlfq_sums_set(struct task_ctx *tctx, u8 qid)
-{
-	u8 c = mlfq_clamp_qid(qid);
-
-	tctx->flags = (u8)((tctx->flags & (u8)~(MLFQ_TF_IN_SUMS | MLFQ_SUM_QID_MASK)) |
-			  MLFQ_TF_IN_SUMS | (((c - 1) & 0x3U) << MLFQ_SUM_QID_SHIFT));
-}
-
-/*
- * mlfq_sums_clear - Record a sums leave.
- * @tctx: The task.
- *
- * Clears IN_SUMS and keeps the queue bits for debugging. A second
- * leave stays a no-op through mlfq_sums_present().
- */
-static __always_inline void mlfq_sums_clear(struct task_ctx *tctx)
-{
-	tctx->flags &= (u8)~MLFQ_TF_IN_SUMS;
-}
-
-/*
+/**
  * mlfq_sameq_preempt_owed - Same-queue wakeup preemption test.
  * @qid: Queue of the wakeup (equal to @running_queue at the call site).
  * @running_queue: Queue of the task running on the wakeup's previous CPU.
@@ -2016,7 +1485,7 @@ static __always_inline void mlfq_sums_clear(struct task_ctx *tctx)
  * elapsed time falls back to zero (which is conservative only when the
  * guard is non-zero).
  *
- * Gives true when the resident owes the wakeup its CPU.
+ * Return: true when the resident owes the wakeup its CPU.
  */
 static __always_inline bool mlfq_sameq_preempt_owed(u8 qid, u8 running_queue,
 						    u64 wakee_deadline,
@@ -2041,7 +1510,7 @@ static __always_inline bool mlfq_sameq_preempt_owed(u8 qid, u8 running_queue,
 	return mlfq_time_before(wakee_deadline, running_deadline);
 }
 
-/*
+/**
  * mlfq_ema_climb - Advance the EMA gauge for a run segment.
  * @ema: Current gauge value.
  * @delta: Physical run time in nsecs.
@@ -2057,7 +1526,7 @@ static __always_inline bool mlfq_sameq_preempt_owed(u8 qid, u8 running_queue,
  * so a CPU-bound task converges to budget_max. The rate is 1/tau_climb
  * with tau_climb = budget_max * FP_ONE / alpha. alpha is fixed.
  *
- * Gives The updated gauge.
+ * Return: The updated gauge.
  */
 static __always_inline u64 mlfq_ema_climb(u64 ema, u64 delta, u64 budget_max,
 					  u64 alpha)
@@ -2076,7 +1545,7 @@ static __always_inline u64 mlfq_ema_climb(u64 ema, u64 delta, u64 budget_max,
 	return ema + step;
 }
 
-/*
+/**
  * mlfq_ema_decay - Decay the EMA gauge for a sleep.
  * @ema: Current gauge value.
  * @sleep_ns: Physical sleep time in nsecs.
@@ -2088,7 +1557,7 @@ static __always_inline u64 mlfq_ema_climb(u64 ema, u64 delta, u64 budget_max,
  * (relative error < 10% for x in [0,1)). The gauge is zeroed at or beyond
  * 64 half-lives.
  *
- * Gives The updated gauge.
+ * Return: The updated gauge.
  */
 static __always_inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
 {
@@ -2110,7 +1579,7 @@ static __always_inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
 	return decayed * factor_fp / FP_ONE;
 }
 
-/*
+/**
  * mlfq_sys_lat_fold - Fold the accumulated wakeup waits into the gauge.
  * @lat_ema: The gauge, average wakeup latency in nsecs.
  * @wait_total: Sum of the episode waits since the last fold.
@@ -2136,7 +1605,7 @@ static __always_inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
  * caller resets the totals at every fold) and wait_total by the
  * count times max_ns, both far inside u64.
  *
- * Gives The updated gauge.
+ * Return: The updated gauge.
  */
 static __always_inline u64 mlfq_sys_lat_fold(u64 lat_ema, u64 wait_total,
 					     u64 wait_count, u64 elapsed,
@@ -2157,7 +1626,7 @@ static __always_inline u64 mlfq_sys_lat_fold(u64 lat_ema, u64 wait_total,
 	return v > max_ns ? max_ns : v;
 }
 
-/*
+/**
  * mlfq_sys_rate_step - Fold the wakeup-rate EMA at an adaptation step.
  * @rate_ema: The rate gauge, FP_SHIFT fixed point.
  * @wakeup_cnt: Wakeup arrivals since the last fold.
@@ -2181,7 +1650,7 @@ static __always_inline u64 mlfq_sys_lat_fold(u64 lat_ema, u64 wait_total,
  * fixed-point EMA operands are at most 1e6 << 8 ~= 2.6e8 and the
  * products at most ~6.6e10, far inside u64.
  *
- * Gives The updated gauge.
+ * Return: The updated gauge.
  */
 static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
 					      u64 elapsed)
@@ -2205,7 +1674,7 @@ static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
 	return rate_ema;
 }
 
-/*
+/**
  * mlfq_adapt_shift_target - Shift target from the latency and rate gauges.
  * @lat_ema: The wakeup-latency gauge, nsecs.
  * @rate_ema: The wakeup-rate gauge, FP_SHIFT fixed point.
@@ -2226,7 +1695,7 @@ static __always_inline u64 mlfq_sys_rate_step(u64 rate_ema, u32 wakeup_cnt,
  * is at most ~1.9e9, inside u64; the division brings the target well
  * below the clamp range before the clamp applies.
  *
- * Gives The slew target, FP_SHIFT fixed point, in
+ * Return: The slew target, FP_SHIFT fixed point, in
  * [0, +MLFQ_ADAPT_MAX_SHIFT].
  */
 static __always_inline s64 mlfq_adapt_shift_target(u64 lat_ema, u64 rate_ema)
@@ -2252,7 +1721,7 @@ static __always_inline s64 mlfq_adapt_shift_target(u64 lat_ema, u64 rate_ema)
 	return target;
 }
 
-/*
+/**
  * mlfq_adapt_slew - Slew-limited shift update.
  * @prev: The current shift, FP_SHIFT fixed point.
  * @target: The gauge-derived shift target.
@@ -2264,7 +1733,7 @@ static __always_inline s64 mlfq_adapt_shift_target(u64 lat_ema, u64 rate_ema)
  * steps. The difference is bounded by twice the shift range, so the
  * arithmetic cannot overflow.
  *
- * Gives The updated shift.
+ * Return: The updated shift.
  */
 static __always_inline s64 mlfq_adapt_slew(s64 prev, s64 target)
 {
@@ -2277,7 +1746,7 @@ static __always_inline s64 mlfq_adapt_slew(s64 prev, s64 target)
 	return prev + step;
 }
 
-/*
+/**
  * mlfq_adapt_band - Effective band edge from the base and the shift.
  * @base: The base (rodata) band edge, nsecs.
  * @shift_fp: The current shift, FP_SHIFT fixed point.
@@ -2294,7 +1763,7 @@ static __always_inline s64 mlfq_adapt_slew(s64 prev, s64 target)
  * Overflow: the largest base is below 6 ms and the shift range is
  * +-128, so the product is at most ~7.7e8, inside s64.
  *
- * Gives The effective band edge, clamped to [@floor, @ceil].
+ * Return: The effective band edge, clamped to [@floor, @ceil].
  */
 static __always_inline u64 mlfq_adapt_band(u64 base, s64 shift_fp,
 					   u64 floor, u64 ceil)
@@ -2322,7 +1791,7 @@ static __always_inline u64 mlfq_adapt_band(u64 base, s64 shift_fp,
 	return (u64)v;
 }
 
-/*
+/**
  * mlfq_queue_from_ema - Base queue mapping from the EMA gauge.
  * @ema: The gauge value.
  * @t_l: Interactive threshold (MLFQ_T_L_NS).
@@ -2330,7 +1799,7 @@ static __always_inline u64 mlfq_adapt_band(u64 base, s64 shift_fp,
  *
  * The base mapping is ema <= T_L -> Q1, ema >= T_H -> Q3, else Q2.
  *
- * Gives 1, 2 or 3.
+ * Return: 1, 2 or 3.
  */
 static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
 {
@@ -2341,7 +1810,7 @@ static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
 	return 2;
 }
 
-/*
+/**
  * mlfq_promote_on_wakeup - Wakeup promotion state machine.
  * @tctx: The task.
  * @sleep_ns: Sleep duration at wakeup.
@@ -2354,7 +1823,7 @@ static __always_inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
  * wake_cnt is reset on a long sleep. reenq_cnt is left for the caller to
  * clear on the wakeup path.
  *
- * Gives true if the task was promoted.
+ * Return: true if the task was promoted.
  */
 static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
 						   u64 sleep_ns,
@@ -2382,7 +1851,7 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
 	return promoted;
 }
 
-/*
+/**
  * mlfq_demote_on_reenq - Slice-exhaustion demotion state machine.
  * @tctx: The task.
  * @t_h: CPU-bound threshold (the effective EMA Q2/Q3 edge).
@@ -2408,7 +1877,7 @@ static __always_inline bool mlfq_promote_on_wakeup(struct task_ctx *tctx,
  * burst. An impostor that never sleeps accumulates the counter and is
  * demoted after the same sustained window.
  *
- * Gives true if the task was demoted.
+ * Return: true if the task was demoted.
  */
 static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
 						 u64 t_h, u64 t_bound,
@@ -2432,7 +1901,7 @@ static __always_inline bool mlfq_demote_on_reenq(struct task_ctx *tctx,
 	return demoted;
 }
 
-/*
+/**
  * mlfq_reset_classification - Fork/exec classification reset.
  * @tctx: The task.
  *
@@ -2449,8 +1918,8 @@ static __always_inline void mlfq_reset_classification(struct task_ctx *tctx)
 
 #if MLFQ_CHECK
 /*
- * Rule predicates. Compiled only under MLFQ_CHECK; the
- * BPF side reports violations via scx_bpf_error() at the base points.
+ * Invariant predicates. Compiled only under MLFQ_CHECK; the
+ * BPF side reports violations via scx_bpf_error() at the natural points.
  */
 
 static __always_inline bool mlfq_check_ema_bounds(u64 ema, u64 budget_max)
@@ -2468,11 +1937,9 @@ static __always_inline bool mlfq_check_weight(u32 weight)
 	return weight >= 1;
 }
 
-static __always_inline bool mlfq_check_queued_vlag(s64 vlag, u64 limit)
+static __always_inline bool mlfq_check_queued_vlag(s64 vlag)
 {
-	s64 bound = (s64)limit;
-
-	return vlag >= -bound && vlag <= bound;
+	return vlag >= 0;
 }
 
 static __always_inline bool mlfq_check_tree_node_index(u32 idx)
@@ -2483,8 +1950,8 @@ static __always_inline bool mlfq_check_tree_node_index(u32 idx)
 static __always_inline bool mlfq_check_tree_feature(u8 feature)
 {
 	/*
-	 * Fact. the split feature must be within the populated ABI.
-	 * Steps. 1.3.11 ABI populates nine split features (0..8:
+	 * Theorem: the split feature must be within the populated ABI.
+	 * Derivation: 1.3.12 ABI populates nine split features (0..8:
 	 * prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
 	 * queue_wait, sq_ema, gpu_submit). The fitter caps splits to
 	 * [0, MLFQ_TREE_NR_FEATURES), and sleep_var_ratio at id 9 is
@@ -2492,11 +1959,11 @@ static __always_inline bool mlfq_check_tree_feature(u8 feature)
 	 * feat[16] holds it at 9 with 10..15 zeroed, &0xF keeps 0..15
 	 * in bounds). The bound check is unconditional, so feature 9..15
 	 * never indexes OOB even with MLFQ_CHECK=0, and serialize_validate
-	 * is extra check.
-	 * Bound. plain < bound is authoritative, not masked tautology.
+	 * is defense in depth.
+	 * Why clamp: plain < bound is authoritative, not masked tautology.
 	 *
-	 * path helper: the walk observes the feature vector
-	 * (path pattern without indirect) via this predicate.
+	 * Strategy helper: the walk observes the feature vector
+	 * (Strategy pattern without vtable) via this predicate.
 	 */
 	return feature < MLFQ_TREE_NR_FEATURES;
 }
@@ -2518,30 +1985,30 @@ static __always_inline bool mlfq_check_bands(u64 t_l, u64 t_h,
 }
 #endif /* MLFQ_CHECK */
 
-/*
+/**
  * mlfq_tree_walk - Walk a tree buffer and predict the next CPU burst.
  * @store: The tree buffer (one entry of mlfq_tree_map).
  * @f: The feature vector.
  *
- * Fact. the walk is a bounded, masked descent over the 9-feature
+ * Theorem: the walk is a bounded, masked descent over the 9-feature
  * tree (prev_burst, sleep, ema, io_wait, wake_cnt, wake_lat,
- * queue_wait, sq_ema, gpu_submit). Rule. depth <= MLFQ_TREE_MAX_DEPTH.
+ * queue_wait, sq_ema, gpu_submit). Invariant: depth <= MLFQ_TREE_MAX_DEPTH.
  *
- * Steps. every index is masked to the node budget
+ * Derivation: every index is masked to the node budget
  * (MLFQ_TREE_MAX_NODES - 1), so a corrupted tree can never address
  * outside the buffer. feat[16] holds nine split features 0..8 plus
  * sleep_var_ratio carry-along at 9 and 10..15 zeroed; Rust mirrors
  * feat[16]. An out-of-range feature (>=9) is rejected unconditionally
- * before dereference, so serialize_validate is extra check and
+ * before dereference, so serialize_validate is defense in depth and
  * MLFQ_CHECK=0 cannot compile out the bound. Walk past tail lands on
- * zeroed node predicting 0. The walk is the path observed via the
- * feature vector (reader) without a indirect.
+ * zeroed node predicting 0. The walk is the Strategy observed via the
+ * feature vector (Observer) without a vtable.
  *
- * Bound. the 30 s watchdog bounds the dispatch stall, and the
+ * Why clamp: the 30 s watchdog bounds the dispatch stall, and the
  * 16 ms label clamp bounds the f64 sums; the unconditional feat bound
  * prevents OOB reads even when MLFQ_CHECK=0.
  *
- * Gives The predicted burst in nsecs.
+ * Return: The predicted burst in nsecs.
  */
 static __always_inline u64
 mlfq_tree_walk(const struct mlfq_tree_store *store,
@@ -2594,7 +2061,7 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
 	return n->right == 0 ? n->left : 0;
 }
 
-/*
+/**
  * mlfq_tree_map_queue - Promotion-only queue mapping of a prediction.
  * @pred: The predicted next burst, 0 while untrained.
  * @cur: The task's current queue (1..3).
@@ -2606,10 +2073,10 @@ mlfq_tree_walk(const struct mlfq_tree_store *store,
  * Q3-band or untrained prediction leaves the queue unchanged. Demotions
  * are the run-out gate's job (mlfq_demote_on_reenq), so a single wakeup
  * prediction can never demote a task and bypass the exhaustion
- * hysteresis, the plain MLFQ gap where the wakeup only
+ * hysteresis, the classic MLFQ asymmetry where the wakeup only
  * promotes and the run-out only demotes.
  *
- * Gives The new queue.
+ * Return: The new queue.
  */
 static __always_inline u8 mlfq_tree_map_queue(u64 pred, u8 cur,
 					      u64 t_int, u64 t_bound)
@@ -2685,14 +2152,14 @@ struct mlfq_wakeup_stats_map {
 
 extern struct mlfq_wakeup_stats_map mlfq_wakeup_stats;
 
-/*
+/**
  * mlfq_op_lat_bucket - Histogram bucket covering an elapsed time.
  * @delta_us: Elapsed microseconds.
  *
  * The eight buckets delimit [0, 2) [2, 5) [5, 10) [10, 20) [20, 50)
  * [50, 100) [100, 250) [250, inf) microseconds.
  *
- * Gives The bucket index in [0, MLFQ_OP_LAT_BUCKETS).
+ * Return: The bucket index in [0, MLFQ_OP_LAT_BUCKETS).
  */
 static __always_inline u32 mlfq_op_lat_bucket(u64 delta_us)
 {
@@ -2713,7 +2180,7 @@ static __always_inline u32 mlfq_op_lat_bucket(u64 delta_us)
 	return 7;
 }
 
-/*
+/**
  * mlfq_op_lat_charge - Charge one op into its latency histogram.
  * @op: The MLFQ_OP_LAT_* slot.
  * @start_ns: scx_bpf_now() captured at the op entry.
@@ -2739,7 +2206,7 @@ static __always_inline void mlfq_op_lat_charge(u32 op, u64 start_ns)
 	lat->buckets[mlfq_op_lat_bucket(delta_us)]++;
 }
 
-/*
+/**
  * mlfq_tree_predict - Predict the next CPU burst from a feature vector.
  * @f: The feature vector.
  *
@@ -2750,7 +2217,7 @@ static __always_inline void mlfq_op_lat_charge(u32 op, u64 start_ns)
  * written one (the daemon writes the inactive entry first and commits
  * the meta last).
  *
- * Gives The predicted burst in nsecs. 0 while untrained or on a
+ * Return: The predicted burst in nsecs. 0 while untrained or on a
  * failed map lookup.
  */
 static __always_inline u64 mlfq_tree_predict(const struct mlfq_tree_feats *f)
@@ -2778,21 +2245,19 @@ static __always_inline u64 mlfq_tree_predict(const struct mlfq_tree_feats *f)
  * the BPF-only guard above, so the accounting helpers below can
  * reference them in every build. The BPF build links them against the
  * bss block, and the native harness supplies its own shadow storage.
- * The queue gauges are three separate counters, one per queue, so the
- * update path needs no array index and no range proof.
  */
 extern volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
-extern volatile u32 mlfq_queue_runnable_q1;
-extern volatile u32 mlfq_queue_runnable_q2;
-extern volatile u32 mlfq_queue_runnable_q3;
+extern volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
 
-/*
+/**
  * mlfq_llc_add - One atomic step on the per-LLC runnable gauge.
- * @llc The LLC domain id.
- * @delta Plus one to count, minus one to uncount.
+ * @llc: The LLC domain id.
+ * @delta: +1 to count, -1 to un-count.
  *
- * The index is checked against the hard array bound. An out of range
- * id is a no-op.
+ * The index is validated against the hard array bound; an out-of-range
+ * id (the MLFQ_MAX_LLCS sentinel the call sites pass for an unpopulated
+ * domain) is a no-op. The gauge is advisory, so a lost update under
+ * contention is absorbed by the next RMW.
  */
 static __always_inline void mlfq_llc_add(u32 llc, s64 delta)
 {
@@ -2804,28 +2269,25 @@ static __always_inline void mlfq_llc_add(u32 llc, s64 delta)
 		__sync_fetch_and_sub(&mlfq_llc_runnable[llc], (u32)(-delta));
 }
 
-/*
+/**
  * mlfq_queue_add - One atomic step on the per-queue runnable gauge.
- * @qid The queue id, 1 to 3.
- * @delta Plus one to count, minus one to uncount.
+ * @qid: The queue id (1..3; index 0 is unused).
+ * @delta: +1 to count, -1 to un-count.
  *
- * Each queue has its own counter, so the update is a plain branch
- * with no array index. The signed step adds modulo 2^32, so minus
- * one wraps the same as a subtract. An out of range id is a no-op.
+ * The index is validated against the queue range; an out-of-range id is
+ * a no-op (defense in depth on top of the classification range checks).
  */
 static __always_inline void mlfq_queue_add(u32 qid, s64 delta)
 {
-	u32 step = (u32)delta;
-
-	if (qid == 1)
-		__sync_fetch_and_add(&mlfq_queue_runnable_q1, step);
-	else if (qid == 2)
-		__sync_fetch_and_add(&mlfq_queue_runnable_q2, step);
-	else if (qid == 3)
-		__sync_fetch_and_add(&mlfq_queue_runnable_q3, step);
+	if (qid < 1 || qid > MLFQ_NR_QUEUES)
+		return;
+	if (delta > 0)
+		__sync_fetch_and_add(&mlfq_queue_runnable[qid], (u32)delta);
+	else
+		__sync_fetch_and_sub(&mlfq_queue_runnable[qid], (u32)(-delta));
 }
 
-/*
+/**
  * mlfq_runnable_enter - Count a task's LLC/queue ownership at an insert.
  * @tctx: The task being placed.
  * @qid: The queue it is placed into (1..3).
@@ -2853,7 +2315,6 @@ static __always_inline void mlfq_runnable_enter(struct task_ctx *tctx,
 	 */
 	if (llc >= MLFQ_MAX_LLCS)
 		return;
-	qid = mlfq_clamp_qid(qid);
 
 	if (tctx->last_llc == MLFQ_LLC_UNOWNED) {
 		mlfq_llc_add(llc, 1);
@@ -2876,7 +2337,7 @@ static __always_inline void mlfq_runnable_enter(struct task_ctx *tctx,
 	}
 }
 
-/*
+/**
  * mlfq_runnable_exit - Release a task's LLC/queue ownership.
  * @tctx: The task leaving the runnable set (or leaving LLC ownership).
  *
@@ -2896,12 +2357,12 @@ static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
 	tctx->last_qid = 0;
 }
 
-/*
+/**
  * mlfq_steer_pick_llc - Least-loaded eligible LLC selection.
  * @runnable: Per-LLC runnable gauge (advisory, stale-tolerant).
  * @idle: Per-LLC idle-CPU gate. A zero entry excludes the domain.
  * @nr_llcs: Number of populated LLC domains; domains at or above it are
- *	excluded (extra check on top of the idle gate, which already
+ *	excluded (defense in depth on top of the idle gate, which already
  *	keeps the unpopulated-domain gauges at zero).
  * @waker_llc: The waker's own domain, always excluded.
  * @visited: Bitmask of domains already tried by earlier selection passes
@@ -2926,7 +2387,7 @@ static __always_inline void mlfq_runnable_exit(struct task_ctx *tctx)
  * instead of re-walking a plain loop until its states converge; the
  * native harness drives the same code through the fallback macro above.
  *
- * Gives The chosen domain id, or MLFQ_MAX_LLCS when no domain is
+ * Return: The chosen domain id, or MLFQ_MAX_LLCS when no domain is
  * eligible.
  */
 static __always_inline u32

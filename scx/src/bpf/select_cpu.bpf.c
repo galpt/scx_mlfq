@@ -82,6 +82,8 @@ static __always_inline s32 mlfq_pick_idle_in_bitmap(void *map, u32 key,
 		bpf_for(bit, 0, 64) {
 			u32 cand = word * 64 + bit;
 
+			if (cand >= MLFQ_MAX_CPUS)
+				break;
 			if (!mlfq_bitmap_test_cpu(bm, cand))
 				continue;
 			if (!bpf_cpumask_test_cpu(cand, p->cpus_ptr))
@@ -127,7 +129,7 @@ mlfq_pick_idle_primary(const struct task_struct *p,
  * selection, so the boost mirror above is the only pre-classification
  * interactivity signal.
  *
- * Gives true if the wakeup is or will become interactive.
+ * Return: true if the wakeup is or will become interactive.
  */
 static __always_inline bool
 mlfq_interactive_on_wakeup(const struct task_struct *p,
@@ -146,9 +148,14 @@ mlfq_interactive_on_wakeup(const struct task_struct *p,
 }
 
 /*
- * Q3 CPU check. Takes a candidate CPU and a task.
- * Checks affinity first, then the RT occupied flag,
- * then the SMT sibling Q1 state when strict.
+ * is_cpu_available_for_q3 - Strategy veto for Q3 placement.
+ * @cpu: Candidate CPU.
+ * @p: Task.
+ * @strict_smt: When true, SMT sibling Q1 busy is a soft veto; when false, relaxed.
+ *
+ * Evaluation order: affinity → RT hard gate (MLFQ_RTDL_OCCUPIED, never
+ * relaxed) → SMT soft veto (logical sibling, is_smt_sibling_q1_busy).
+ * Returns true if CPU passes all enabled gates.
  */
 static __always_inline bool is_cpu_available_for_q3(s32 cpu,
 						    const struct task_struct *p,
@@ -184,26 +191,38 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!tctx)
 		return prev_cpu;
 
-	/* Sync handoff for Q1 and Q2, checks affinity and RT first. */
-	if ((wake_flags & SCX_WAKE_SYNC) || (tctx->flags & MLFQ_TF_DRM_WAKE)) {
-		if (tctx->queue <= 2) {
-			struct task_struct *cur = bpf_get_current_task_btf();
+	/* SCX_WAKE_SYNC fast-path: synchronous waker handoff for Q1/Q2.
+	 * Strategy: when wake_flags carries SCX_WAKE_SYNC or the task
+	 * carries MLFQ_TF_DRM_WAKE and the wakee is Q1/Q2, keep cache hot
+	 * by staying on waker's CPU. Affinity is checked, RT hard gate
+	 * (mlfq_cpu_occupied) is never relaxed and strands Q1/Q2 behind
+	 * an RT-occupied LOCAL until rtdl drain; RT-occupied waker CPU
+	 * falls through to regular placement. SMT sibling veto is
+	 * intentionally bypassed for this handoff (cache-hot policy,
+	 * zero-knob). Null cur (bpf_get_current_task_btf failed) also
+	 * falls through. The insert uses SCX_DSQ_LOCAL + SCX_ENQ_IMMED
+	 * (never SCX_ENQ_HEAD) as the zero-knob policy and the queue's
+	 * own slice (Q1 1ms, Q2 2ms) to match enqueue's per-queue slice,
+	 * not SCX_SLICE_DFL (20ms), so the dispatch slice accounting stays
+	 * consistent. MLFQ_TF_DRM_WAKE is cleared after the insert, no
+	 * new branch depth, no new loop.
+	 */
+	if (((wake_flags & SCX_WAKE_SYNC) || (tctx->flags & MLFQ_TF_DRM_WAKE)) && tctx->queue <= 2) {
+		struct task_struct *cur = bpf_get_current_task_btf();
 
-			if (cur) {
-				s32 cur_cpu = scx_bpf_task_cpu(cur);
+		if (cur) {
+			s32 cur_cpu = scx_bpf_task_cpu(cur);
 
-				if (cur_cpu >= 0 && cur_cpu < (s32)MLFQ_MAX_CPUS &&
-				    !mlfq_cpu_occupied(cur_cpu) &&
-				    bpf_cpumask_test_cpu((u32)cur_cpu, p->cpus_ptr)) {
-					u64 slice = tctx->queue == 1 ?
-						    MLFQ_Q1_SLICE_NS : MLFQ_Q2_SLICE_NS;
+			if (cur_cpu >= 0 && cur_cpu < (s32)MLFQ_MAX_CPUS &&
+			    !mlfq_cpu_occupied(cur_cpu) &&
+			    bpf_cpumask_test_cpu((u32)cur_cpu, p->cpus_ptr)) {
+				u64 slice = tctx->queue == 1 ?
+					    MLFQ_Q1_SLICE_NS : MLFQ_Q2_SLICE_NS;
 
-					scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
-							   SCX_ENQ_IMMED);
-					tctx->flags &= ~MLFQ_TF_DRM_WAKE;
-					tctx->wake_cpu_state = 0;
-					return cur_cpu;
-				}
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice,
+						   SCX_ENQ_IMMED);
+				tctx->flags &= ~MLFQ_TF_DRM_WAKE;
+				return cur_cpu;
 			}
 		}
 		tctx->flags &= ~MLFQ_TF_DRM_WAKE;
@@ -246,33 +265,6 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 */
 	now = scx_bpf_now();
 	interactive = mlfq_interactive_on_wakeup(p, tctx, now);
-
-	/*
-	 * Deadline first. When the wakeup shares the resident queue on its
-	 * previous CPU and its fresh deadline is earlier, it is owed the CPU
-	 * regardless of cache warmth. Returning prev_cpu lets the enqueue
-	 * preemption path claim it. Otherwise the cache steps below are only
-	 * tiebreakers among idle CPUs. Cross queue deadlines are not compared,
-	 * since each queue has its own average and slice.
-	 */
-	{
-		struct mlfq_cpu_state *prev_state = mlfq_lookup_cpu_state(prev_cpu);
-		u8 cqid = mlfq_clamp_qid(tctx->queue);
-		struct queue_ctx *dq = mlfq_lookup_queue(cqid);
-
-		if (dq && prev_state && prev_state->running_queue == cqid &&
-		    prev_state->running_deadline && prev_state->running_pid != p->pid &&
-		    bpf_cpumask_test_cpu((u32)prev_cpu, p->cpus_ptr)) {
-			bool cv = prev_state->running_weight != 0;
-			u64 fresh = mlfq_place_entity_deadline_with_curr(dq, tctx,
-									 prev_state->running_vruntime,
-									 prev_state->running_weight,
-									 cv);
-
-			if (fresh && mlfq_time_before(fresh, prev_state->running_deadline))
-				return prev_cpu;
-		}
-	}
 
 	/*
 	 * Q3 isolation path: bounded bpf_for scans with SMT soft veto.
@@ -406,9 +398,9 @@ s32 BPF_STRUCT_OPS(mlfq_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * best, the clock tradeoff of a larger (often lower-clocked) L3
 	 * is worth it for interactive work, and the idle claim is
 	 * authoritative, so the bias is non-exclusive. The
-	 * mlfq_llc_has_primary gate keeps the interactive never parks on
-	 * an efficiency core rule on hybrid systems and
-	 * require_primary is an extra check. The step is dead on
+	 * mlfq_llc_has_primary gate keeps the "interactive never parks on
+	 * an efficiency core" invariant on hybrid systems and
+	 * require_primary is an extra defense. The step is dead on
 	 * single-LLC machines, on ties or failed discovery (the
 	 * MLFQ_MAX_LLCS sentinel), and when the largest domain is the
 	 * waker's. The MLFQ_MAX_LLCS bound in the gate keeps the

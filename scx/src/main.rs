@@ -87,11 +87,10 @@ const MLFQ_MAX_CPUS: usize = crate::bpf_intf::mlfq_consts_MLFQ_MAX_CPUS as usize
 
 /*
  * Web-UI runnable gauges. The BPF side maintains `mlfq_llc_runnable`,
- * `mlfq_queue_runnable_q1/q2/q3` and `mlfq_llc_idle` in the bss block
- * directly before `mlfq_stats` (the declaration order keeps the
- * published-tree control line isolated, see main.bpf.c); the generated
- * bss type carries the counters, so the web metrics read them as typed
- * fields.
+ * `mlfq_queue_runnable` and `mlfq_llc_idle` in the bss block directly
+ * before `mlfq_stats` (the declaration order keeps the published-tree
+ * control line isolated, see main.bpf.c); the generated bss type carries
+ * the arrays, so the web metrics read them as typed fields.
  */
 
 /*
@@ -128,10 +127,13 @@ const MLFQ_TREE_MIN_LEAF: usize = 32;
 const MLFQ_TREE_RETRAIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /*
- * PM QoS cap in microseconds on /dev/cpu_dma_latency for the run.
- * 10 us bans deep C states while keeping C1, so wakeups stay fast.
+ * PM QoS idle-resume-latency cap in microseconds, applied to
+ * /dev/cpu_dma_latency for the duration of the run. 10 us bans the deep
+ * core and package C-states (18 us and 350 us exits on the target) while
+ * keeping C1 (1 us), so wakeup latency is not dominated by deep-state
+ * exits. An environmental power/latency tradeoff made automatically, not
+ * a user knob.
  */
-/* PM QoS holds 10us for the run, then releases. */
 const MLFQ_IDLE_RESUME_LATENCY_US: i32 = 10;
 
 fn full_version() -> String {
@@ -266,8 +268,10 @@ struct Scheduler<'a> {
     // Zero-allocation reuse buffers. All Vecs are pre-reserved to their
     // maximum capacity at init and reused via clear+extend, so the 100 ms
     // hot path never triggers a heap allocation after the first iteration.
+    train_snapshot_buf: Vec<TreeSample>,
     web_statics_buf: Vec<Option<stats::PerCpuMetrics>>,
     web_per_cpu_buf: Vec<stats::PerCpuMetrics>,
+    #[allow(dead_code)]
     op_lat_buf: Vec<u64>,
     wakeup_raw_buf: Vec<u8>,
     op_lat_raw_buf: Vec<u8>,
@@ -506,7 +510,7 @@ impl<'a> Scheduler<'a> {
          * bounded channel the run loop drains. try_send drops the sample
          * when the channel is full, which the ring-buffer backpressure
          * absorbs first. TreeSample is a repr(C) POD mirroring the
-         * 84-byte BPF record (1.3.11 ABI), so the parse is a plain byte
+         * 84-byte BPF record (1.3.12 ABI), so the parse is a plain byte
          * reinterpretation. The record's version tag is checked before
          * the record is admitted, so a record from a foreign producer or
          * a mismatched build is dropped instead of misread.
@@ -562,6 +566,7 @@ impl<'a> Scheduler<'a> {
             train_tx,
             train_rx,
             model: ModelMeta::default(),
+            train_snapshot_buf: Vec::with_capacity(MLFQ_TREE_WINDOW_MAX),
             web_statics_buf: Vec::with_capacity(MLFQ_MAX_CPUS),
             web_per_cpu_buf: Vec::with_capacity(MLFQ_MAX_CPUS),
             op_lat_buf: Vec::with_capacity(
@@ -619,10 +624,6 @@ impl<'a> Scheduler<'a> {
             rt_evacuations: s.rt_evacuations,
             rt_redirects: s.rt_redirects,
             rt_reenqs: s.rt_reenqs,
-            eevdf_eligible: s.eevdf_eligible,
-            eevdf_ineligible: s.eevdf_ineligible,
-            eevdf_deadline_miss: s.eevdf_deadline_miss,
-            eevdf_divergence: s.eevdf_divergence,
             op_lat,
             tree_samples_cap_dropped: self.tree_samples_cap_dropped,
             tree_model_generation: self.model.generation,
@@ -666,6 +667,7 @@ impl<'a> Scheduler<'a> {
         {
             let nr = nr_cpus_bss.min(MLFQ_MAX_CPUS);
             self.cur_freq_khz.clear();
+            self.cur_freq_khz.reserve(nr);
             for cpu in 0..nr {
                 self.cur_freq_khz
                     .push(topology::current_freq_khz(cpu as u32));
@@ -690,12 +692,12 @@ impl<'a> Scheduler<'a> {
         self.web_statics_buf.resize_with(nr_cpus, || None);
         for s in &self.cpu_static {
             if (s.id as usize) < nr_cpus {
-                self.web_statics_buf[s.id as usize] = Some(*s);
+                self.web_statics_buf[s.id as usize] = Some(s.clone());
             }
         }
         self.web_per_cpu_buf.clear();
         for (cpu, static_entry) in self.web_statics_buf.iter().enumerate().take(nr_cpus) {
-            let mut entry = (*static_entry).unwrap_or_default();
+            let mut entry = static_entry.clone().unwrap_or_default();
             entry.id = cpu as u32;
             entry.cur_freq_khz = self.cur_freq_khz.get(cpu).copied().unwrap_or(0);
 
@@ -708,8 +710,10 @@ impl<'a> Scheduler<'a> {
             entry.rt_occupied = rt.flags & crate::bpf_intf::MLFQ_RTDL_OCCUPIED != 0;
             self.web_per_cpu_buf.push(entry);
         }
-        // Move the scratch buffer into per_cpu. The scratch is left empty.
-        let per_cpu = std::mem::take(&mut self.web_per_cpu_buf);
+        // Move the scratch buffer into per_cpu without allocating a new Vec
+        // by swapping. The scratch is left empty but retains capacity.
+        let mut per_cpu = Vec::with_capacity(nr_cpus);
+        std::mem::swap(&mut per_cpu, &mut self.web_per_cpu_buf);
 
         // Copy the BSS gauges before the mutable borrow for get_metrics
         // so the borrow checker sees no overlap.
@@ -726,44 +730,96 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Read one CPU's dynamic state from the per-CPU array map. A failed
+    /// lookup or an unexpected value size yields an all-zero state.
+    #[allow(dead_code)]
+    fn read_cpu_state(&self, cpu: usize) -> mlfq_cpu_state {
+        let key = (cpu as u32).to_ne_bytes();
+        match self
+            .skel
+            .maps
+            .cpu_state_stor
+            .lookup(&key, libbpf_rs::MapFlags::ANY)
+        {
+            Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_cpu_state>() => {
+                // SAFETY: mlfq_cpu_state is the repr(C) bindgen mirror of
+                // the map's value type; reading the value bytes as the
+                // struct is a plain reinterpretation of integer fields.
+                unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_cpu_state>()) }
+            }
+            _ => mlfq_cpu_state {
+                running_queue: 0,
+                running_pid: 0,
+                steal_scan_off: 0,
+                cpu_ema: 0,
+                cpu_ema_at: 0,
+                running_deadline: 0,
+                run_start_at: 0,
+                running_gpu_submit: 0,
+                pad2: 0,
+            },
+        }
+    }
+
+    /// Read one CPU's realtime-occupancy state from the per-CPU array
+    /// map; a failed lookup yields an all-zero state (not occupied).
+    #[allow(dead_code)]
+    fn read_rtdl_state(&self, cpu: usize) -> mlfq_rtdl_state {
+        let key = (cpu as u32).to_ne_bytes();
+        match self
+            .skel
+            .maps
+            .rtdl_state_stor
+            .lookup(&key, libbpf_rs::MapFlags::ANY)
+        {
+            Ok(Some(bytes)) if bytes.len() >= size_of::<mlfq_rtdl_state>() => {
+                // SAFETY: as in read_cpu_state: a repr(C) mirror of the
+                // map's value type.
+                unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<mlfq_rtdl_state>()) }
+            }
+            _ => mlfq_rtdl_state {
+                flags: 0,
+                pad: 0,
+                last_drain_at: 0,
+            },
+        }
+    }
+
     /// Tracked runnable tasks per queue (index 0 unused, 1..3 = Q1..Q3).
     ///
-    /// The gauges are the BPF-side `mlfq_queue_runnable_q1/q2/q3` bss
-    /// counters, which count the runnable tasks placed in each queue's
-    /// DSQs (the accounting contract is in `intf.h` next to the
-    /// counters). Read through the generated bss type, so a layout
-    /// change is a compile error rather than a silent misread.
-    fn read_queue_runnable(&self) -> [u64; 4] {
+    /// The gauge is the BPF-side `mlfq_queue_runnable` bss array, which
+    /// counts the runnable tasks placed in each queue's DSQs (the
+    /// accounting contract is in `intf.h` next to the counters). Read
+    /// through the generated bss type, so a layout change is a compile
+    /// error rather than a silent misread.
+    fn read_queue_runnable(&self) -> Vec<u64> {
         let bss_data = self
             .skel
             .maps
             .bss_data
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
-        [
-            0,
-            bss_data.mlfq_queue_runnable_q1 as u64,
-            bss_data.mlfq_queue_runnable_q2 as u64,
-            bss_data.mlfq_queue_runnable_q3 as u64,
-        ]
+        bss_data
+            .mlfq_queue_runnable
+            .iter()
+            .map(|v| *v as u64)
+            .collect()
     }
 
     /// Tracked runnable tasks per LLC domain (MLFQ_MAX_LLCS entries).
     /// Same contract and access path as `read_queue_runnable`.
-    fn read_llc_runnable(&self) -> [u64; 32] {
+    fn read_llc_runnable(&self) -> Vec<u64> {
         let bss_data = self
             .skel
             .maps
             .bss_data
             .as_ref()
             .expect("bss_data missing, the BPF object has no .bss section");
-        let mut out = [0u64; 32];
-        let mut i = 0;
-        while i < 32 {
-            out[i] = bss_data.mlfq_llc_runnable[i] as u64;
-            i += 1;
-        }
-        out
+        bss_data
+            .mlfq_llc_runnable
+            .iter()
+            .map(|v| *v as u64)
+            .collect()
     }
 
     fn exited(&self) -> bool {
@@ -779,14 +835,12 @@ impl<'a> Scheduler<'a> {
                 running_queue: 0,
                 running_pid: 0,
                 steal_scan_off: 0,
-                pad0: 0,
                 cpu_ema: 0,
                 cpu_ema_at: 0,
                 running_deadline: 0,
                 run_start_at: 0,
                 running_gpu_submit: 0,
-                running_weight: 0,
-                running_vruntime: 0,
+                pad2: 0,
             };
         }
         let fd = self.skel.maps.cpu_state_stor.as_fd().as_raw_fd();
@@ -806,14 +860,12 @@ impl<'a> Scheduler<'a> {
                 running_queue: 0,
                 running_pid: 0,
                 steal_scan_off: 0,
-                pad0: 0,
                 cpu_ema: 0,
                 cpu_ema_at: 0,
                 running_deadline: 0,
                 run_start_at: 0,
                 running_gpu_submit: 0,
-                running_weight: 0,
-                running_vruntime: 0,
+                pad2: 0,
             }
         }
     }
@@ -852,6 +904,7 @@ impl<'a> Scheduler<'a> {
     /// (MLFQ_OP_LAT_OPS x MLFQ_OP_LAT_BUCKETS entries, op-major). The
     /// map is per-CPU so the BPF charges never contend. A failed lookup
     /// or an unexpected value size yields zeros for that entry.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn read_op_lat(&mut self) -> Vec<u64> {
         let nr_ops = crate::bpf_intf::mlfq_op_lat_slots_MLFQ_OP_LAT_OPS as usize;
         let buckets = crate::bpf_intf::mlfq_op_lat_consts_MLFQ_OP_LAT_BUCKETS as usize;
@@ -989,7 +1042,7 @@ impl<'a> Scheduler<'a> {
 
         let m = self.get_metrics();
         log::info!(
-            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} steals_same_llc={} steals_cross_llc={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} eevdf_eligible={} eevdf_ineligible={} eevdf_miss={} eevdf_diverge={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={} wakeups={} adapt_steps={}",
+            "mlfq exit counters: Q1={} Q2={} Q3={} fastpath={} regular={} pin_idle={} pin_busy={} pin_global={} drop_tctx={} drop_weight={} drop_deadline={} promotions={} demotions={} aging_boosts={} short_sleep_boosts={} cpuperf_boosts={} preempt_kicks={} runtime={} on_cpu={} steals={} steals_same_llc={} steals_cross_llc={} keep_running={} rt_takeovers={} rt_evacuations={} rt_redirects={} rt_reenqs={} tree gen={} nodes={} samples={} mae={}us ema_mae={}us corr={:.3} tree_inf={} tree_fallback={} tree_disagree={} tree_emitted={} tree_dropped={} tree_cap_dropped={} wakeups={} adapt_steps={}",
             m.q1_placements, m.q2_placements, m.q3_placements, m.enq_fastpath,
             m.enq_regular, m.enq_pinned_idle, m.enq_pinned_busy,
             m.enq_pinned_global, m.enq_no_tctx, m.enq_bad_weight,
@@ -998,7 +1051,6 @@ impl<'a> Scheduler<'a> {
             m.total_runtime, m.on_cpu, m.steals, m.steals_same_llc,
             m.steals_cross_llc, m.keep_running,
             m.rt_takeovers, m.rt_evacuations, m.rt_redirects, m.rt_reenqs,
-            m.eevdf_eligible, m.eevdf_ineligible, m.eevdf_deadline_miss, m.eevdf_divergence,
             m.tree_model_generation, m.tree_model_nodes, m.tree_model_samples,
             m.tree_mae_tree_us, m.tree_mae_ema_us, self.model.corr,
             m.tree_inference, m.tree_fallback, m.tree_disagree,
@@ -1051,11 +1103,19 @@ impl<'a> Scheduler<'a> {
     /// cadence makes rare.
     fn kick_training(&mut self) {
         self.last_train_at = Some(std::time::Instant::now());
-        // Hand the worker its own buffer. The scratch is refilled from
-        // the window each kick and moved into the channel, then replaced
-        // with a fresh buffer for the next kick. One buffer per 60 s kick.
-        let mut snapshot = Vec::with_capacity(self.window.len());
-        snapshot.extend(self.window.iter().copied());
+        // Reuse the snapshot buffer. The buffer is cleared and refilled
+        // from the window; the capacity stays at MLFQ_TREE_WINDOW_MAX, so
+        // no allocation after the first kick.
+        self.train_snapshot_buf.clear();
+        self.train_snapshot_buf.extend(self.window.iter().copied());
+        // Move the buffer into the channel without allocating a new Vec
+        // by swapping with an empty Vec that retains the channel's
+        // previously sent capacity. The swap leaves the scratch empty
+        // but with the same capacity for the next kick.
+        let mut snapshot = Vec::new();
+        std::mem::swap(&mut snapshot, &mut self.train_snapshot_buf);
+        // Restore the scratch capacity for the next kick.
+        self.train_snapshot_buf = Vec::with_capacity(MLFQ_TREE_WINDOW_MAX);
         if self.train_tx.try_send(snapshot).is_err() {
             log::warn!("MLFQ tree training already in flight, skipping this retrain");
         }
@@ -1307,6 +1367,18 @@ fn tree_distinct_pids(samples: &[TreeSample]) -> usize {
 /// Fit a tree and compute the holdout metrics, on the training worker.
 ///
 /// The tree is fit on the first 90% of the window and evaluated on the
+/// last 10%, so the reported MAE and the publish gate describe
+/// out-of-sample error. The EMA baseline is exact. Each sample's
+/// prediction is the captured gauge `feats.ema` (the post-decay gauge at
+/// the capture, as emitted by the BPF side), so
+/// `mae_ema = mean(|feats.ema - label|)` on the same holdout slice and
+/// the tree comparison is honest.
+#[allow(dead_code)]
+fn train_model(samples: &[TreeSample]) -> Result<TrainResult, String> {
+    let mut scratch = FitScratch::new();
+    train_model_with_scratch(samples, &mut scratch)
+}
+
 /// Fit a tree and compute holdout metrics reusing the scratch arena.
 /// The scratch buffers are cleared in place, so the second call with the
 /// same window size does not allocate.
@@ -1325,7 +1397,7 @@ fn train_model_with_scratch(
         scratch,
     );
     mlfq_tree::serialize_validate(&tree).map_err(|e| {
-        // A tree that fails the walk rules must never be
+        // A tree that fails the walk invariants must never be
         // published; the previous model stays committed.
         format!("tree failed validation: {e}")
     })?;

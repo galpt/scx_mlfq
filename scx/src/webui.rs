@@ -91,8 +91,10 @@ struct WebState {
     metrics: WebMetrics,
 }
 
-/// Serve one unix client with a minimal HTTP reply. Two routes only.
-/* Unix socket mirrors the loopback routes. */
+/// Serve one unix-socket client with a minimal HTTP/1.1 response. The
+/// two routes mirror the tiny_http server: `/` serves the embedded HTML
+/// (no-store), `/api/stats` the live metrics JSON, everything else a
+/// 404. A malformed request is dropped silently.
 fn unix_handle_client(
     mut stream: std::os::unix::net::UnixStream,
     state: &Arc<Mutex<WebState>>,
@@ -309,7 +311,8 @@ fn try_unblock_loader_sandbox() -> bool {
 ///
 /// Only the byte-identical file this process wrote is ever removed: a
 /// foreign or user-edited drop-in is logged and left untouched. `/run`
-/// is tmpfs, so an exit that skips this restore is clean at reboot.
+/// is tmpfs, so even an exit that skips this restore self-heals at the
+/// next reboot.
 pub fn restore_loader_sandbox() {
     if !UNBLOCK_WRITTEN.load(Ordering::SeqCst) {
         return;
@@ -381,10 +384,10 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
 
     // The metrics consumer: keep the newest snapshot behind the mutex.
     // A timeout keeps the loop parked for at most POLL_INTERVAL, so the
-    // shutdown flag is observed within that budget. Joined at the end.
+    // shutdown flag is observed within that budget.
     let state_clone = state.clone();
     let shutdown_clone = shutdown.clone();
-    let inner = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         while !shutdown_clone.load(Ordering::Relaxed) {
             match metrics_rx.recv_timeout(POLL_INTERVAL) {
                 Ok(m) => {
@@ -496,30 +499,19 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
             "Web UI: TCP blocked (spawned by scx_loader?), falling back to {}",
             UNIX_SOCKET_PATH
         );
-        // Bind first. Only on address-in-use remove a stale socket left
-        // by a previous run and retry once, so no check-then-remove race
-        // runs when the path is free.
-        let listener = match UnixListener::bind(UNIX_SOCKET_PATH) {
-            Ok(l) => Ok(l),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                if let Ok(meta) = std::fs::symlink_metadata(UNIX_SOCKET_PATH) {
-                    if meta.file_type().is_socket() {
-                        let _ = std::fs::remove_file(UNIX_SOCKET_PATH);
-                    }
-                }
-                UnixListener::bind(UNIX_SOCKET_PATH)
+        // Remove a stale socket file left by a previous run before
+        // binding, so the bind cannot fail on the leftover path.
+        if let Ok(meta) = std::fs::symlink_metadata(UNIX_SOCKET_PATH) {
+            if meta.file_type().is_socket() {
+                let _ = std::fs::remove_file(UNIX_SOCKET_PATH);
             }
-            Err(e) => Err(e),
-        };
-        let listener = match listener {
+        }
+
+        let listener = match UnixListener::bind(UNIX_SOCKET_PATH) {
             Ok(l) => l,
             Err(e) => {
                 log::warn!("Web UI: Unix socket bind failed: {}", e);
                 log::warn!("Web UI disabled. Use --no-webui to silence.");
-                while !shutdown.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                let _ = inner.join();
                 return;
             }
         };
@@ -548,10 +540,6 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
             // The UI simply shows disconnected.
             log::error!("Web UI: failed to set the unix socket nonblocking: {e}");
             log::warn!("Web UI disabled. Use --no-webui to silence.");
-            while !shutdown.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            let _ = inner.join();
             return;
         }
         while !shutdown.load(Ordering::Relaxed) {
@@ -584,7 +572,6 @@ pub fn start(metrics_rx: crossbeam::channel::Receiver<WebMetrics>, shutdown: Arc
         }
     }
 
-    let _ = inner.join();
     log::info!("Web UI stopped");
 }
 

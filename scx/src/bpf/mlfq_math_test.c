@@ -4,7 +4,7 @@
  *
  * Native unit tests for the scx_mlfq pure-logic layer (intf.h). Compiles
  * the same header the BPF code and the Rust bindings use, with MLFQ_CHECK
- * forced on so the check predicates are exercised too. Runs on the
+ * forced on so the invariant predicates are exercised too. Runs on the
  * host with no kernel, BTF or BPF privileges, driven by the Rust unit
  * test in main.rs.
  */
@@ -17,12 +17,10 @@
  * Shadow runnable gauges: intf.h declares the per-LLC and per-queue
  * runnable gauge externs unconditionally (the BPF build gets them from
  * the main.bpf.c bss block); the harness provides the storage itself so
- * the pure accounting helpers can be driven against real counters.
+ * the pure accounting helpers can be driven against real arrays.
  */
 volatile u32 mlfq_llc_runnable[MLFQ_MAX_LLCS];
-volatile u32 mlfq_queue_runnable_q1;
-volatile u32 mlfq_queue_runnable_q2;
-volatile u32 mlfq_queue_runnable_q3;
+volatile u32 mlfq_queue_runnable[MLFQ_NR_QUEUES + 1];
 
 #include <stddef.h>
 #include <stdio.h>
@@ -55,6 +53,23 @@ static void test_calc_delta_fair(void)
 		"delta 1ms weight 1 -> 100ms virtual");
 	TEST_OK(calc_delta_fair_bpf(1000000, 10000) == 10000,
 		"delta 1ms weight 10000 -> 10us virtual");
+	TEST_OK(calc_delta_fair_bpf(0, 100) == 0,
+		"zero delta stays zero at any weight");
+}
+
+/* The 1.3.12 clamp: the multiply never wraps, and a zero weight is one. */
+static void test_calc_delta_clamp(void)
+{
+	u64 ProductMax = 0xFFFFFFFFFFFFFFFFULL / 100;
+
+	TEST_OK(calc_delta_fair_bpf(0xFFFFFFFFFFFFFFFFULL, 1) == ProductMax * 100,
+		"max delta clamps before the multiply, no wrap");
+	TEST_OK(calc_delta_fair_bpf(0xFFFFFFFFFFFFFFFFULL, 100) == ProductMax,
+		"max delta at weight 100 clamps to the bound");
+	TEST_OK(calc_delta_fair_bpf(1000000, 0) == calc_delta_fair_bpf(1000000, 1),
+		"zero weight is treated as one, division stays defined");
+	TEST_OK(calc_delta_fair_bpf(ProductMax + 1, 1) == ProductMax * 100,
+		"one past the bound clamps to the bound");
 }
 
 static struct queue_ctx make_q(u64 clock, u64 max_slice_ns)
@@ -62,24 +77,6 @@ static struct queue_ctx make_q(u64 clock, u64 max_slice_ns)
 	struct queue_ctx q = {
 		.clock = clock,
 		.max_slice_ns = max_slice_ns,
-		.sum_w_vruntime = 0,
-		.sum_weight = 0,
-		.zero_vruntime = clock,
-		.sum_shift = 0,
-	};
-
-	return q;
-}
-
-static struct queue_ctx make_q_sums(u64 zero, s64 sum_w, s64 sum_weight, u64 max_slice_ns)
-{
-	struct queue_ctx q = {
-		.clock = zero,
-		.max_slice_ns = max_slice_ns,
-		.sum_w_vruntime = sum_w,
-		.sum_weight = sum_weight,
-		.zero_vruntime = zero,
-		.sum_shift = 0,
 	};
 
 	return q;
@@ -113,17 +110,17 @@ static void test_place_entity(void)
 		"behind task clamped to clock - limit, lag at the bound");
 
 	/*
-	 * An ahead task keeps negative lag within the bound. The signed
-	 * clamp preserves leading credit up to one limit, so the placed
-	 * vruntime stays ahead of the average by the bound.
+	 * An ahead task is placed at the clock (fair.c DELAY_ZERO):
+	 * leading credit is not carried, so the negative lag case is
+	 * collapsed to zero.
 	 */
 	q = make_q(1000, 2000000);
 	memset(&t, 0, sizeof(t));
 	t.weight = 100;
 	t.vruntime = 1ULL << 40;
-	TEST_OK(mlfq_place_entity(&q, &t) == 5001000 &&
-		t.vruntime == 3001000 && t.vlag == -3000000,
-		"ahead task keeps negative lag at the bound");
+	TEST_OK(mlfq_place_entity(&q, &t) == 2001000 &&
+		t.vruntime == 1000 && t.vlag == 0,
+		"ahead task placed at the clock, vlag 0");
 
 	/*
 	 * An in-band task (within one lag limit behind the clock) keeps
@@ -220,13 +217,11 @@ static void test_place_charge_replacement(void)
 	mlfq_queue_advance_clock(&q, t.vruntime);
 	TEST_OK(q.clock == t.vruntime,
 		"clock advances to the vruntime charged for a full slice");
-	/* Publish moves zero alongside the clock, so average follows service. */
-	q.zero_vruntime = q.clock;
 
 	t.vruntime = q.clock - 500000;	/* now only 0.5 ms behind */
 	mlfq_place_entity(&q, &t);
 	TEST_OK(t.vruntime == q.clock - 500000 && t.vlag == 500000,
-		"re-placement measures the lag from the advanced average");
+		"re-placement measures the lag from the advanced clock");
 }
 
 /*
@@ -352,6 +347,54 @@ static void test_clock_advance(void)
 	mlfq_queue_advance_clock(&q, 10);
 	TEST_OK(q.clock == 10,
 		"wrapped advance across the u64 boundary is followed");
+}
+
+/* The single read estimate and the advisory eligibility of 1.3.12. */
+static void test_clock_read_eligible(void)
+{
+	struct queue_ctx q = make_q(1234567, 2000000);
+	struct task_ctx t;
+
+	TEST_OK(mlfq_clock_read(&q) == 1234567,
+		"clock read returns the estimated clock");
+	memset(&t, 0, sizeof(t));
+	t.vlag = 0;
+	TEST_OK(mlfq_task_eligible(&t),
+		"vlag 0 is eligible");
+	t.vlag = 3000000;
+	TEST_OK(mlfq_task_eligible(&t),
+		"vlag at the limit is eligible");
+	t.vlag = -1;
+	TEST_OK(!mlfq_task_eligible(&t),
+		"negative vlag is ineligible, fallback serves min deadline");
+}
+
+/* Lag stays in [0, limit] and FIRST_RUN halves the slice once. */
+static void test_place_lag_first_run(void)
+{
+	struct queue_ctx q = make_q(1ULL << 40, 2000000);
+	struct task_ctx t;
+	u64 limit, d1, d2;
+
+	memset(&t, 0, sizeof(t));
+	t.weight = 100;
+	t.vruntime = 0;
+	limit = mlfq_lag_limit(&q, 100);
+	mlfq_place_entity(&q, &t);
+	TEST_OK(t.vlag >= 0 && (u64)t.vlag <= limit,
+		"placed lag stays in [0, limit]");
+	TEST_OK(t.vruntime == q.clock - (u64)t.vlag,
+		"placed vruntime is clock minus lag");
+
+	q = make_q(0, 2000000);
+	memset(&t, 0, sizeof(t));
+	t.weight = 100;
+	t.flags = MLFQ_TF_FIRST_RUN;
+	d1 = mlfq_place_entity(&q, &t);
+	t.flags &= ~MLFQ_TF_FIRST_RUN;
+	d2 = mlfq_place_entity(&q, &t);
+	TEST_OK(d1 * 2 == d2,
+		"FIRST_RUN halves the vslice once");
 }
 
 static void test_ema_climb(void)
@@ -519,12 +562,9 @@ static void test_mlfq_check_predicates(void)
 	TEST_OK(!mlfq_check_queue(0) && !mlfq_check_queue(4),
 		"queues 0 and 4 are invalid");
 	TEST_OK(mlfq_check_weight(1) && !mlfq_check_weight(0),
-		"weight >= 1 rule");
-	TEST_OK(mlfq_check_queued_vlag(0, 3000000) && mlfq_check_queued_vlag(-3000000, 3000000),
-		"queued lag inside [-limit, limit] is valid");
-	TEST_OK(!mlfq_check_queued_vlag(3000001, 3000000) &&
-		!mlfq_check_queued_vlag(-3000001, 3000000),
-		"queued lag outside [-limit, limit] is invalid");
+		"weight >= 1 invariant");
+	TEST_OK(mlfq_check_queued_vlag(0) && !mlfq_check_queued_vlag(-1),
+		"queued lag >= 0 invariant");
 }
 
 static void test_bitmap(void)
@@ -721,15 +761,8 @@ static void test_mlfq_tree_layout(void)
 		offsetof(struct mlfq_tree_ctrl, sample_last_at) == 8,
 		"tree ctrl state is one dedicated 64-byte cache line");
 	TEST_OK(sizeof(struct mlfq_stats) % 64 == 0 &&
-		sizeof(struct mlfq_stats) == 320,
-		"mlfq_stats is padded to a 64-byte multiple (320 bytes with EEVDF counters)");
-/* Stats stay at 320 bytes on five lines. */
-	TEST_OK(sizeof(struct queue_ctx) == 64,
-		"queue_ctx stays 64 bytes with sums and zero");
-	TEST_OK(sizeof(struct mlfq_cpu_state) == 64,
-		"mlfq_cpu_state stays 64 bytes with curr vruntime");
-	TEST_OK(MLFQ_EEVDF_ABI_VERSION == 1,
-		"EEVDF ABI version is 1");
+		sizeof(struct mlfq_stats) == 256,
+		"mlfq_stats is padded to a 64-byte multiple (256 bytes)");
 	TEST_OK(sizeof(struct mlfq_sys_gauge) == 48 &&
 		sizeof(struct mlfq_adapt_state) == 48 &&
 		sizeof(struct mlfq_wakeup_counters) == 16,
@@ -983,7 +1016,7 @@ static void test_mlfq_check_tree_predicates(void)
 	TEST_OK(mlfq_check_tree_feature(0) && mlfq_check_tree_feature(8),
 		"feature ids 0 and 8 are in bounds (NR_FEATURES 9)");
 	TEST_OK(mlfq_check_tree_feature(5) && mlfq_check_tree_feature(7),
-		"feature ids 5 and 7 are now in bounds for 1.3.11 ABI");
+		"feature ids 5 and 7 are now in bounds for 1.3.12 ABI");
 	TEST_OK(!mlfq_check_tree_feature(0x80) &&
 		!mlfq_check_tree_feature(0x90) &&
 		!mlfq_check_tree_feature(9),
@@ -992,28 +1025,12 @@ static void test_mlfq_check_tree_predicates(void)
 
 /* Runnable accounting contract. */
 
-/*
- * Harness read of one queue gauge by id. Gives the counter for 1 to
- * 3, 0 for any other id.
- */
-static u32 rn_queue_get(u32 qid)
-{
-	if (qid == 1)
-		return mlfq_queue_runnable_q1;
-	if (qid == 2)
-		return mlfq_queue_runnable_q2;
-	if (qid == 3)
-		return mlfq_queue_runnable_q3;
-	return 0;
-}
-
 static void rn_state_reset(void)
 {
 	memset((void *)mlfq_llc_runnable, 0,
 	       sizeof(mlfq_llc_runnable[0]) * MLFQ_MAX_LLCS);
-	mlfq_queue_runnable_q1 = 0;
-	mlfq_queue_runnable_q2 = 0;
-	mlfq_queue_runnable_q3 = 0;
+	memset((void *)mlfq_queue_runnable, 0,
+	       sizeof(mlfq_queue_runnable[0]) * (MLFQ_NR_QUEUES + 1));
 }
 
 static u32 rn_llc_sum(void)
@@ -1028,8 +1045,12 @@ static u32 rn_llc_sum(void)
 
 static u32 rn_queue_sum(void)
 {
-	return mlfq_queue_runnable_q1 + mlfq_queue_runnable_q2 +
-	       mlfq_queue_runnable_q3;
+	u32 sum = 0;
+	u32 i;
+
+	for (i = 1; i <= MLFQ_NR_QUEUES; i++)
+		sum += mlfq_queue_runnable[i];
+	return sum;
 }
 
 /*
@@ -1044,12 +1065,12 @@ static void test_runnable_enter_fresh(void)
 
 	rn_state_reset();
 	mlfq_runnable_enter(&t, 1, 2);
-	TEST_OK(mlfq_llc_runnable[2] == 1 && mlfq_queue_runnable_q1 == 1 &&
+	TEST_OK(mlfq_llc_runnable[2] == 1 && mlfq_queue_runnable[1] == 1 &&
 		t.last_llc == 2 && t.last_qid == 1,
 		"fresh enter counts LLC 2 Q1 once and records ownership");
 
 	mlfq_runnable_enter(&u, 3, 2);
-	TEST_OK(mlfq_llc_runnable[2] == 2 && mlfq_queue_runnable_q3 == 1 &&
+	TEST_OK(mlfq_llc_runnable[2] == 2 && mlfq_queue_runnable[3] == 1 &&
 		rn_llc_sum() == 2 && rn_queue_sum() == 2,
 		"a second task on the same LLC counts separately");
 }
@@ -1057,7 +1078,7 @@ static void test_runnable_enter_fresh(void)
 /*
  * Continuation enters. The task is already counted, so the call only
  * moves its ownership. The table drives one task through the moves and
- * checks the gauge deltas and the rule that the total counted
+ * checks the gauge deltas and the invariant that the total counted
  * stays 1: only a changed LLC or queue moves a unit between indexes.
  */
 static void test_runnable_enter_continuation_table(void)
@@ -1089,11 +1110,11 @@ static void test_runnable_enter_continuation_table(void)
 	for (i = 0; i < ARRAY_SIZE(rows); i++) {
 		const struct rn_row *r = &rows[i];
 		u32 prev_llc = mlfq_llc_runnable[r->llc];
-		u32 prev_q = rn_queue_get(r->qid);
+		u32 prev_q = mlfq_queue_runnable[r->qid];
 
 		mlfq_runnable_enter(&t, r->qid, r->llc);
 		TEST_OK((s32)(mlfq_llc_runnable[r->llc] - prev_llc) == r->llc_delta &&
-			(s32)(rn_queue_get(r->qid) - prev_q) == r->q_delta &&
+			(s32)(mlfq_queue_runnable[r->qid] - prev_q) == r->q_delta &&
 			t.last_llc == r->exp_llc && t.last_qid == r->exp_qid &&
 			rn_llc_sum() == 1 && rn_queue_sum() == 1,
 			"continuation row %u: qid %u llc %u keeps the total at 1",
@@ -1112,7 +1133,7 @@ static void test_runnable_continuation_noop(void)
 	rn_state_reset();
 	mlfq_runnable_enter(&t, 1, 0);
 	mlfq_runnable_enter(&t, 1, 0);
-	TEST_OK(mlfq_llc_runnable[0] == 1 && mlfq_queue_runnable_q1 == 1 &&
+	TEST_OK(mlfq_llc_runnable[0] == 1 && mlfq_queue_runnable[1] == 1 &&
 		t.last_llc == 0 && t.last_qid == 1,
 		"same-LLC same-queue continuation does not re-count");
 }
@@ -1132,14 +1153,14 @@ static void test_runnable_exit(void)
 	rn_state_reset();
 	mlfq_runnable_enter(&t, 2, 1);
 	mlfq_runnable_exit(&t);
-	TEST_OK(mlfq_llc_runnable[1] == 0 && mlfq_queue_runnable_q2 == 0 &&
+	TEST_OK(mlfq_llc_runnable[1] == 0 && mlfq_queue_runnable[2] == 0 &&
 		t.last_llc == MLFQ_LLC_UNOWNED && t.last_qid == 0,
 		"exit releases LLC and queue counts and resets ownership");
 
-	prev = mlfq_llc_runnable[1] + mlfq_queue_runnable_q2;
+	prev = mlfq_llc_runnable[1] + mlfq_queue_runnable[2];
 	mlfq_runnable_exit(&t);		/* double release */
 	mlfq_runnable_exit(&u);		/* never counted */
-	TEST_OK(mlfq_llc_runnable[1] + mlfq_queue_runnable_q2 == prev &&
+	TEST_OK(mlfq_llc_runnable[1] + mlfq_queue_runnable[2] == prev &&
 		t.last_llc == MLFQ_LLC_UNOWNED && u.last_llc == MLFQ_LLC_UNOWNED,
 		"double release and release of an unowned task are no-ops");
 }
@@ -1171,7 +1192,7 @@ static void test_runnable_global_park_cycle(void)
 
 	/* The running acquisition starts a fresh episode. */
 	mlfq_runnable_enter(&t, 2, 3);
-	TEST_OK(mlfq_llc_runnable[3] == 1 && mlfq_queue_runnable_q2 == 1 &&
+	TEST_OK(mlfq_llc_runnable[3] == 1 && mlfq_queue_runnable[2] == 1 &&
 		t.last_llc == 3 && t.last_qid == 2,
 		"running acquisition counts the global-parked task");
 
@@ -1204,7 +1225,9 @@ static void test_runnable_sentinel_llc_noop(void)
 }
 
 /*
- * Out of range queue ids clamp to 2, so the call counts there.
+ * The queue-index guard is defense in depth. An out-of-range queue id
+ * never moves the queue gauge (the LLC gauge still counts the episode;
+ * callers always pass 1..3).
  */
 static void test_runnable_qid_guard(void)
 {
@@ -1212,13 +1235,12 @@ static void test_runnable_qid_guard(void)
 
 	rn_state_reset();
 	mlfq_runnable_enter(&t, 0, 1);
-	TEST_OK(mlfq_llc_runnable[1] == 1 && mlfq_queue_runnable_q2 == 1 &&
-		t.last_qid == 2,
-		"out-of-range queue id clamps to 2");
+	TEST_OK(mlfq_llc_runnable[1] == 1 && rn_queue_sum() == 0,
+		"out-of-range queue id never moves the queue gauge");
 
 	mlfq_runnable_exit(&t);
-	TEST_OK(rn_llc_sum() == 0 && rn_queue_sum() == 0,
-		"release balances the clamped enter");
+	TEST_OK(rn_llc_sum() == 0,
+		"release balances the LLC count of the guarded enter");
 }
 
 static void test_runnable_layout(void)
@@ -1561,7 +1583,7 @@ static void test_adapt_disabled_equals_base(void)
 		"disabled: the guard base keeps the unconditional interactive preemption");
 	TEST_OK(mlfq_check_bands(MLFQ_T_L_NS, MLFQ_T_H_NS,
 				 MLFQ_TREE_T_INT_NS, MLFQ_TREE_T_BOUND_NS),
-		"disabled. base bands keep order");
+		"disabled: the base band pair satisfies the band-order invariants");
 }
 
 /*
@@ -1677,195 +1699,18 @@ static void test_adapt_boundary_exacts(void)
 
 }
 
-static void test_avg_basic(void)
-{
-	struct queue_ctx q;
-
-	q = make_q_sums(1000000, 0, 0, 2000000);
-	TEST_OK(mlfq_avg_queued(&q) == 1000000,
-		"avg: empty queue yields zero base");
-	TEST_OK(mlfq_avg_from_sums(0, 0, 1000000, 0, 0) == 1000000,
-		"avg: empty sums yield zero");
-	TEST_OK(mlfq_avg_from_sums(0, 100, 1000000, 0, 0) == 1000000,
-		"avg: zero sum yields zero base");
-	/* Two tasks at 800000 and 1200000 weight 100 each, avg 1000000. */
-	TEST_OK(mlfq_avg_from_sums(-20000000LL + 20000000LL, 200, 1000000, 0, 0) == 1000000,
-		"avg: symmetric tasks average to the base");
-	/* Single running task is the average. */
-	TEST_OK(mlfq_avg_from_sums(0, 0, 500000, 500000, 100) == 1000000,
-		"avg: single curr yields its vruntime");
-	/* Weighted: task at 0 weight 300 and task at 3000000 weight 100, avg 750000 past base. */
-	{
-		s64 sum = (s64)(0 - 1000000) * 300 + (s64)(3000000 - 1000000) * 100;
-		u64 avg = mlfq_avg_from_sums(sum, 400, 1000000, 0, 0);
-
-		TEST_OK(avg == 750000,
-			"avg: weighted mean follows weights");
-	}
-}
-
-static void test_inflation(void)
-{
-	TEST_OK(mlfq_inflate_lag(0, 100, 100) == 0,
-		"inflation: zero lag stays zero");
-	TEST_OK(mlfq_inflate_lag(100000, 100, 100) == 200000,
-		"inflation: lag doubles when joining equal weight");
-	TEST_OK(mlfq_inflate_lag(-100000, 100, 100) == -200000,
-		"inflation: negative lag inflates symmetric");
-	TEST_OK(mlfq_inflate_lag(100000, 0, 100) == 100000,
-		"inflation: empty queue needs no inflation");
-	TEST_OK(mlfq_inflate_lag(100000, 1000, 100) == 110000,
-		"inflation: heavy queue inflates little");
-}
-
-static void test_clamp_signed(void)
-{
-	TEST_OK(mlfq_entity_lag_raw(1000000, 800000, 3000000) == 200000,
-		"clamp: behind within bound keeps lag");
-	TEST_OK(mlfq_entity_lag_raw(1000000, 0, 3000000) == 1000000,
-		"clamp: behind within bound keeps full lag");
-	TEST_OK(mlfq_entity_lag_raw(1000000, 0, 500000) == 500000,
-		"clamp: behind beyond bound saturates at limit");
-	TEST_OK(mlfq_entity_lag_raw(1000, 1ULL << 40, 3000000) == -3000000,
-		"clamp: ahead beyond bound saturates at negative limit");
-	TEST_OK(mlfq_entity_lag_raw(1000000, 1000000, 3000000) == 0,
-		"clamp: at average lag is zero");
-}
-
-static void test_overflow_shift(void)
-{
-	struct queue_ctx q = make_q(0, 2000000);
-
-	TEST_OK(mlfq_avg_weight(&q, 100) == 100,
-		"shift: zero shift keeps raw weight");
-	q.sum_shift = 2;
-	TEST_OK(mlfq_avg_weight(&q, 100) == 25,
-		"shift: shift 2 quarters the weight");
-	TEST_OK(mlfq_avg_weight(&q, 1) == 2,
-		"shift: scaled weight never drops below minimum");
-	q.sum_shift = MLFQ_SUM_SHIFT_MAX + 5;
-	TEST_OK(mlfq_avg_weight(&q, 10000) >= MLFQ_AVG_MIN_WEIGHT,
-		"shift: overshift clamps to max shift");
-	/* Overflow guard by sign: far ahead key with huge load is ineligible. */
-	TEST_OK(!mlfq_vruntime_eligible_raw(0, 1000000, 0, 1ULL << 60, 0, 0),
-		"overflow: far ahead key is ineligible");
-	TEST_OK(mlfq_vruntime_eligible_raw(0, 1000000, 1ULL << 60, 0, 0, 0),
-		"overflow: far behind key is eligible");
-}
-
-static void test_eligibility_boundary(void)
-{
-	s64 sum_w = 0;
-	s64 sum_wt = 100;
-	u64 zero = 1000000;
-
-	TEST_OK(mlfq_vruntime_eligible_raw(sum_w, sum_wt, zero, 1000000, 0, 0),
-		"eligible: vruntime at average is eligible");
-	TEST_OK(mlfq_vruntime_eligible_raw(sum_w, sum_wt, zero, 999999, 0, 0),
-		"eligible: vruntime behind average is eligible");
-	TEST_OK(!mlfq_vruntime_eligible_raw(sum_w, sum_wt, zero, 1000001, 0, 0),
-		"eligible: vruntime ahead of average is ineligible");
-	TEST_OK(mlfq_vruntime_eligible_raw(0, 0, zero, 1ULL << 40, 0, 0),
-		"stale: empty sums are always eligible");
-	TEST_OK(mlfq_vruntime_eligible_raw(sum_w, sum_wt, zero, 1000000, 0, 100),
-		"eligible: curr inclusion keeps average eligible");
-}
-
-static void test_stale_monotone(void)
-{
-	s64 sum_w = 0;
-	u64 zero = 1000000;
-	s64 delta = 500000;
-
-	mlfq_update_zero_raw(&sum_w, &zero, 100, delta);
-	TEST_OK(zero == 1500000 && sum_w == -50000000LL,
-		"zero: advance keeps sums consistent");
-	/* No-op delta leaves everything unchanged. */
-	mlfq_update_zero_raw(&sum_w, &zero, 100, 0);
-	TEST_OK(zero == 1500000,
-		"zero: zero delta is a no-op");
-}
-
-static void test_tie_determinism(void)
-{
-	struct queue_ctx q = make_q(1000000, 2000000);
-	struct task_ctx a, b;
-
-	memset(&a, 0, sizeof(a));
-	memset(&b, 0, sizeof(b));
-	a.weight = 100;
-	b.weight = 100;
-	a.vruntime = 900000;
-	b.vruntime = 900000;
-	TEST_OK(mlfq_place_entity(&q, &a) == mlfq_place_entity(&q, &b),
-		"tie: identical placements are deterministic");
-	a.vruntime = 800000;
-	b.vruntime = 900000;
-	/* Earlier vruntime yields earlier or equal deadline, deterministic order. */
-	{
-		u64 da = mlfq_place_entity_deadline(&q, &a);
-		u64 db = mlfq_place_entity_deadline(&q, &b);
-
-		TEST_OK(da <= db,
-			"tie: earlier vruntime never loses the deadline tie");
-	}
-}
-
-static void test_initial_vs_firstrun(void)
-{
-	struct queue_ctx q = make_q(5000000, 2000000);
-	struct task_ctx t;
-
-	memset(&t, 0, sizeof(t));
-	t.weight = 100;
-	t.vruntime = 0;
-	t.flags = MLFQ_TF_INITIAL | MLFQ_TF_FIRST_RUN;
-	TEST_OK(mlfq_place_entity(&q, &t) == 5000000 + 1000000 &&
-		t.vruntime == 5000000 && !(t.flags & MLFQ_TF_INITIAL) &&
-		(t.flags & MLFQ_TF_FIRST_RUN),
-		"initial: joins at average with half slice, clears INITIAL only");
-	t.flags &= ~MLFQ_TF_FIRST_RUN;
-	TEST_OK(mlfq_place_entity(&q, &t) != 0 && t.vruntime != 0,
-		"firstrun: after clear the full slice applies");
-}
-
-static void test_rel_deadline(void)
-{
-	struct queue_ctx q = make_q(1000000, 2000000);
-	struct task_ctx t;
-
-	memset(&t, 0, sizeof(t));
-	t.weight = 100;
-	t.vruntime = 900000;
-	t.deadline = 500000;
-	t.flags = MLFQ_TF_REL_DEADLINE;
-	TEST_OK(mlfq_place_entity_deadline(&q, &t) == 1400000,
-		"rel: relative deadline adds placed vruntime");
-}
-
-static void test_update_deadline_noop(void)
-{
-	u64 d = 2000000;
-
-	TEST_OK(!mlfq_update_deadline_raw(1000000, &d, 2000000) && d == 2000000,
-		"deadline: vruntime before deadline is a no-op");
-	TEST_OK(mlfq_update_deadline_raw(2000000, &d, 2000000) && d == 4000000,
-		"deadline: vruntime at deadline moves by one slice");
-	TEST_OK(mlfq_update_deadline_raw(5000000, &d, 2000000) && d == 7000000,
-		"deadline: vruntime past deadline moves");
-}
-
-/* Veristat bounds are checked by the veristat configs, no stub here. */
-
 int main(void)
 {
 	test_calc_delta_fair();
+	test_calc_delta_clamp();
 	test_place_entity();
 	test_place_entity_weight_edges();
 	test_place_charge_replacement();
 	test_place_entity_deadline_pure();
 	test_sameq_preempt_owed();
 	test_clock_advance();
+	test_clock_read_eligible();
+	test_place_lag_first_run();
 	test_ema_climb();
 	test_ema_decay();
 	test_sys_lat_fold();
@@ -1902,16 +1747,6 @@ int main(void)
 	test_runnable_layout();
 	test_steer_pick_llc();
 	test_steer_loop_bound();
-	test_avg_basic();
-	test_inflation();
-	test_clamp_signed();
-	test_overflow_shift();
-	test_eligibility_boundary();
-	test_stale_monotone();
-	test_tie_determinism();
-	test_initial_vs_firstrun();
-	test_rel_deadline();
-	test_update_deadline_noop();
 
 	if (nr_failed) {
 		printf("%d test(s) FAILED\n", nr_failed);

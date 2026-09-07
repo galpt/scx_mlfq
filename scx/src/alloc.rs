@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2026 Galih Tama <galpt@v.recipes>
 
+#![allow(dead_code, unused_imports)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "count_alloc")]
@@ -10,20 +12,16 @@ use std::alloc::{GlobalAlloc, Layout, System};
 /// `count_alloc` feature is enabled. The global allocator below bumps
 /// these on every heap allocation, so a hot-path iteration that stays at
 /// zero proves the zero-allocation guarantee.
-#[allow(dead_code)]
 pub static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-#[allow(dead_code)]
 pub static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Reset the counters to zero. Call before a measurement window.
-#[allow(dead_code)]
 pub fn reset_counters() {
     ALLOC_COUNT.store(0, Ordering::Relaxed);
     ALLOC_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// Read the current counters.
-#[allow(dead_code)]
 pub fn counters() -> (usize, usize) {
     (
         ALLOC_COUNT.load(Ordering::Relaxed),

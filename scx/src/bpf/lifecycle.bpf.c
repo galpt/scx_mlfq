@@ -20,16 +20,19 @@
  * acquisition is observed at ops.running().
  */
 
-/*
- * Sleep cadence update. N is 32 with weight 8 on the new sample.
- * Takes the task and the sleep interval in nsecs.
- * Updates mean and var EMAs and the var over mean squared ratio.
- * Long idle over 120ms decays the EMAs to zero.
+/**
+ * mlfq_sleep_ema_update - N=32 EWMA for sleep cadence (α=8/256).
+ * @tctx: Task context.
+ * @sleep_ns: Sleep interval, clamped.
+ *
+ * Updates mean/var EMAs and var/mean² ratio FP_SHIFT 8 saturate
+ * 0..1024. Long idle >120ms decays the EMAs via mlfq_ema_decay.
+ * Observer helper: stopping observes sleep state, Strategy:
+ * ratio computation is pluggable without vtable.
  */
 static __always_inline void mlfq_sleep_ema_update(struct task_ctx *tctx,
 						  u64 sleep_ns)
 {
-/* Cadence EMA tracks sleep mean and var. */
 	u64 old_mean, new_mean, var, mean2, ratio, diff, diff2;
 	s64 sdiff;
 
@@ -96,8 +99,10 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 	tctx->last_run_at = 0;
 	tctx->last_sleep_at = scx_bpf_task_running(p) ? 0 : now;
 	tctx->queued_at = 0;
-	tctx->weight = mlfq_eevdf_weight(p->scx.weight);
-	tctx->flags = MLFQ_TF_FIRST_RUN | MLFQ_TF_INITIAL;
+	tctx->weight = p->scx.weight;
+	if (!tctx->weight)
+		tctx->weight = 1;
+	tctx->flags = MLFQ_TF_FIRST_RUN;
 	tctx->wake_cpu_state = 0;
 	tctx->sleep_mean_ema = 0;
 	tctx->sleep_var_ema = 0;
@@ -122,23 +127,6 @@ static __always_inline void mlfq_reset_task_ctx(struct task_ctx *tctx,
 	tctx->last_wake_lat_ns = 0;
 	tctx->last_q_wait_ns = 0;
 	tctx->sq_ema = 0;
-	tctx->prev_burst_ns = 0;
-	tctx->last_sample_at = 0;
-	/* Pending sample starts empty, no capture is in flight. */
-	tctx->pending_feats.prev_burst_ns = 0;
-	tctx->pending_feats.sleep_ns = 0;
-	tctx->pending_feats.ema = 0;
-	tctx->pending_feats.io_wait = 0;
-	tctx->pending_feats.wake_cnt = 0;
-	tctx->pending_feats.wake_lat_us = 0;
-	tctx->pending_feats.queue_wait_us = 0;
-	tctx->pending_feats.sq_ema = 0;
-	tctx->pending_feats.sleep_var_ratio = 0;
-	tctx->pending_feats.pad = 0;
-	tctx->pending_feats.gpu_submit = 0;
-	tctx->pending_feats.pad2 = 0;
-	tctx->pending_queue = 0;
-	tctx->pending_valid = 0;
 	mlfq_reset_classification(tctx);
 }
 
@@ -197,8 +185,6 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 		cpu->running_deadline = tctx->deadline;
 		cpu->run_start_at = now;
 		cpu->running_gpu_submit = tctx->gpu_submit;
-		cpu->running_weight = tctx->weight ? tctx->weight : 1;
-		cpu->running_vruntime = tctx->vruntime;
 	}
 
 	/*
@@ -220,7 +206,7 @@ void BPF_STRUCT_OPS(mlfq_running, struct task_struct *p)
 	tctx->last_run_at = now;
 	tctx->flags &= ~MLFQ_TF_FIRST_RUN;
 
-	/* Mark Q1 occupancy for SMT isolation in the per-CPU map. */
+	/* Observer: mark Q1 occupancy for SMT isolation (per-CPU map, no __sync). */
 	mlfq_q1_set((u32)cpu_id, tctx->queue == 1);
 
 	/*
@@ -299,7 +285,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 	tctx->last_run_at = 0;
 
 	if (delta) {
-		/* Ordered service accounting: charge, deadline, average. */
+		/* vruntime advance + EMA climb for this run segment. */
 		mlfq_update_vruntime(tctx, delta);
 		mlfq_ema_climb_task(tctx, delta);
 		/*
@@ -323,40 +309,19 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 						      mlfq_budget_max_ns,
 						      mlfq_alpha);
 			cpu->cpu_ema_at = now;
-			cpu->running_vruntime = tctx->vruntime;
-			cpu->running_weight = tctx->weight ? tctx->weight : 1;
 		}
 		/*
-		 * Deadline refresh comes after the charge and before the
-		 * average publish. When vruntime is still before the
-		 * deadline, this is a no-op and the task keeps its request.
-		 * When it reached the deadline, one virtual slice is added.
-		 * A run-out re-enqueue carries flags == 0 and always charges
-		 * the full segment here, so the next placement sees the
-		 * complete service.
+		 * Advance the owning queue's virtual clock with the
+		 * virtual time just charged. The clock follows the
+		 * service given to the queue, and placement anchors new
+		 * arrivals to it. The queue lookup can fail when the task's
+		 * queue state was not carried over, which is tolerated. The
+		 * clock only needs to be near the service point and the
+		 * placement clamp bounds the staleness.
 		 */
-		q = mlfq_lookup_queue(mlfq_clamp_qid(tctx->queue));
-		if (q) {
-			u64 vslice = calc_delta_fair_bpf(q->max_slice_ns,
-							 tctx->weight ? tctx->weight : 1);
-
-			if (mlfq_update_deadline_raw(tctx->vruntime, &tctx->deadline, vslice))
-				__sync_fetch_and_add(&mlfq_stats.eevdf_deadline_miss, 1);
-			mlfq_publish_avg(q, tctx);
+		q = mlfq_lookup_queue(tctx->queue);
+		if (q)
 			mlfq_queue_advance_clock(q, tctx->vruntime);
-			/* Keep the preempted record fresh, it stays for the next wakeup test. */
-			if (cpu && runnable)
-				cpu->running_deadline = tctx->deadline;
-			/* Queued spread beyond one bound is divergence. */
-			{
-				u64 avg = mlfq_avg_queued(q);
-				u64 lim = mlfq_lag_limit(q, tctx->weight ? tctx->weight : 1);
-				s64 raw = (s64)(avg - q->clock);
-
-				if (raw > (s64)lim || raw < -(s64)lim)
-					__sync_fetch_and_add(&mlfq_stats.eevdf_divergence, 1);
-			}
-		}
 		__sync_fetch_and_add(&mlfq_stats.total_runtime, delta);
 
 		tctx->prev_burst_ns = delta;
@@ -460,7 +425,6 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		tctx->last_sleep_at = now;
 
 	/* Clear Q1 occupancy on stopping (task leaves CPU); isolated per-CPU map store. */
-/* Stopping clears Q1 occupancy on the CPU. */
 	mlfq_q1_set((u32)bpf_get_smp_processor_id(), false);
 
 	/*
@@ -477,8 +441,6 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
 		cpu->running_deadline = 0;
 		cpu->run_start_at = 0;
 		cpu->running_gpu_submit = 0;
-		cpu->running_weight = 0;
-		cpu->running_vruntime = 0;
 	}
 
 	/* Diagnostic runnable count. Guard against wrap-around. */
@@ -501,10 +463,7 @@ void BPF_STRUCT_OPS(mlfq_stopping, struct task_struct *p, bool runnable)
  * exit signal for this accounting because it fires only while ops_state
  * is QUEUED, which the dispatch moves leave set for same-rq moves and
  * clear for remote transfers. A release of a task with no recorded
- * ownership is a no-op (idempotent against a racing transfer). A task
- * leaving from a queue DSQ still holds its sums entry for the stored
- * queue, so it leaves the sums here as well; a task leaving from
- * running or the local DSQ holds no entry and the leave is a no-op.
+ * ownership is a no-op (idempotent against a racing transfer).
  */
 void BPF_STRUCT_OPS(mlfq_quiescent, struct task_struct *p, u64 deq_flags)
 {
@@ -514,7 +473,6 @@ void BPF_STRUCT_OPS(mlfq_quiescent, struct task_struct *p, u64 deq_flags)
 	if (!tctx)
 		return;
 
-	mlfq_sums_leave(tctx);
 	mlfq_runnable_exit(tctx);
 }
 
@@ -542,7 +500,7 @@ void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 
 	if (idle) {
 		__sync_fetch_and_add(&mlfq_idle_count, 1);
-	} else if (mlfq_idle_count) {
+	} else {
 		__sync_fetch_and_sub(&mlfq_idle_count, 1);
 	}
 
@@ -560,7 +518,7 @@ void BPF_STRUCT_OPS(mlfq_update_idle, s32 cpu, bool idle)
 		if (llc < MLFQ_MAX_LLCS && llc < mlfq_nr_llcs) {
 			if (idle)
 				__sync_fetch_and_add(&mlfq_llc_idle[llc], 1);
-			else if (mlfq_llc_idle[llc])
+			else
 				__sync_fetch_and_sub(&mlfq_llc_idle[llc], 1);
 		}
 	}
@@ -585,25 +543,13 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
 	 * occupied; the store is per-CPU map, no __sync_* on the BSS
 	 * stats line, and SCX_ENQ_IMMED remains LOCAL-only.
 	 */
-	if (mlfq_clamp_qid(tctx->queue) == 1) {
+	if (tctx->queue == 1) {
 		s32 cpu = scx_bpf_task_cpu(p);
 
-		if (cpu >= 0 && cpu < (s32)MLFQ_MAX_CPUS) {
-			struct mlfq_cpu_state *st = mlfq_lookup_cpu_state(cpu);
-
-			/* Only the running task owns the slot. */
-			if (st && st->running_pid == p->pid &&
-			    mlfq_q1_is_occupied((u32)cpu))
-				mlfq_q1_set((u32)cpu, false);
-		}
+		if (cpu >= 0 && cpu < (s32)MLFQ_MAX_CPUS &&
+		    mlfq_q1_is_occupied((u32)cpu))
+			mlfq_q1_set((u32)cpu, false);
 	}
-
-	/*
-	 * A task exiting from a queue DSQ still holds its sums entry.
-	 * Leave it before the storage is freed, so the per-queue sums do
-	 * not leak. A task with no entry is a no-op.
-	 */
-	mlfq_sums_leave(tctx);
 
 	bpf_task_storage_delete(&task_ctx_stor, p);
 }

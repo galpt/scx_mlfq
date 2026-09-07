@@ -56,7 +56,7 @@ static __always_inline bool mlfq_demotion_blocked(const struct task_struct *p)
  * is intentionally not named p, because BPF_CORE_READ_BITFIELD() declares
  * its own local named p and would shadow it.
  *
- * Gives true if @task is an I/O waiter.
+ * Return: true if @task is an I/O waiter.
  */
 static __always_inline bool mlfq_task_io_wait(const struct task_struct *task)
 {
@@ -71,7 +71,7 @@ static __always_inline bool mlfq_task_io_wait(const struct task_struct *task)
 /*
  * SCHED_IDLE tasks always run in Q3.
  *
- * Gives true if @p is SCHED_IDLE.
+ * Return: true if @p is SCHED_IDLE.
  */
 static __always_inline bool mlfq_apply_sched_idle(const struct task_struct *p,
 						  struct task_ctx *tctx)
@@ -207,7 +207,6 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * clamp without the seed still starves Q3, and the seed without
 	 * the clamp still pollutes Q3.
 	 */
-/* Q3 clamp and seed stay paired. */
 	if (pred >= mlfq_adapt_state.t_bnd_eff_ns && tctx->gpu_submit > 0 &&
 	    !(sleep_ns > mlfq_short_sleep_ns ||
 	      tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns))
@@ -220,7 +219,7 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 		 * the run-out gate (mlfq_demote_on_reenq) with its
 		 * consecutive-exhaustion hysteresis, so a single wakeup
 		 * prediction can never demote a task. This is the
-		 * plain MLFQ gap. tree_disagree compares the
+		 * classic MLFQ asymmetry. tree_disagree compares the
 		 * mapping result against the EMA base band.
 		 */
 		tctx->queue = mlfq_tree_map_queue(pred, tctx->queue,
@@ -301,7 +300,7 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * implement gpu_submit as Q1-only, not Q3-defining. Keep both;
 	 * removing either reintroduces Q3 starvation or Q3 pollution.
 	 *
-	 * Rule. I/O latency is strictly dominant. The seed is
+	 * Invariant: I/O latency is strictly dominant. The seed is
 	 * gated on !io_wait and ordered after the I/O/short-sleep boost
 	 * (mlfq_ss_boost_pending() / mlfq_boost_eligible()), so a task
 	 * waking from I/O stays in Q1 for this episode even when its
@@ -311,9 +310,9 @@ static __always_inline void mlfq_wakeup_classify(const struct task_struct *p,
 	 * seeds on the run-out path with no sleep guard (sleep == 0,
 	 * io_wait == 0 there) and is left unchanged.
 	 *
-	 * One branch, no loop. Keeps per-queue EEVDF bounded lag and
-	 * the 64, 84 and 240 byte task layouts with dedup stamp.
-	 * Verifier stays within 1M insn and 512B stack caps.
+	 * One branch, no loop. Preserves per-queue EEVDF bounded lag and
+	 * the 64/84/240 V4 NR9 ABI (task_ctx 240 with dedup timestamp);
+	 * verifier stays within 1M insn / 512B stack.
 	 */
 	if (!io_wait && tctx->gpu_submit == 0 &&
 	    tctx->prev_burst_ns > mlfq_adapt_state.t_h_eff_ns &&
@@ -396,8 +395,8 @@ static __always_inline void mlfq_runout_classify(const struct task_struct *p,
 	 * Q3 labels once the tree splits on gpu_submit. Force one Q3
 	 * placement so the next window regains Q3 labels. No sleep check
 	 * here: a run-out re-enqueue has sleep == 0 and io_wait == 0 by
-	 * construction (see the capture above), so the I/O rule
-	 * and the MLFQ_SHORT_SLEEP_NS guard only apply to the
+	 * construction (see the capture above), so the I/O-dominance
+	 * invariant and the MLFQ_SHORT_SLEEP_NS guard only apply to the
 	 * wakeup seed in mlfq_wakeup_classify(). One branch, no loop.
 	 */
 	if (tctx->gpu_submit == 0 &&
