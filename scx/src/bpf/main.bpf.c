@@ -113,6 +113,19 @@ volatile u32 mlfq_steal_scan;
 volatile u32 mlfq_idle_count;
 
 /*
+ * Startup gate for the takeover drain and the shared
+ * kicks. mlfq_init_done is set once at the end of
+ * mlfq_init(), after the queue DSQ loop and the id
+ * space check. mlfq_created_cpus snapshots the CPU
+ * count the DSQs were created for. A create failure
+ * returns before either is set, so every early path
+ * stays inert. Both are zero by BSS default, which
+ * is the closed gate.
+ */
+volatile u8 mlfq_init_done;
+volatile u32 mlfq_created_cpus;
+
+/*
  * Per-LLC and per-queue runnable gauges, maintained by
  * mlfq_runnable_enter()/mlfq_runnable_exit() at every tracked insert
  * and leave-runnable event. mlfq_llc_runnable[llc] is the number of
@@ -851,6 +864,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mlfq_init)
 	mlfq_adapt_state.t_int_eff_ns = mlfq_tree_t_int_ns;
 	mlfq_adapt_state.t_bnd_eff_ns = mlfq_tree_t_bound_ns;
 	mlfq_adapt_state.guard_eff_ns = mlfq_sameq_preempt_min_run_ns;
+
+	/*
+	 * Publish the startup gate last. The DSQ loop and the
+	 * id space check above have proven the queue ids, so
+	 * the snapshot covers exactly the created set. A
+	 * create failure returns before this point and leaves
+	 * the gate closed, so the drain stays inert.
+	 */
+	mlfq_created_cpus = nr_cpus;
+	mlfq_init_done = 1;
 
 	return 0;
 }

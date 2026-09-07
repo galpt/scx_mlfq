@@ -197,7 +197,10 @@ mlfq_dispatch_queue(s32 cpu, u8 qid, u32 quota,
 			tier_a_nr = MLFQ_LLC_SCAN_MAX;
 	}
 
-	/* Hoist off and mlfq_dsq_id reuse: off computed once per queue, dsq ids reused via locals. 3072 tail cut documented: MLFQ_ALPHA 3072 is the EMA tail cut. No new bpf_for. */
+	/*
+	 * The steal offset is computed once per queue, so the
+	 * rotating window is shared by both tiers.
+	 */
 	u32 off = cpu_state ? cpu_state->steal_scan_off % (u32)nr_cpus : 0;
 
 	bpf_for(slot, 0, quota) {

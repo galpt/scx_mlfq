@@ -113,17 +113,17 @@ static __always_inline void mlfq_stamp_enq_at(struct task_ctx *tctx, u64 now,
 }
 
 /*
- * Shared queue kick discipline. Local inserts (FIFO or preempt) never kick:
- * the owner drains its local DSQ without one, and a kick there is a wasted
- * IPI. A queue-DSQ insert kicks only via the constrained helper in
- * rtdl.bpf.c (another CPU, not occupied, and either the selection was
- * skipped or the task is affinity-constrained). The helper is the single
- * kick site for shared queues.
+ * Shared queue kick rule.
+ * A local insert never kicks.
+ * A redirected insert always kicks when the target can run it.
+ * A plain insert kicks only when no claim was made or when the task
+ * can run on a few CPUs only. One call site for shared queues.
  */
 static __always_inline void mlfq_idle_kick_shared(const struct task_struct *p,
-						  u64 enq_flags, s32 target_cpu)
+						  u64 enq_flags, s32 target_cpu,
+						  bool redirected)
 {
-	if (mlfq_needs_shared_kick(p, enq_flags, target_cpu))
+	if (mlfq_needs_shared_kick(p, enq_flags, target_cpu, redirected))
 		scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
 }
 
@@ -137,6 +137,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	bool wakeup, runout, local_fast_path, migration_disabled;
 	bool sched_idle;
 	bool skip_preempt = false;
+	bool redirected = false;
 	s32 prev_cpu = scx_bpf_task_cpu(p);
 	s32 target_cpu;
 
@@ -490,7 +491,8 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	 * where the takeover drain or the steal scans serve it. A pinned
 	 * task cannot legally run elsewhere.
 	 */
-	if ((wakeup || (enq_flags & SCX_ENQ_REENQ)) &&
+	if (mlfq_init_done &&
+	    (wakeup || (enq_flags & SCX_ENQ_REENQ)) &&
 	    (mlfq_cpu_occupied(target_cpu) ||
 	     is_smt_sibling_q1_busy(target_cpu))) {
 		bool rt_occ = mlfq_cpu_occupied(target_cpu);
@@ -504,6 +506,7 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 		skip_preempt = true;
 		if (fallback >= 0 && fallback != target_cpu) {
 			target_cpu = fallback;
+			redirected = true;
 			__sync_fetch_and_add(&mlfq_stats.rt_redirects, 1);
 		}
 	}
@@ -646,8 +649,11 @@ void BPF_STRUCT_OPS(mlfq_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Keep the fast-path state from leaking into the next enqueue. */
 	tctx->wake_cpu_state = 0;
 
-	/* Shared queue kick only: constrained or selection-skipped, never after a local. */
-	mlfq_idle_kick_shared(p, enq_flags, target_cpu);
+	/*
+	 * A redirected task always kicks the new target.
+	 * The old claim does not cover it.
+	 */
+	mlfq_idle_kick_shared(p, enq_flags, target_cpu, redirected);
 
 done:
 	mlfq_op_lat_charge(MLFQ_OP_LAT_ENQUEUE, op_lat_start);
