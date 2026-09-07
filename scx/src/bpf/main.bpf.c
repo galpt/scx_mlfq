@@ -653,22 +653,22 @@ static __always_inline bool mlfq_cpu_allowed(const struct task_struct *p,
 /*
  * Arity stable requeue wrappers with a version gate.
  * Each wrapper keeps one call shape on every kernel.
- * The gate probes the kfunc once per call, so old
+ * The gate checks the release once per call, so old
  * kernels skip the call without a new branch.
  */
 static __always_inline bool mlfq_reenqueue_one(u64 dsq)
 {
-	if (!__COMPAT_has_generic_reenq())
+	if (LINUX_KERNEL_VERSION < KERNEL_VERSION(7, 1, 0))
 		return false;
-	scx_bpf_dsq_reenq___compat(dsq, 0);
+	scx_bpf_dsq_reenq(dsq, 0);
 	return true;
 }
 
 static __always_inline bool mlfq_reenqueue_local_step(void)
 {
-	if (!__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
+	if (LINUX_KERNEL_VERSION < KERNEL_VERSION(6, 19, 0))
 		return false;
-	scx_bpf_reenqueue_local___v2___compat();
+	scx_bpf_reenqueue_local_from_anywhere();
 	return true;
 }
 

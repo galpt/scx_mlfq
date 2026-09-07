@@ -331,8 +331,8 @@ static __always_inline void mlfq_rtdl_drain(s32 cpu, u64 now)
  * which is exactly the invariant the placement redirect needs. The
  * program is loaded on every kernel. The flag logic alone drives
  * placement even where the evacuation cannot run, and the evacuation
- * branch inside is ksym-gated so it self-prunes on kernels without the
- * reenqueue kfunc. The drain itself stays inert before the init gate,
+ * branch inside is version gated so it folds away on older releases
+ * without the reenqueue calls. The drain stays inert before the init gate,
  * so early switches during attach cannot name a queue that does not
  * exist yet. The body is straight-line with at most a few bounded
  * map operations per switch. There are no loops.

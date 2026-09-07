@@ -586,16 +586,15 @@ void BPF_STRUCT_OPS(mlfq_exit_task, struct task_struct *p,
  * guard and the stall watchdog cap the pathological loop.
  * scx_bpf_reenqueue_local() is restricted to this callback (ext.c).
  *
- * On kernels with the call-from-anywhere reenqueue
- * (scx_bpf_reenqueue_local___v2, v6.19+), the sched_switch hook in
- * rtdl.bpf.c evacuates the local DSQ on a higher-priority-class
+ * On kernels with the call from anywhere reenqueue,
+ * version 6.19 and later, the sched switch hook in
+ * rtdl.bpf.c evacuates the local DSQ on a higher priority class
  * takeover, so this callback has nothing left to drain there and stays
- * out of the way. On 6.18 it is the only local-DSQ evacuation path and
- * does the drain. The gate is the compat layer's ksym probe on the v2
- * kfunc, dead-folded to the drain on 6.18. The ops slot is registered on
- * every kernel (the ops initializer cannot fold the probe), so on newer
- * kernels the callback still engages the cpu_acquire/cpu_release
- * takeover path but does no work.
+ * out of the way. On 6.18 it is the only local DSQ evacuation path and
+ * does the drain. The gate is a compile time version check,
+ * folded to the drain on 6.18. The ops slot is registered on
+ * every kernel, so on newer kernels the callback still runs
+ * the takeover path but does no work.
  */
 void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
 {
@@ -605,13 +604,13 @@ void BPF_STRUCT_OPS(mlfq_cpu_release, s32 cpu, struct scx_cpu_release_args *args
 	 * must not survive a CPU offline when the CPU never cleared
 	 * its slot via stopping()/exit_task. Per-CPU map store, no
 	 * __sync_* on a shared line, never SCX_ENQ_HEAD, and bounded
-	 * bpf_for is untouched. Clear before the 7.1+ early return so
-	 * the drain-skip path still heals the veto.
+	 * bpf for is untouched. Clear before the 6.19 and later early return so
+	 * the drain skip path still heals the veto.
 	 */
 	if (cpu >= 0 && cpu < (s32)MLFQ_MAX_CPUS)
 		mlfq_q1_set((u32)cpu, false);
 
-	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
+	if (LINUX_KERNEL_VERSION >= KERNEL_VERSION(6, 19, 0)) {
 		mlfq_op_lat_charge(MLFQ_OP_LAT_CPU_RELEASE, op_lat_start);
 		return;
 	}
