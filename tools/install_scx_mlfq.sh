@@ -36,7 +36,7 @@
 # Usage. sudo bash install_scx_mlfq.sh [options]
 #
 # The scheduler sources come from the standalone repository
-# (https://github.com/galpt/scx_mlfq.git, branch archive/v2.0.0). The workspace
+# (https://github.com/galpt/scx_mlfq.git, branch archive/v2.0.1). The workspace
 # repository provides the sched-ext build environment and the scheduler
 # crate is copied into its scheds/experimental/scx_mlfq/ directory.
 #
@@ -73,7 +73,7 @@ SCX_OPS_FILE="/sys/kernel/sched_ext/root/ops"
 SCX_LOADER_CONFIG="/etc/scx_loader.toml"
 
 DEFAULT_STANDALONE_REPO="https://github.com/galpt/scx_mlfq.git"
-DEFAULT_STANDALONE_BRANCH="archive/v2.0.0"
+DEFAULT_STANDALONE_BRANCH="archive/v2.0.1"
 DEFAULT_REPO="https://github.com/galpt/scx.git"
 DEFAULT_BRANCH="main"
 
@@ -204,7 +204,7 @@ Options:
   --help, -h         Print this help text and exit.
 
 The scheduler sources are always taken from the standalone repository
-(https://github.com/galpt/scx_mlfq.git, branch archive/v2.0.0). The workspace
+(https://github.com/galpt/scx_mlfq.git, branch archive/v2.0.1). The workspace
 repository only provides the sched-ext build environment. The scheduler
 crate is copied into scheds/experimental/scx_mlfq/ of the workspace
 before building.

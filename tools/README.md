@@ -68,7 +68,7 @@ Defaults (matching the beta-testing workflow).
 | `--source-dir` | unset (clone from `--repo`/`--branch` instead) |
 
 The scheduler sources come from `https://github.com/galpt/scx_mlfq.git`,
-branch `archive/v2.0.0`, and are copied into the workspace before building.
+branch `archive/v2.0.1`, and are copied into the workspace before building.
 
 Options.
 
