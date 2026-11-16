@@ -18,16 +18,13 @@ to preview what they would do.
 
 `scx_mlfq` is an experimental sched_ext CPU scheduler for Linux, written in
 Rust with a BPF component. It implements a Multilevel Feedback Queue (MLFQ)
-discipline on top of EEVDF-style virtual-time scheduling. Three queues per
-CPU (Q1/Q2/Q3), each a vtime-ordered dispatch queue, hold the tasks, and a
-continuous EMA-based interactivity gauge (plus hysteresis) decides which
-queue a task lives in. Interactive-first desktop and latency workloads are
-served from Q1, batch work is demoted toward Q3. Like all sched_ext
-schedulers it handles **non-RT tasks only**, so the kernel's rt and dl
-classes are untouched. The scheduler attaches directly to the kernel and is
-observed through the kernel's sched_ext interface, `scx_mlfq --stats`, and,
-since 1.3.0, a realtime web UI on the loopback port 50005 (see the "Web UI
-and the loader network sandbox" section below).
+discipline. Tasks drop through eight feedback levels while they run without
+sleeping (20 ms on the top level, doubling on each level below) and go back
+to the top level when they wake up. Tasks wait in one virtual deadline DSQ
+per LLC (per-CPU DSQs for pinned tasks). Like all sched_ext schedulers it
+handles **non-RT tasks only**, so the kernel's rt and dl classes are
+untouched. The scheduler attaches directly to the kernel and is observed
+through the kernel's sched_ext interface and `scx_mlfq --stats`.
 
 ## Prerequisites
 
@@ -67,8 +64,11 @@ Defaults (matching the beta-testing workflow).
 | Option | Default |
 |---|---|
 | `--repo` | `https://github.com/galpt/scx.git` |
-| `--branch` | `scx_mlfq` |
+| `--branch` | `main` |
 | `--source-dir` | unset (clone from `--repo`/`--branch` instead) |
+
+The scheduler sources come from `https://github.com/galpt/scx_mlfq.git`,
+branch `archive/v2.0.0`, and are copied into the workspace before building.
 
 Options.
 
@@ -89,7 +89,7 @@ Options.
 Examples.
 
 ```bash
-# Default. Clone galpt/scx branch scx_mlfq and install everything
+# Default. Clone galpt/scx branch main and install everything
 sudo bash install_scx_mlfq.sh
 
 # Preview without touching the system
@@ -178,9 +178,6 @@ Options.
 - `--force`. Back up and replace a conflicting pre-existing loader drop-in
   (to `/usr/lib/scx/scx_loader.service.d.mlfq-loader.conf.bak`) instead of
   refusing.
-- `--no-webui`. Skip the web UI network unblock. The loader sandbox stays
-  in place and the web UI uses the unix-socket fallback
-  `/tmp/scx_mlfq.sock` (see the web UI section below).
 - `--dry-run`. Validate inputs and print every action without downloading,
   building, or changing the system.
 - `--help`, `-h`. Print help.
@@ -205,58 +202,11 @@ What it does, in order.
 6. Records the install in `/usr/lib/scx/scx_mlfq-loader.manifest`
    (its own manifest, separate from the beta manifest), so the uninstaller
    can undo exactly this step.
-7. Unblocks the web UI's network path. It writes
-   `scx_loader.service.d/mlfq-webui.conf`, whose empty
-   `RestrictAddressFamilies=` / `SocketBindDeny=` assignments lift the
-   network sandbox the packaged `scx_loader.service` applies to its
-   scheduler children, so a loader-spawned scx_mlfq can bind its loopback
-   web UI port (50005). The write is atomic and idempotent, the drop-in
-   carries a marker comment, `webui_unblock=1` is recorded in the loader
-   manifest, and the `daemon-reload` in the restart step activates it. The
-   unblock applies to the next loader-spawned scheduler. `--no-webui`
-   skips this step entirely (the web UI then uses the unix-socket
-   fallback).
+The installer and uninstaller also remove a `mlfq-webui.conf` drop-in left
+by a 1.3.x install when it is byte-identical to what 1.3.x wrote.
 
 After it finishes, the Kernel Manager GUI dropdown lists scx_mlfq. One
 more step is needed before the GUI can apply it (see below).
-
-## Web UI and the loader network sandbox
-
-Since 1.3.0, scx_mlfq ships a realtime web UI (loopback-only, port 50005 on
-`[::1]`/`127.0.0.1`, no auth, the localhost trust boundary). The packaged
-`scx_loader.service` sandboxes the schedulers it spawns with
-`RestrictAddressFamilies=AF_UNIX` and `SocketBindDeny=...`, so a
-loader-spawned scx_mlfq inherits the restriction and cannot bind the TCP
-port. The loader installer therefore writes a systemd drop-in
-`scx_loader.service.d/mlfq-webui.conf` whose empty assignments
-(`RestrictAddressFamilies=`, `SocketBindDeny=`) reset both settings for the
-loader and the scheduler children it spawns.
-
-- **Lifecycle.** The installer writes the drop-in atomically
-  (`mktemp` + `mv`) and idempotently (re-runs leave byte-identical bytes).
-  The uninstaller removes it only when the loader manifest records
-  `webui_unblock=1` or the file byte-matches the installer's content, then
-  reloads systemd and restarts an active loader, restoring the
-  packaged sandbox. If the install fails after the drop-in was written, an
-  EXIT trap removes it again. The fixed filename
-  `mlfq-webui.conf` plus the byte check guarantee that a foreign drop-in
-  in the same directory is never touched.
-- **State detection.** Both scripts query the effective merged values with
-  `systemctl show -p RestrictAddressFamilies -p SocketBindDeny
-  scx_loader.service` and report whether the sandbox is in force, already
-  lifted (e.g. by a foreign drop-in), or our drop-in is present and
-  matching. The detection reports but never gates the write.
-- **Opt-out.** `--no-webui` skips the unblock entirely. The web UI then
-  falls back to the unix socket `/tmp/scx_mlfq.sock` (AF_UNIX is permitted
-  by the sandbox, only inet binds are denied). The socket is created mode
-  0600, so connecting needs root. View it with
-  `sudo socat TCP-LISTEN:50005 UNIX-CONNECT:/tmp/scx_mlfq.sock`.
-- **Security tradeoff.** The drop-in is per-unit, not per-binary. It lifts
-  the network sandbox for the loader and **every** scheduler it spawns, not
-  just scx_mlfq. systemd drop-ins cannot target a single child binary, so
-  no narrower alternative exists. The tradeoff is printed by the installer,
-  the unblock is removable through the uninstaller, and `--no-webui`
-  avoids it entirely.
 
 ## GUI integration (select and apply scx_mlfq in the GUI)
 
@@ -341,14 +291,6 @@ The uninstaller is **manifest-driven and idempotent**.
   same way), and the loader drop-in (only when it byte-matches), reloads
   systemd so the stock loader's `ExecStart` takes effect, and restarts an
   active loader. The loader service itself is never disabled.
-- It removes the web UI unblock drop-in
-  `scx_loader.service.d/mlfq-webui.conf` only when the loader manifest
-  records `webui_unblock=1` or the file byte-matches the loader
-  installer's content (an extra check for a lost manifest), reloads
-  systemd and restarts an active loader, then reports the effective
-  `RestrictAddressFamilies`/`SocketBindDeny` values. "Network sandbox
-  restored", or "still lifted" when a foreign drop-in remains (reported,
-  never touched). The summary gains a `Web UI unblock:` row.
 - If the GUI manifest exists, it restores the packaged
   `/usr/lib/libscxctl-ui.so.1.15.12` from the recorded backup (only when
   the current library still matches the patched build, otherwise the
@@ -412,20 +354,6 @@ After that, normal CachyOS tooling owns the binary. The GUI manages
 scx_mlfq directly once CachyOS also adds it to the loader's scheduler list
 (their pattern when packaging a new scheduler), and until then the
 patched-loader installer above keeps working.
-
-**Does scx_mlfq have a web UI or listen on a port?**
-
-Since 1.3.0, yes by default. A realtime web UI on the loopback address
-(`[::1]:50005`, falling back to `127.0.0.1:50005`), no auth (the localhost
-trust boundary, any local process can already read the scheduler's
-counters, no secrets are exposed). Disable it with `--no-webui`. Under the
-loader sandbox the TCP bind is denied, so the UI falls back to the unix
-socket `/tmp/scx_mlfq.sock` (mode 0600, root-only connect, use `sudo`
-with socat) unless the network unblock drop-in from the
-loader installer is in place (see the "Web UI and the loader network
-sandbox" section). Scheduler state is otherwise visible through the
-kernel's sched_ext interface (e.g. `cat /sys/kernel/sched_ext/root/ops`)
-and `scx_mlfq --stats`.
 
 **Is it safe to run as root / what if something goes wrong?**
 

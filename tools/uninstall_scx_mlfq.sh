@@ -23,11 +23,11 @@
 # use, and the drop-in is removed only if its content byte-matches what the
 # installer writes.
 #
-# When the loader manifest records webui_unblock=1 (or the web UI drop-in
-# byte-matches the content the loader installer writes), the
-# mlfq-webui.conf drop-in, which lifted the network sandbox the loader
-# applies to its scheduler children so the web UI can bind its loopback
-# HTTP port, is removed and systemd reloaded, restoring the sandbox. The
+# scx_mlfq 1.3.x installs wrote an mlfq-webui.conf drop-in that lifted the
+# network sandbox the loader applies to its scheduler children, so the old
+# web UI could bind its loopback port. When the loader manifest records
+# webui_unblock=1 (or the drop-in byte-matches the content 1.3.x wrote),
+# that file is removed and systemd reloaded, restoring the sandbox. The
 # removal is by fixed filename plus a byte check, so a foreign drop-in in
 # the same directory can never be touched.
 #
@@ -487,9 +487,9 @@ our_loader_dropin() {
     printf '[Service]\nExecStart=\nExecStart=%s\n' "$LOADER_BIN"
 }
 
-# webui_dropin. The exact bytes the loader installer owns for the web UI
+# webui_dropin. The exact bytes 1.3.x loader installs wrote for the web UI
 # network unblock (mlfq-webui.conf). Byte-identical to the loader
-# installer's webui_dropin() so the byte check below is a true match.
+# installer's legacy_webui_dropin() so the byte check below is a true match.
 webui_dropin() {
     cat <<'EOF'
 # scx_mlfq Web UI: lift the network restrictions the loader applies to its
@@ -501,8 +501,8 @@ SocketBindDeny=
 EOF
 }
 
-# webui_dropin_matches: 0 when the web UI drop-in on disk is byte-identical
-# to the content the loader installer writes.
+# webui_dropin_matches: 0 when the drop-in on disk is byte-identical to the
+# content 1.3.x wrote.
 webui_dropin_matches() {
     [ -f "$WEBUI_DROPIN" ] && cmp -s "$WEBUI_DROPIN" <(webui_dropin)
 }
@@ -675,19 +675,19 @@ report_webui_sandbox() {
     fi
 }
 
-# remove_webui_unblock. Removes the mlfq-webui.conf drop-in that lifts the
-# loader's network sandbox for the web UI, reload systemd so the packaged
-# restrictions are live again, restart an active loader, and report the
-# resulting state. The drop-in is removed only when the loader manifest
-# records webui_unblock=1 OR the file byte-matches the content the loader
-# installer writes (an extra check for a lost manifest). The fixed
-# filename plus the byte check make touching a foreign drop-in in the same
-# directory structurally impossible.
+# remove_webui_unblock. Removes the mlfq-webui.conf drop-in left by a 1.3.x
+# install, which lifted the loader's network sandbox for the old web UI.
+# Reloads systemd so the packaged restrictions are live again, restarts an
+# active loader, and reports the resulting state. The drop-in is removed
+# only when the loader manifest records webui_unblock=1 OR the file
+# byte-matches the content 1.3.x wrote (an extra check for a lost
+# manifest). The fixed filename plus the byte check make touching a
+# foreign drop-in in the same directory structurally impossible.
 remove_webui_unblock() {
     local _matches=""
 
     if [ ! -f "$WEBUI_DROPIN" ]; then
-        info "web UI drop-in not present: $WEBUI_DROPIN"
+        info "no 1.3.x web UI drop-in present: $WEBUI_DROPIN"
         WEBUI_UNBLOCK_STATE="absent"
         report_webui_sandbox
         return 0
@@ -698,7 +698,7 @@ remove_webui_unblock() {
     fi
 
     if [ "$WEBUI_UNBLOCK_MF" != "1" ] && [ -z "$_matches" ]; then
-        info "web UI drop-in $WEBUI_DROPIN is not recorded as ours and does"
+        info "$WEBUI_DROPIN is not recorded as ours and does"
         info "  not byte-match our content; leaving it"
         WEBUI_UNBLOCK_STATE="left (not ours)"
         report_webui_sandbox
@@ -706,13 +706,13 @@ remove_webui_unblock() {
     fi
 
     if [ -z "$_matches" ] && [ "$WEBUI_UNBLOCK_MF" = "1" ]; then
-        warn "web UI drop-in $WEBUI_DROPIN is recorded in the manifest but does"
+        warn "$WEBUI_DROPIN is recorded in the manifest but does"
         warn "  not byte-match our content; removing it (the filename is fixed"
         warn "  to our file)"
     fi
 
     run rm -f "$WEBUI_DROPIN"
-    ok "removed web UI drop-in $WEBUI_DROPIN"
+    ok "removed 1.3.x web UI drop-in $WEBUI_DROPIN"
     WEBUI_UNBLOCK_STATE="removed"
 
     # Reload the unit so the packaged restrictions are live (and
@@ -894,7 +894,7 @@ summary() {
     printf '  %-24s %s\n' 'Patched loader:' "$LOADER_BIN_STATE"
     printf '  %-24s %s\n' 'Patched scxctl:' "$SCXCTL_BIN_STATE"
     printf '  %-24s %s\n' 'Loader drop-in:' "$LOADER_DROPIN_STATE"
-    printf '  %-24s %s\n' 'Web UI unblock:' "$WEBUI_UNBLOCK_STATE"
+    printf '  %-24s %s\n' '1.3.x web UI drop-in:' "$WEBUI_UNBLOCK_STATE"
     printf '  %-24s %s\n' 'GUI library:' "$GUI_LIB_STATE"
     printf '  %-24s %s\n' 'scx.service:' 'left in place (not disabled)'
     if [ -n "$DROPIN_BACKUP" ]; then
@@ -1058,7 +1058,7 @@ main() {
     step 'Removing the patched scx_loader'
     remove_loader_patch
 
-    step 'Restoring the loader network sandbox'
+    step 'Removing the 1.3.x web UI drop-in'
     remove_webui_unblock
 
     step 'Restoring the GUI library'

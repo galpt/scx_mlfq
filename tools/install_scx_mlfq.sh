@@ -5,7 +5,7 @@
 #
 # scx_mlfq installer for CachyOS (sched_ext). This is the single entry
 # point. It builds scx_mlfq from the galpt/scx fork (default branch
-# "scx_mlfq"), installs it as /usr/bin/scx_mlfq, records the install in a
+# "main"), installs it as /usr/bin/scx_mlfq, records the install in a
 # manifest, installs a systemd drop-in so `systemctl restart scx.service`
 # starts scx_mlfq instead of the packaged default scheduler, and then
 # invokes the loader and GUI integration scripts so the CachyOS Kernel
@@ -36,7 +36,7 @@
 # Usage. sudo bash install_scx_mlfq.sh [options]
 #
 # The scheduler sources come from the standalone repository
-# (https://github.com/galpt/scx_mlfq.git, branch main). The workspace
+# (https://github.com/galpt/scx_mlfq.git, branch archive/v2.0.0). The workspace
 # repository provides the sched-ext build environment and the scheduler
 # crate is copied into its scheds/experimental/scx_mlfq/ directory.
 #
@@ -44,7 +44,7 @@
 #   --repo URL         Git repository to use as the build workspace
 #                      (defaults to https://github.com/galpt/scx.git)
 #   --branch NAME      Branch of the build workspace
-#                      (defaults to scx_mlfq)
+#                      (defaults to main)
 #   --source-dir DIR   Build from a local scx workspace instead of cloning.
 #                      DIR must contain Cargo.toml with
 #                      scheds/experimental/scx_mlfq listed as a member.
@@ -73,9 +73,9 @@ SCX_OPS_FILE="/sys/kernel/sched_ext/root/ops"
 SCX_LOADER_CONFIG="/etc/scx_loader.toml"
 
 DEFAULT_STANDALONE_REPO="https://github.com/galpt/scx_mlfq.git"
-DEFAULT_STANDALONE_BRANCH="main"
+DEFAULT_STANDALONE_BRANCH="archive/v2.0.0"
 DEFAULT_REPO="https://github.com/galpt/scx.git"
-DEFAULT_BRANCH="scx_mlfq"
+DEFAULT_BRANCH="main"
 
 STANDALONE_REPO="$DEFAULT_STANDALONE_REPO"
 STANDALONE_BRANCH="$DEFAULT_STANDALONE_BRANCH"
@@ -189,7 +189,7 @@ Options:
   --repo URL         Git repository to use as the build workspace
                      (default: https://github.com/galpt/scx.git)
   --branch NAME      Branch of the build workspace
-                     (default: scx_mlfq)
+                     (default: main)
   --source-dir DIR   Build from a local scx workspace instead of cloning.
                      DIR must contain Cargo.toml with
                      scheds/experimental/scx_mlfq listed as a member.
@@ -204,7 +204,7 @@ Options:
   --help, -h         Print this help text and exit.
 
 The scheduler sources are always taken from the standalone repository
-(https://github.com/galpt/scx_mlfq.git, branch main). The workspace
+(https://github.com/galpt/scx_mlfq.git, branch archive/v2.0.0). The workspace
 repository only provides the sched-ext build environment. The scheduler
 crate is copied into scheds/experimental/scx_mlfq/ of the workspace
 before building.

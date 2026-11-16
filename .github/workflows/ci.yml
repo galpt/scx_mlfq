@@ -5,6 +5,10 @@ on:
 
 env:
   BPF_CLANG: clang-19
+  # sched-ext/scx main with scx_flow 5.2.27 merged. scx/ builds against the
+  # scx_* crates and BPF headers of this workspace, so bump it only after
+  # checking that the scheduler still builds on the new ref.
+  SCX_REF: 48e2a9cbd36b29a2a52689112fb613bae9723b8f
 
 jobs:
   test:
@@ -21,22 +25,22 @@ jobs:
             libseccomp-dev libcap-ng-dev stress-ng mold
       - name: Assemble the scheduler workspace
         run: |
-          git clone --depth 1 https://github.com/sched-ext/scx /tmp/scx
-          cp -r scx /tmp/scx/scheds/experimental/scx_mlfq
-          rm /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
+          git init -q /tmp/scx
+          git -C /tmp/scx remote add origin https://github.com/sched-ext/scx
+          git -C /tmp/scx fetch --depth 1 origin "${SCX_REF}"
+          git -C /tmp/scx checkout -q FETCH_HEAD
+          # Upstream already ships scheds/experimental/scx_mlfq, so replace
+          # it instead of copying into it.
+          rsync -a --delete --exclude /target/ scx/ /tmp/scx/scheds/experimental/scx_mlfq/
+          rm -f /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
           ln -s ../../../LICENSE /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
-          python3 - <<'EOF'
-          p = '/tmp/scx/Cargo.toml'
-          s = open(p).read()
-          marker = '    "scheds/experimental/scx_rlfifo",'
-          assert marker in s, "workspace member marker not found"
-          s = s.replace(marker,
-                        '    "scheds/experimental/scx_mlfq",\n' + marker)
-          open(p, 'w').write(s)
-          EOF
+          grep -q '"scheds/experimental/scx_mlfq"' /tmp/scx/Cargo.toml
+      - name: Sync the lock entry of the scheduler
+        working-directory: /tmp/scx
+        run: cargo update -p scx_mlfq
       - name: Build
         working-directory: /tmp/scx
-        run: cargo build --profile ci -p scx_mlfq
+        run: cargo build --profile ci --locked -p scx_mlfq
       - name: Format
         working-directory: /tmp/scx
         run: cargo fmt -p scx_mlfq --check
@@ -93,19 +97,19 @@ jobs:
             libseccomp-dev libcap-ng-dev mold
       - name: Assemble the scheduler workspace
         run: |
-          git clone --depth 1 https://github.com/sched-ext/scx /tmp/scx
-          cp -r scx /tmp/scx/scheds/experimental/scx_mlfq
-          rm /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
+          git init -q /tmp/scx
+          git -C /tmp/scx remote add origin https://github.com/sched-ext/scx
+          git -C /tmp/scx fetch --depth 1 origin "${SCX_REF}"
+          git -C /tmp/scx checkout -q FETCH_HEAD
+          # Upstream already ships scheds/experimental/scx_mlfq, so replace
+          # it instead of copying into it.
+          rsync -a --delete --exclude /target/ scx/ /tmp/scx/scheds/experimental/scx_mlfq/
+          rm -f /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
           ln -s ../../../LICENSE /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
-          python3 - <<'EOF'
-          p = '/tmp/scx/Cargo.toml'
-          s = open(p).read()
-          marker = '    "scheds/experimental/scx_rlfifo",'
-          assert marker in s, "workspace member marker not found"
-          s = s.replace(marker,
-                        '    "scheds/experimental/scx_mlfq",\n' + marker)
-          open(p, 'w').write(s)
-          EOF
+          grep -q '"scheds/experimental/scx_mlfq"' /tmp/scx/Cargo.toml
+      - name: Sync the lock entry of the scheduler
+        working-directory: /tmp/scx
+        run: cargo update -p scx_mlfq
       - name: Install veristat tools
         run: |
           git clone --depth 1 --recurse-submodules \
@@ -117,7 +121,7 @@ jobs:
       - name: Build and verify
         working-directory: /tmp/scx
         run: |
-          cargo build --profile ci -p scx_mlfq
+          cargo build --profile ci --locked -p scx_mlfq
           cargo metadata --format-version 1 > /tmp/meta.json
           cargo veristat --profile ci --metadata-json /tmp/meta.json \
             --no-build scx_mlfq

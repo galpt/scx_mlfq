@@ -23,19 +23,11 @@
 # PATH. Without it, scxctl cannot parse scx_mlfq and aborts on any
 # switch command.
 #
-# Since 1.3.0, scx_mlfq ships a loopback web UI (port 50005), but the packaged
-# scx_loader.service sandboxes its scheduler children with
-# RestrictAddressFamilies=AF_UNIX + SocketBindDeny=..., so a
-# loader-spawned scx_mlfq cannot bind the port. This script writes a
-# second drop-in (scx_loader.service.d/mlfq-webui.conf) whose empty
-# assignments lift the sandbox for the next loader-spawned scheduler. The
-# drop-in carries a marker comment (ownership is machine-checkable), is
-# written atomically and idempotently, is recorded in the loader manifest
-# as webui_unblock=1, and is rolled back by an EXIT trap if the install
-# fails. Pass --no-webui to skip the unblock. The web UI then falls back
-# to the unix socket /tmp/scx_mlfq.sock. Security note. The drop-in is
-# per-unit, not per-binary. It lifts the network sandbox for EVERY
-# scheduler the loader spawns. systemd offers no narrower alternative.
+# scx_mlfq 1.3.x installs wrote a second drop-in,
+# scx_loader.service.d/mlfq-webui.conf, to lift the loader's network
+# sandbox for the old web UI. This version has no web UI, so the script
+# removes that file when it is byte-identical to what 1.3.x wrote and
+# leaves an edited copy alone.
 #
 # The install is recorded in the scx_mlfq beta manifest
 # (/usr/lib/scx/scx_mlfq-beta.manifest) under the loader_* keys, so
@@ -50,9 +42,6 @@
 # Options:
 #   --force            Replace a conflicting pre-existing loader drop-in
 #                      (backed up under /usr/lib/scx first).
-#   --no-webui         Skip the web UI network unblock. The loader sandbox
-#                      stays in place and the web UI uses the unix socket
-#                      /tmp/scx_mlfq.sock.
 #   --dry-run          Validate inputs and print every action without
 #                      changing the system. Does NOT download or build.
 #   --help, -h         Print this help text and exit.
@@ -65,8 +54,7 @@ LOADER_BIN="/usr/local/bin/scx_loader"
 LOADER_DROPIN_DIR="/etc/systemd/system/scx_loader.service.d"
 LOADER_DROPIN="$LOADER_DROPIN_DIR/mlfq-loader.conf"
 LOADER_DROPIN_BACKUP="$LIB_DIR/scx_loader.service.d.mlfq-loader.conf.bak"
-WEBUI_DROPIN_DIR="$LOADER_DROPIN_DIR"
-WEBUI_DROPIN="$WEBUI_DROPIN_DIR/mlfq-webui.conf"
+LEGACY_WEBUI_DROPIN="$LOADER_DROPIN_DIR/mlfq-webui.conf"
 LOADER_DROPIN_BACKUP_RECORDED=""
 LOADER_CRATE_VERSION="1.1.2"
 LOADER_CRATE_URL="https://static.crates.io/crates/scx_loader/scx_loader-${LOADER_CRATE_VERSION}.crate"
@@ -82,9 +70,6 @@ SCXCTL_DIR=""
 LOADER_BIN_SHA=""
 SCXCTL_BIN_SHA=""
 LOADER_DROPIN_BACKUP_RECORDED=""
-NO_WEBUI=""
-UNBLOCK_WRITTEN=""
-INSTALL_OK=""
 
 info()  { printf '[INFO]  %s\n' "$1"; }
 ok()    { printf '[ OK ]  %s\n' "$1"; }
@@ -107,13 +92,9 @@ our_dropin_matches() {
     [ -f "$LOADER_DROPIN" ] && cmp -s "$LOADER_DROPIN" <(our_dropin)
 }
 
-# webui_dropin. The exact bytes this installer owns for the web UI network
-# unblock. Empty assignments reset the packaged
-# RestrictAddressFamilies=AF_UNIX + SocketBindDeny=... restrictions for the
-# next loader-spawned scheduler. The marker comment makes ownership
-# machine-checkable. The uninstaller removes the file only when it is
-# recorded as ours or byte-matches this content.
-webui_dropin() {
+# legacy_webui_dropin. The exact bytes 1.3.x installs wrote for the web UI
+# network unblock. Only a byte-identical file is removed on upgrade.
+legacy_webui_dropin() {
     cat <<'EOF'
 # scx_mlfq Web UI: lift the network restrictions the loader applies to its
 # scheduler children so the web UI can bind the loopback HTTP port.
@@ -124,10 +105,10 @@ SocketBindDeny=
 EOF
 }
 
-# webui_dropin_matches: 0 when the web UI drop-in on disk is byte-identical
-# to ours.
-webui_dropin_matches() {
-    [ -f "$WEBUI_DROPIN" ] && cmp -s "$WEBUI_DROPIN" <(webui_dropin)
+# legacy_webui_dropin_matches: 0 when the drop-in on disk is byte-identical
+# to the one 1.3.x wrote.
+legacy_webui_dropin_matches() {
+    [ -f "$LEGACY_WEBUI_DROPIN" ] && cmp -s "$LEGACY_WEBUI_DROPIN" <(legacy_webui_dropin)
 }
 
 usage() {
@@ -139,9 +120,6 @@ Usage: sudo bash install_scx_mlfq_loader.sh [options]
 Options:
   --force     Replace a conflicting pre-existing loader drop-in
               (backed up under /usr/lib/scx first).
-  --no-webui  Skip the web UI network unblock. The loader sandbox stays
-              in place and the web UI uses the unix socket
-              /tmp/scx_mlfq.sock.
   --dry-run   Validate inputs and print every action without
               changing the system. Does NOT download or build.
   --help, -h  Print this help text and exit.
@@ -174,15 +152,13 @@ check_root() {
 # record_manifest. Writes the loader manifest. The loader install owns
 # this file. The beta manifest records the scheduler binary install and
 # is never touched here, so either script can be re-run independently.
-# webui_unblock records whether the web UI network unblock was requested
-# (1) or skipped with --no-webui (0).
 record_manifest() {
     local _tmp
 
     if [ -n "$DRY_RUN" ]; then
         dry "write $LOADER_MANIFEST (name, version, loader_bin, loader_dropin,"
         dry "  loader_sha256, loader_scxctl_bin, loader_scxctl_sha256,"
-        dry "  webui_unblock, install_time)"
+        dry "  install_time)"
         return 0
     fi
 
@@ -197,7 +173,6 @@ loader_sha256=$LOADER_BIN_SHA
 loader_scxctl_bin=$SCXCTL_BIN
 loader_scxctl_sha256=$SCXCTL_BIN_SHA
 loader_dropin_backup=${LOADER_DROPIN_BACKUP_RECORDED:-}
-webui_unblock=$([ -n "$NO_WEBUI" ] && printf '0' || printf '1')
 install_time=$(date +%Y-%m-%dT%H:%M:%S%z)
 EOF
     chmod 644 "$_tmp"
@@ -388,80 +363,28 @@ write_dropin() {
     ok "drop-in written to $LOADER_DROPIN"
 }
 
-# check_webui_state. Read-only. Queries the EFFECTIVE (merged) network
-# restrictions of scx_loader.service and report whether the web UI's
-# loopback TCP bind is currently blocked. systemd renders an empty
-# RestrictAddressFamilies as '~' and omits an empty SocketBindDeny. This
-# reports but never gates the write. Our drop-in is written whenever it is
-# not byte-identical, so we own the unblock regardless of any foreign
-# drop-in that is present today.
-check_webui_state() {
-    local out raf sbd
+# remove_legacy_webui_dropin. Version 1.3.x wrote a drop-in that lifted the
+# loader's network sandbox for the web UI, which this version no longer
+# has. A byte-identical copy is removed and systemd reloaded. A file that
+# differs may have been edited by the admin and is left alone.
+remove_legacy_webui_dropin() {
+    [ -e "$LEGACY_WEBUI_DROPIN" ] || return 0
 
-    if [ -n "$DRY_RUN" ]; then
-        dry "systemctl show -p RestrictAddressFamilies -p SocketBindDeny scx_loader.service"
-    fi
-    out=$(systemctl show -p RestrictAddressFamilies \
-          -p SocketBindDeny scx_loader.service 2>/dev/null) || true
-    raf=$(printf '%s\n' "$out" | sed -n 's/^RestrictAddressFamilies=//p')
-    sbd=$(printf '%s\n' "$out" | sed -n 's/^SocketBindDeny=//p')
-
-    if webui_dropin_matches; then
-        info 'web UI network sandbox: our mlfq-webui.conf drop-in is present and byte-identical'
-    elif [ -z "$out" ]; then
-        warn 'web UI network sandbox: could not query scx_loader.service (is it installed?)'
-    elif { [ -z "$raf" ] || [ "$raf" = "~" ]; } && [ -z "$sbd" ]; then
-        info 'web UI network sandbox: already lifted (RestrictAddressFamilies'
-        info '  and SocketBindDeny are empty - e.g. a foreign drop-in)'
-    else
-        info "web UI network sandbox: restricted by the packaged unit"
-        info "  (RestrictAddressFamilies=${raf:-<unset>}, SocketBindDeny=${sbd:-<unset>})"
-    fi
-}
-
-# install_webui_dropin. Writes our mlfq-webui.conf drop-in to lift the
-# loader's network sandbox for the web UI. Idempotent and atomic
-# (mkdir -p, mktemp in the target dir, chmod, mv -f). UNBLOCK_WRITTEN
-# is set only when THIS run actually wrote the drop-in, and never under
-# --dry-run, so the EXIT trap rolls back exactly what this run owns. It
-# is inert on a dry-run and leaves a pre-existing drop-in alone when a
-# re-install fails.
-install_webui_dropin() {
-    local _tmp
-
-    if webui_dropin_matches; then
-        info "web UI drop-in already present and byte-identical: $WEBUI_DROPIN"
-        # A pre-existing drop-in was written by an earlier install, not
-        # by this run: UNBLOCK_WRITTEN stays empty (under --dry-run too),
-        # so a failed re-install keeps the pre-existing unblock instead
-        # of removing a file this run does not own.
+    step 'Removing the 1.3.x web UI drop-in'
+    if ! legacy_webui_dropin_matches; then
+        info "$LEGACY_WEBUI_DROPIN differs from the 1.3.x content; leaving it in place"
         return 0
     fi
 
     if [ -n "$DRY_RUN" ]; then
-        dry "mkdir -p $WEBUI_DROPIN_DIR"
-        dry "write $WEBUI_DROPIN:"
-        dry '  # scx_mlfq Web UI: lift the network restrictions the loader applies to its'
-        dry '  # scheduler children so the web UI can bind the loopback HTTP port.'
-        dry '  # Owned by install_scx_mlfq_loader.sh; removed by uninstall_scx_mlfq.sh.'
-        dry '  [Service]'
-        dry '  RestrictAddressFamilies='
-        dry '  SocketBindDeny='
-        dry 'systemctl daemon-reload (in the restart step below) activates the drop-in'
+        dry "remove $LEGACY_WEBUI_DROPIN"
+        dry 'systemctl daemon-reload'
         return 0
     fi
 
-    mkdir -p "$WEBUI_DROPIN_DIR"
-    _tmp=$(mktemp "$WEBUI_DROPIN_DIR/.mlfq-webui.conf.XXXXXX")
-    webui_dropin > "$_tmp"
-    chmod 644 "$_tmp"
-    mv -f "$_tmp" "$WEBUI_DROPIN"
-    # This run owns the file now, so the trap may roll it back on a
-    # failed install. The gate is redundant with the dry-run early
-    # return above, but it states the ownership rule unconditionally:
-    # the trap only ever removes a drop-in this run wrote.
-    [ -z "$DRY_RUN" ] && UNBLOCK_WRITTEN=1
-    ok "web UI drop-in written to $WEBUI_DROPIN (loader network sandbox lifted)"
+    rm -f -- "$LEGACY_WEBUI_DROPIN"
+    ok "removed $LEGACY_WEBUI_DROPIN"
+    systemctl daemon-reload || warn 'systemctl daemon-reload failed; restart systemd or reboot'
 }
 
 restart_loader() {
@@ -522,29 +445,6 @@ cleanup() {
     fi
 }
 
-# reblock_if_install_failed: EXIT-trap. If the install fails after this
-# run wrote the web UI drop-in, remove it again (our fixed filename only)
-# and reload systemd so the packaged network sandbox is back in force.
-# UNBLOCK_WRITTEN is set only by a real write of this run -- never under
-# --dry-run (UNBLOCK_WRITTEN stays empty there, so the trap is inert) and
-# never when the drop-in already existed (a failed re-install keeps the
-# pre-existing unblock) -- and a successful install sets INSTALL_OK=1, so
-# the trap is a no-op after success too.
-reblock_if_install_failed() {
-    [ "$UNBLOCK_WRITTEN" = 1 ] || return 0
-    [ "$INSTALL_OK" = 1 ] && return 0
-    # Remove only the file this run wrote. The byte check keeps the
-    # rollback from deleting an admin-edited drop-in that landed in the
-    # window between the write and the failure.
-    if [ -f "$WEBUI_DROPIN" ] && cmp -s "$WEBUI_DROPIN" <(webui_dropin); then
-        rm -f -- "$WEBUI_DROPIN"
-        systemctl daemon-reload 2>/dev/null || true
-        warn 'network unblock rolled back after the install failed'
-    else
-        warn 'network unblock rollback skipped: the drop-in is not the file this run wrote'
-    fi
-}
-
 main() {
     step 'scx_mlfq loader patch installer for CachyOS'
     check_root
@@ -573,18 +473,7 @@ main() {
     step 'Recording the install'
     record_manifest
 
-    step 'Unblocking the loader network sandbox'
-    check_webui_state
-    if [ -n "$NO_WEBUI" ]; then
-        info '--no-webui: skipping the network unblock; the loader sandbox stays in place'
-        info '  if the web UI is started, it falls back to the unix socket /tmp/scx_mlfq.sock'
-        info '  (view it with:  socat TCP-LISTEN:50005 UNIX-CONNECT:/tmp/scx_mlfq.sock)'
-    else
-        info 'security note: the drop-in lifts the network sandbox for the loader and EVERY'
-        info 'scheduler it spawns (per-unit, not per-binary; systemd offers'
-        info '  no narrower alternative)'
-        install_webui_dropin
-    fi
+    remove_legacy_webui_dropin
 
     step 'Restarting scx_loader'
     restart_loader
@@ -597,8 +486,6 @@ main() {
         return 0
     fi
 
-    INSTALL_OK=1
-
     printf '\n=== patched scx_loader and scxctl installed ===\n'
     printf 'The CachyOS Kernel Manager GUI now lists scx_mlfq and can start,\n'
     printf 'stop and switch to it like any other registered scheduler, and\n'
@@ -606,10 +493,8 @@ main() {
     printf 'Remove with:  sudo bash uninstall_scx_mlfq.sh\n'
 }
 
-# On EXIT, roll back a failed install's network unblock, then remove the
-# owned build directory (both handlers guard themselves). bash runs a
-# single EXIT trap, so both run here in order.
-trap 'reblock_if_install_failed; cleanup' EXIT
+# On EXIT, remove the owned build directory.
+trap cleanup EXIT
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -619,10 +504,6 @@ while [ "$#" -gt 0 ]; do
             ;;
         --dry-run)
             DRY_RUN="1"
-            shift
-            ;;
-        --no-webui)
-            NO_WEBUI="1"
             shift
             ;;
         --help|-h)
