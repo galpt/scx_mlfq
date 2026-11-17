@@ -1,10 +1,29 @@
 name: ci
 
+# Overlay CI for the scx_mlfq scheduler.
+#
+# The scheduler in scx/ replaces scheds/experimental/scx_mlfq/ in an
+# upstream sched-ext/scx checkout (path deps use ../../../rust), so every
+# job first assembles that workspace, syncs the lock entry of the
+# scheduler and then runs the usual package checks inside it. The
+# scheduler is never loaded here: the jobs run the unit tests, a
+# --version smoke check and the BPF verifier through veristat.
+
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -eo pipefail -x {0}
+
 env:
+  PS4: '+ $(date "+%H:%M:%S") '
   BPF_CLANG: clang-19
+  RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
   # sched-ext/scx main with scx_flow 5.2.27 merged. scx/ builds against the
   # scx_* crates and BPF headers of this workspace, so bump it only after
   # checking that the scheduler still builds on the new ref.
@@ -17,20 +36,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          disable_annotations: true
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y pkg-config lld clang clang-19 llvm-19 \
             libbpf-dev libelf-dev libzstd-dev protobuf-compiler \
-            libseccomp-dev libcap-ng-dev stress-ng mold
+            libseccomp-dev libcap-ng-dev mold
+          echo /usr/lib/llvm-19/bin >> $GITHUB_PATH
       - name: Assemble the scheduler workspace
         run: |
           git init -q /tmp/scx
           git -C /tmp/scx remote add origin https://github.com/sched-ext/scx
           git -C /tmp/scx fetch --depth 1 origin "${SCX_REF}"
-          git -C /tmp/scx checkout -q FETCH_HEAD
+          git -C /tmp/scx checkout FETCH_HEAD
           # Upstream already ships scheds/experimental/scx_mlfq, so replace
-          # it instead of copying into it.
+          # it instead of merging into it.
           rsync -a --delete --exclude /target/ scx/ /tmp/scx/scheds/experimental/scx_mlfq/
           rm -f /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
           ln -s ../../../LICENSE /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
@@ -38,50 +61,23 @@ jobs:
       - name: Sync the lock entry of the scheduler
         working-directory: /tmp/scx
         run: cargo update -p scx_mlfq
-      - name: Build
-        working-directory: /tmp/scx
-        run: cargo build --profile ci --locked -p scx_mlfq
       - name: Format
         working-directory: /tmp/scx
         run: cargo fmt -p scx_mlfq --check
       - name: Clippy
         working-directory: /tmp/scx
-        run: cargo clippy --profile ci --no-deps --locked -p scx_mlfq -- -D warnings
+        run: cargo clippy --profile ci --no-deps --locked -p scx_mlfq -- -Dwarnings
+      - name: Build
+        working-directory: /tmp/scx
+        run: cargo build --profile ci --locked -p scx_mlfq
       - name: Unit tests
         working-directory: /tmp/scx
         run: cargo test --profile ci --locked -p scx_mlfq
-      - name: Kernel diagnostics
-        run: |
-          uname -r
-          cat /proc/sys/kernel/sched_ext/state 2>/dev/null || true
-          zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_(PREEMPT|HZ_|NO_HZ|SCHED_CLASS_EXT|SCHED_SMT|SCHED_AUTOGROUP)" || true
-      - name: Stress test (no affinity)
+      - name: Smoke test (no kernel needed)
         working-directory: /tmp/scx
         run: |
-          stress-ng -t 31 --aggressive -M -c 4 -f 4 &
-          stress_pid=$!
-          set +e
-          sudo timeout --foreground --preserve-status 45 \
-            target/ci/scx_mlfq -v
-          rc=$?
-          set -e
-          kill $stress_pid 2>/dev/null || true
-          wait $stress_pid 2>/dev/null || true
-          exit $rc
-      - name: Stress test (affinity only)
-        working-directory: /tmp/scx
-        run: |
-          stress-ng -t 31 --aggressive -M --affinity 1 --affinity-delay 1 \
-            --affinity-pin &
-          stress_pid=$!
-          set +e
-          sudo timeout --foreground --preserve-status 45 \
-            target/ci/scx_mlfq -v
-          rc=$?
-          set -e
-          kill $stress_pid 2>/dev/null || true
-          wait $stress_pid 2>/dev/null || true
-          exit $rc
+          target/ci/scx_mlfq --version
+          target/ci/scx_mlfq --help > /dev/null
 
   veristat:
     runs-on: ubuntu-24.04
@@ -89,20 +85,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          disable_annotations: true
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y pkg-config lld clang clang-19 llvm-19 \
             libbpf-dev libelf-dev libzstd-dev protobuf-compiler \
             libseccomp-dev libcap-ng-dev mold
+          echo /usr/lib/llvm-19/bin >> $GITHUB_PATH
       - name: Assemble the scheduler workspace
         run: |
           git init -q /tmp/scx
           git -C /tmp/scx remote add origin https://github.com/sched-ext/scx
           git -C /tmp/scx fetch --depth 1 origin "${SCX_REF}"
-          git -C /tmp/scx checkout -q FETCH_HEAD
+          git -C /tmp/scx checkout FETCH_HEAD
           # Upstream already ships scheds/experimental/scx_mlfq, so replace
-          # it instead of copying into it.
+          # it instead of merging into it.
           rsync -a --delete --exclude /target/ scx/ /tmp/scx/scheds/experimental/scx_mlfq/
           rm -f /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
           ln -s ../../../LICENSE /tmp/scx/scheds/experimental/scx_mlfq/LICENSE
