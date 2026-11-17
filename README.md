@@ -70,7 +70,7 @@ sudo bash tools/uninstall_scx_mlfq.sh           # clean removal of everything
 ```
 
 The install script builds the scheduler from this repository: it clones
-the standalone repo (branch `archive/v2.0.1`), copies the `scx/` sources
+the standalone repo (branch `archive/v2.0.2`), copies the `scx/` sources
 into a sched-ext workspace (cloned from `galpt/scx`, branch `main`, or
 `--source-dir` for a local workspace), installs `/usr/bin/scx_mlfq`, and records everything in a
 manifest under `/usr/lib/scx/` so the uninstall script restores the
