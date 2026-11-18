@@ -77,6 +77,12 @@ manifest under `/usr/lib/scx/` so the uninstall script restores the
 previous state, including the case where a future upstream release ships
 scx_mlfq in the distro package.
 
+## Credits
+
+scx_mlfq is made possible by the support we received from the sched_ext
+community. Credit goes to the developers and contributors whose work
+inspired it and who helped with its development.
+
 ## License
 
 GPL-2.0-only. Copyright (c) 2026 Galih Tama <galpt@v.recipes>
